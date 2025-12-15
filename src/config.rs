@@ -194,6 +194,10 @@ pub enum Action {
     FocusPaneLeft,
     /// Focus the pane to the right of the current one.
     FocusPaneRight,
+    /// Copy selection to clipboard.
+    Copy,
+    /// Paste from clipboard.
+    Paste,
 }
 
 /// Keybinding configuration.
@@ -238,6 +242,10 @@ pub struct Keybindings {
     pub focus_pane_left: Keybind,
     /// Focus pane to the right.
     pub focus_pane_right: Keybind,
+    /// Copy selection to clipboard.
+    pub copy: Keybind,
+    /// Paste from clipboard.
+    pub paste: Keybind,
 }
 
 impl Default for Keybindings {
@@ -256,12 +264,14 @@ impl Default for Keybindings {
             tab_8: Keybind("alt+8".to_string()),
             tab_9: Keybind("alt+9".to_string()),
             split_horizontal: Keybind("ctrl+shift+h".to_string()),
-            split_vertical: Keybind("ctrl+shift+v".to_string()),
+            split_vertical: Keybind("ctrl+shift+e".to_string()),
             close_pane: Keybind("ctrl+shift+w".to_string()),
             focus_pane_up: Keybind("ctrl+shift+up".to_string()),
             focus_pane_down: Keybind("ctrl+shift+down".to_string()),
             focus_pane_left: Keybind("ctrl+shift+left".to_string()),
             focus_pane_right: Keybind("ctrl+shift+right".to_string()),
+            copy: Keybind("ctrl+shift+c".to_string()),
+            paste: Keybind("ctrl+shift+v".to_string()),
         }
     }
 }
@@ -328,6 +338,12 @@ impl Keybindings {
         if let Some(parsed) = self.focus_pane_right.parse() {
             map.insert(parsed, Action::FocusPaneRight);
         }
+        if let Some(parsed) = self.copy.parse() {
+            map.insert(parsed, Action::Copy);
+        }
+        if let Some(parsed) = self.paste.parse() {
+            map.insert(parsed, Action::Paste);
+        }
         
         map
     }
@@ -344,6 +360,8 @@ pub struct Config {
     /// Background opacity (0.0 = fully transparent, 1.0 = fully opaque).
     /// Requires compositor support for transparency.
     pub background_opacity: f32,
+    /// Number of lines to keep in scrollback buffer.
+    pub scrollback_lines: usize,
     /// Keybindings.
     pub keybindings: Keybindings,
 }
@@ -354,6 +372,7 @@ impl Default for Config {
             font_size: 16.0,
             tab_bar_position: TabBarPosition::Top,
             background_opacity: 1.0,
+            scrollback_lines: 50_000,
             keybindings: Keybindings::default(),
         }
     }

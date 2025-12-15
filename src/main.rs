@@ -1,89 +1,975 @@
-//! ZTerm Client - GPU-accelerated terminal emulator that connects to the daemon.
+//! ZTerm - GPU-accelerated terminal emulator.
+//! 
+//! Single-process architecture: owns PTY, terminal state, and rendering.
+//! Supports window close/reopen without losing terminal state.
 
-use zterm::client::DaemonClient;
 use zterm::config::{Action, Config};
 use zterm::keyboard::{FunctionalKey, KeyEncoder, KeyEventType, KeyboardState, Modifiers};
-use zterm::protocol::{ClientMessage, DaemonMessage, Direction, PaneId, PaneInfo, PaneSnapshot, WindowState};
+use zterm::pty::Pty;
 use zterm::renderer::Renderer;
+use zterm::terminal::{Terminal, MouseTrackingMode};
+
+use std::collections::HashMap;
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use polling::{Event, Events, Poller};
-use std::collections::HashMap;
-use std::os::fd::{AsRawFd, BorrowedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, Modifiers as WinitModifiers, MouseScrollDelta, WindowEvent};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, KeyEvent, MouseButton, Modifiers as WinitModifiers, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::platform::wayland::EventLoopBuilderExtWayland;
 use winit::window::{Window, WindowId};
 
+/// Kitty-style shared buffer for PTY I/O using double-buffering.
+/// 
+/// Uses two buffers that swap roles:
+/// - I/O thread writes to the "write" buffer
+/// - Main thread parses from the "read" buffer  
+/// - On `swap()`, the buffers exchange roles
+/// 
+/// This gives us:
+/// - Zero-copy parsing (main thread reads directly from buffer)
+/// - No lock contention during parsing (each thread has its own buffer)
+/// - No memmove needed
+const PTY_BUF_SIZE: usize = 4 * 1024 * 1024; // 4MB like Kitty
+
+struct SharedPtyBuffer {
+    inner: Mutex<DoubleBuffer>,
+}
+
+struct DoubleBuffer {
+    /// Two buffers that swap roles
+    bufs: [Vec<u8>; 2],
+    /// Which buffer the I/O thread writes to (0 or 1)
+    write_idx: usize,
+    /// How many bytes are pending in the write buffer
+    write_len: usize,
+}
+
+impl SharedPtyBuffer {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(DoubleBuffer {
+                bufs: [vec![0u8; PTY_BUF_SIZE], vec![0u8; PTY_BUF_SIZE]],
+                write_idx: 0,
+                write_len: 0,
+            }),
+        }
+    }
+    
+    /// Read from PTY fd into the write buffer. Called by I/O thread.
+    /// Returns number of bytes read, 0 if no space/would block, -1 on error.
+    fn read_from_fd(&self, fd: i32) -> isize {
+        let mut inner = self.inner.lock().unwrap();
+        
+        let available = PTY_BUF_SIZE.saturating_sub(inner.write_len);
+        if available == 0 {
+            return 0; // Buffer full, need swap
+        }
+        
+        let write_idx = inner.write_idx;
+        let write_len = inner.write_len;
+        let buf_ptr = unsafe { inner.bufs[write_idx].as_mut_ptr().add(write_len) };
+        
+        let result = unsafe { 
+            libc::read(fd, buf_ptr as *mut libc::c_void, available) 
+        };
+        
+        if result > 0 {
+            inner.write_len += result as usize;
+        }
+        result
+    }
+    
+    /// Check if there's space in the write buffer.
+    fn has_space(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.write_len < PTY_BUF_SIZE
+    }
+    
+    /// Swap buffers and return data to parse. Called by main thread.
+    /// The I/O thread will start writing to the other buffer.
+    fn take_pending(&self) -> Vec<u8> {
+        let mut inner = self.inner.lock().unwrap();
+        
+        if inner.write_len == 0 {
+            return Vec::new(); // Nothing new to parse
+        }
+        
+        // Swap: the write buffer becomes the read buffer
+        let read_idx = inner.write_idx;
+        let read_len = inner.write_len;
+        
+        // Switch I/O thread to the other buffer
+        inner.write_idx = 1 - inner.write_idx;
+        inner.write_len = 0;
+        
+        // Return a copy of the data to parse
+        // (We have to copy because we can't return a reference with the mutex)
+        inner.bufs[read_idx][..read_len].to_vec()
+    }
+}
+
+/// Unique identifier for a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PaneId(u64);
+
+impl PaneId {
+    fn new() -> Self {
+        use std::sync::atomic::AtomicU64;
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// A single pane containing a terminal and its PTY.
+struct Pane {
+    /// Unique identifier for this pane.
+    id: PaneId,
+    /// Terminal state (grid, cursor, scrollback, etc.).
+    terminal: Terminal,
+    /// PTY connection to the shell.
+    pty: Pty,
+    /// Raw file descriptor for the PTY (for polling).
+    pty_fd: i32,
+    /// Shared buffer for this pane's PTY I/O.
+    pty_buffer: Arc<SharedPtyBuffer>,
+    /// Selection state for this pane.
+    selection: Option<Selection>,
+    /// Whether we're currently selecting in this pane.
+    is_selecting: bool,
+    /// Last scrollback length for tracking changes.
+    last_scrollback_len: u32,
+}
+
+impl Pane {
+    /// Create a new pane with its own terminal and PTY.
+    fn new(cols: usize, rows: usize, scrollback_lines: usize) -> Result<Self, String> {
+        let terminal = Terminal::new(cols, rows, scrollback_lines);
+        let pty = Pty::spawn(None).map_err(|e| format!("Failed to spawn PTY: {}", e))?;
+        
+        // Set terminal size
+        if let Err(e) = pty.resize(cols as u16, rows as u16) {
+            log::warn!("Failed to set initial PTY size: {}", e);
+        }
+        
+        let pty_fd = pty.as_raw_fd();
+        
+        Ok(Self {
+            id: PaneId::new(),
+            terminal,
+            pty,
+            pty_fd,
+            pty_buffer: Arc::new(SharedPtyBuffer::new()),
+            selection: None,
+            is_selecting: false,
+            last_scrollback_len: 0,
+        })
+    }
+    
+    /// Resize the terminal and PTY.
+    fn resize(&mut self, cols: usize, rows: usize) {
+        self.terminal.resize(cols, rows);
+        if let Err(e) = self.pty.resize(cols as u16, rows as u16) {
+            log::warn!("Failed to resize PTY: {}", e);
+        }
+    }
+    
+    /// Write data to the PTY.
+    fn write_to_pty(&mut self, data: &[u8]) {
+        if let Err(e) = self.pty.write(data) {
+            log::warn!("Failed to write to PTY: {}", e);
+        }
+    }
+    
+    /// Check if the shell has exited.
+    fn child_exited(&self) -> bool {
+        self.pty.child_exited()
+    }
+}
+
+/// Geometry of a pane in pixels.
+#[derive(Debug, Clone, Copy)]
+struct PaneGeometry {
+    /// Left edge in pixels.
+    x: f32,
+    /// Top edge in pixels.
+    y: f32,
+    /// Width in pixels.
+    width: f32,
+    /// Height in pixels.
+    height: f32,
+    /// Number of columns.
+    cols: usize,
+    /// Number of rows.
+    rows: usize,
+}
+
+/// A node in the split tree - either a split or a leaf (pane).
+enum SplitNode {
+    /// A leaf node containing a pane.
+    Leaf {
+        pane_id: PaneId,
+        /// Cached geometry, updated during layout.
+        geometry: PaneGeometry,
+    },
+    /// A split node with two children.
+    Split {
+        /// True for horizontal split (panes side-by-side), false for vertical (panes stacked).
+        horizontal: bool,
+        /// Size ratio of the first child (0.0 to 1.0).
+        ratio: f32,
+        /// First child (left or top).
+        first: Box<SplitNode>,
+        /// Second child (right or bottom).
+        second: Box<SplitNode>,
+    },
+}
+
+impl SplitNode {
+    /// Create a new leaf node.
+    fn leaf(pane_id: PaneId) -> Self {
+        SplitNode::Leaf {
+            pane_id,
+            geometry: PaneGeometry {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+                cols: 0,
+                rows: 0,
+            },
+        }
+    }
+    
+    /// Split this node, replacing it with a split containing the original and a new pane.
+    /// Returns the new node that should replace this one.
+    fn split(self, new_pane_id: PaneId, horizontal: bool) -> Self {
+        SplitNode::Split {
+            horizontal,
+            ratio: 0.5,
+            first: Box::new(self),
+            second: Box::new(SplitNode::leaf(new_pane_id)),
+        }
+    }
+    
+    /// Calculate layout for all nodes given the available space.
+    fn layout(&mut self, x: f32, y: f32, width: f32, height: f32, cell_width: f32, cell_height: f32, border_width: f32) {
+        match self {
+            SplitNode::Leaf { geometry, .. } => {
+                let cols = ((width - border_width) / cell_width).floor() as usize;
+                let rows = ((height - border_width) / cell_height).floor() as usize;
+                *geometry = PaneGeometry {
+                    x,
+                    y,
+                    width,
+                    height,
+                    cols: cols.max(1),
+                    rows: rows.max(1),
+                };
+            }
+            SplitNode::Split { horizontal, ratio, first, second } => {
+                if *horizontal {
+                    // Side-by-side split
+                    let first_width = (width * *ratio) - border_width / 2.0;
+                    let second_width = width - first_width - border_width;
+                    first.layout(x, y, first_width, height, cell_width, cell_height, border_width);
+                    second.layout(x + first_width + border_width, y, second_width, height, cell_width, cell_height, border_width);
+                } else {
+                    // Stacked split
+                    let first_height = (height * *ratio) - border_width / 2.0;
+                    let second_height = height - first_height - border_width;
+                    first.layout(x, y, width, first_height, cell_width, cell_height, border_width);
+                    second.layout(x, y + first_height + border_width, width, second_height, cell_width, cell_height, border_width);
+                }
+            }
+        }
+    }
+    
+    /// Find the geometry for a specific pane.
+    fn find_geometry(&self, target_id: PaneId) -> Option<PaneGeometry> {
+        match self {
+            SplitNode::Leaf { pane_id, geometry } => {
+                if *pane_id == target_id {
+                    Some(*geometry)
+                } else {
+                    None
+                }
+            }
+            SplitNode::Split { first, second, .. } => {
+                first.find_geometry(target_id).or_else(|| second.find_geometry(target_id))
+            }
+        }
+    }
+    
+    /// Collect all pane IDs.
+    fn collect_pane_ids(&self, ids: &mut Vec<PaneId>) {
+        match self {
+            SplitNode::Leaf { pane_id, .. } => ids.push(*pane_id),
+            SplitNode::Split { first, second, .. } => {
+                first.collect_pane_ids(ids);
+                second.collect_pane_ids(ids);
+            }
+        }
+    }
+    
+    /// Collect all pane geometries.
+    fn collect_geometries(&self, geometries: &mut Vec<(PaneId, PaneGeometry)>) {
+        match self {
+            SplitNode::Leaf { pane_id, geometry } => {
+                geometries.push((*pane_id, *geometry));
+            }
+            SplitNode::Split { first, second, .. } => {
+                first.collect_geometries(geometries);
+                second.collect_geometries(geometries);
+            }
+        }
+    }
+    
+    /// Find a neighbor pane in the given direction.
+    /// Returns the pane ID of the neighbor, if any.
+    fn find_neighbor(&self, target_id: PaneId, direction: Direction) -> Option<PaneId> {
+        // First, find the geometry of the target pane
+        let target_geom = self.find_geometry(target_id)?;
+        
+        // Collect all geometries
+        let mut all_geoms = Vec::new();
+        self.collect_geometries(&mut all_geoms);
+        
+        // Find the best candidate in the given direction
+        let mut best: Option<(PaneId, f32)> = None;
+        
+        for (pane_id, geom) in all_geoms {
+            if pane_id == target_id {
+                continue;
+            }
+            
+            let is_neighbor = match direction {
+                Direction::Up => {
+                    // Neighbor is above: its bottom edge is near our top edge
+                    geom.y + geom.height <= target_geom.y + 5.0 &&
+                    Self::overlaps_horizontally(&geom, &target_geom)
+                }
+                Direction::Down => {
+                    // Neighbor is below: its top edge is near our bottom edge
+                    geom.y >= target_geom.y + target_geom.height - 5.0 &&
+                    Self::overlaps_horizontally(&geom, &target_geom)
+                }
+                Direction::Left => {
+                    // Neighbor is to the left: its right edge is near our left edge
+                    geom.x + geom.width <= target_geom.x + 5.0 &&
+                    Self::overlaps_vertically(&geom, &target_geom)
+                }
+                Direction::Right => {
+                    // Neighbor is to the right: its left edge is near our right edge
+                    geom.x >= target_geom.x + target_geom.width - 5.0 &&
+                    Self::overlaps_vertically(&geom, &target_geom)
+                }
+            };
+            
+            if is_neighbor {
+                // Calculate distance (for choosing closest)
+                let distance = match direction {
+                    Direction::Up => target_geom.y - (geom.y + geom.height),
+                    Direction::Down => geom.y - (target_geom.y + target_geom.height),
+                    Direction::Left => target_geom.x - (geom.x + geom.width),
+                    Direction::Right => geom.x - (target_geom.x + target_geom.width),
+                };
+                
+                if distance >= 0.0 {
+                    if best.is_none() || distance < best.unwrap().1 {
+                        best = Some((pane_id, distance));
+                    }
+                }
+            }
+        }
+        
+        best.map(|(id, _)| id)
+    }
+    
+    fn overlaps_horizontally(a: &PaneGeometry, b: &PaneGeometry) -> bool {
+        let a_left = a.x;
+        let a_right = a.x + a.width;
+        let b_left = b.x;
+        let b_right = b.x + b.width;
+        a_left < b_right && a_right > b_left
+    }
+    
+    fn overlaps_vertically(a: &PaneGeometry, b: &PaneGeometry) -> bool {
+        let a_top = a.y;
+        let a_bottom = a.y + a.height;
+        let b_top = b.y;
+        let b_bottom = b.y + b.height;
+        a_top < b_bottom && a_bottom > b_top
+    }
+    
+    /// Remove a pane from the tree. Returns the new tree root (or None if tree is empty).
+    fn remove_pane(self, target_id: PaneId) -> Option<SplitNode> {
+        match self {
+            SplitNode::Leaf { pane_id, .. } => {
+                if pane_id == target_id {
+                    None // Remove this leaf
+                } else {
+                    Some(self) // Keep this leaf
+                }
+            }
+            SplitNode::Split { horizontal, ratio, first, second } => {
+                // Check if target is in first or second subtree
+                let first_has_target = first.contains_pane(target_id);
+                let second_has_target = second.contains_pane(target_id);
+                
+                if first_has_target {
+                    match first.remove_pane(target_id) {
+                        Some(new_first) => Some(SplitNode::Split {
+                            horizontal,
+                            ratio,
+                            first: Box::new(new_first),
+                            second,
+                        }),
+                        None => Some(*second), // First child removed, promote second
+                    }
+                } else if second_has_target {
+                    match second.remove_pane(target_id) {
+                        Some(new_second) => Some(SplitNode::Split {
+                            horizontal,
+                            ratio,
+                            first,
+                            second: Box::new(new_second),
+                        }),
+                        None => Some(*first), // Second child removed, promote first
+                    }
+                } else {
+                    Some(SplitNode::Split { horizontal, ratio, first, second })
+                }
+            }
+        }
+    }
+    
+    /// Check if this tree contains the given pane.
+    fn contains_pane(&self, target_id: PaneId) -> bool {
+        match self {
+            SplitNode::Leaf { pane_id, .. } => *pane_id == target_id,
+            SplitNode::Split { first, second, .. } => {
+                first.contains_pane(target_id) || second.contains_pane(target_id)
+            }
+        }
+    }
+    
+    /// Split the pane with the given ID.
+    fn split_pane(self, target_id: PaneId, new_pane_id: PaneId, horizontal: bool) -> Self {
+        match self {
+            SplitNode::Leaf { pane_id, geometry } => {
+                if pane_id == target_id {
+                    SplitNode::Leaf { pane_id, geometry }.split(new_pane_id, horizontal)
+                } else {
+                    SplitNode::Leaf { pane_id, geometry }
+                }
+            }
+            SplitNode::Split { horizontal: h, ratio, first, second } => {
+                SplitNode::Split {
+                    horizontal: h,
+                    ratio,
+                    first: Box::new(first.split_pane(target_id, new_pane_id, horizontal)),
+                    second: Box::new(second.split_pane(target_id, new_pane_id, horizontal)),
+                }
+            }
+        }
+    }
+}
+
+/// Direction for pane navigation.
+#[derive(Debug, Clone, Copy)]
+enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// Unique identifier for a tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TabId(u64);
+
+impl TabId {
+    fn new() -> Self {
+        use std::sync::atomic::AtomicU64;
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// A single tab containing one or more panes arranged in a split tree.
+struct Tab {
+    /// Unique identifier for this tab.
+    id: TabId,
+    /// All panes in this tab, keyed by PaneId.
+    panes: HashMap<PaneId, Pane>,
+    /// The split tree structure.
+    split_root: SplitNode,
+    /// Currently active pane ID.
+    active_pane: PaneId,
+    /// Tab title (from OSC or shell).
+    title: String,
+}
+
+impl Tab {
+    /// Create a new tab with a single pane.
+    fn new(cols: usize, rows: usize, scrollback_lines: usize) -> Result<Self, String> {
+        let pane = Pane::new(cols, rows, scrollback_lines)?;
+        let pane_id = pane.id;
+        
+        let mut panes = HashMap::new();
+        panes.insert(pane_id, pane);
+        
+        Ok(Self {
+            id: TabId::new(),
+            panes,
+            split_root: SplitNode::leaf(pane_id),
+            active_pane: pane_id,
+            title: String::from("zsh"),
+        })
+    }
+    
+    /// Get the active pane.
+    fn active_pane(&self) -> Option<&Pane> {
+        self.panes.get(&self.active_pane)
+    }
+    
+    /// Get the active pane mutably.
+    fn active_pane_mut(&mut self) -> Option<&mut Pane> {
+        self.panes.get_mut(&self.active_pane)
+    }
+    
+    /// Resize all panes based on new window dimensions.
+    fn resize(&mut self, width: f32, height: f32, cell_width: f32, cell_height: f32, border_width: f32) {
+        // Recalculate layout
+        self.split_root.layout(0.0, 0.0, width, height, cell_width, cell_height, border_width);
+        
+        // Resize each pane's terminal based on its geometry
+        let mut geometries = Vec::new();
+        self.split_root.collect_geometries(&mut geometries);
+        
+        for (pane_id, geom) in geometries {
+            if let Some(pane) = self.panes.get_mut(&pane_id) {
+                pane.resize(geom.cols, geom.rows);
+            }
+        }
+    }
+    
+    /// Write data to the active pane's PTY.
+    fn write_to_pty(&mut self, data: &[u8]) {
+        if let Some(pane) = self.active_pane_mut() {
+            pane.write_to_pty(data);
+        }
+    }
+    
+    /// Check if any pane's shell has exited and clean up.
+    /// Returns true if all panes have exited (tab should close).
+    fn check_exited_panes(&mut self) -> bool {
+        // Collect exited pane IDs
+        let exited: Vec<PaneId> = self.panes
+            .iter()
+            .filter(|(_, pane)| pane.child_exited())
+            .map(|(id, _)| *id)
+            .collect();
+        
+        // Remove exited panes
+        for pane_id in exited {
+            self.remove_pane(pane_id);
+        }
+        
+        self.panes.is_empty()
+    }
+    
+    /// Split the active pane.
+    fn split(&mut self, horizontal: bool, cols: usize, rows: usize, scrollback_lines: usize) -> Result<PaneId, String> {
+        let new_pane = Pane::new(cols, rows, scrollback_lines)?;
+        let new_pane_id = new_pane.id;
+        
+        // Add to panes map
+        self.panes.insert(new_pane_id, new_pane);
+        
+        // Update split tree
+        let old_root = std::mem::replace(&mut self.split_root, SplitNode::leaf(PaneId(0)));
+        self.split_root = old_root.split_pane(self.active_pane, new_pane_id, horizontal);
+        
+        // Focus the new pane
+        self.active_pane = new_pane_id;
+        
+        Ok(new_pane_id)
+    }
+    
+    /// Remove a pane from the tab.
+    fn remove_pane(&mut self, pane_id: PaneId) {
+        // Remove from map
+        self.panes.remove(&pane_id);
+        
+        // Update split tree
+        let old_root = std::mem::replace(&mut self.split_root, SplitNode::leaf(PaneId(0)));
+        if let Some(new_root) = old_root.remove_pane(pane_id) {
+            self.split_root = new_root;
+        }
+        
+        // If we removed the active pane, select a new one
+        if self.active_pane == pane_id {
+            if let Some(first_pane_id) = self.panes.keys().next() {
+                self.active_pane = *first_pane_id;
+            }
+        }
+    }
+    
+    /// Close the active pane.
+    fn close_active_pane(&mut self) {
+        let pane_id = self.active_pane;
+        self.remove_pane(pane_id);
+    }
+    
+    /// Navigate to a neighbor pane in the given direction.
+    fn focus_neighbor(&mut self, direction: Direction) {
+        if let Some(neighbor_id) = self.split_root.find_neighbor(self.active_pane, direction) {
+            self.active_pane = neighbor_id;
+        }
+    }
+    
+    /// Get all pane IDs.
+    fn pane_ids(&self) -> Vec<PaneId> {
+        self.panes.keys().copied().collect()
+    }
+    
+    /// Get pane by ID.
+    fn get_pane(&self, pane_id: PaneId) -> Option<&Pane> {
+        self.panes.get(&pane_id)
+    }
+    
+    /// Get pane by ID mutably.
+    fn get_pane_mut(&mut self, pane_id: PaneId) -> Option<&mut Pane> {
+        self.panes.get_mut(&pane_id)
+    }
+    
+    /// Collect all pane geometries for rendering.
+    fn collect_pane_geometries(&self) -> Vec<(PaneId, PaneGeometry)> {
+        let mut geometries = Vec::new();
+        self.split_root.collect_geometries(&mut geometries);
+        geometries
+    }
+    
+    /// Check if all panes have exited (tab should be closed).
+    fn child_exited(&mut self) -> bool {
+        self.check_exited_panes()
+    }
+}
+
+/// PID file location for single-instance support.
+fn pid_file_path() -> std::path::PathBuf {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(runtime_dir).join("zterm.pid")
+}
+
+/// Check if another instance is running and signal it to show window.
+/// Returns true if we signaled an existing instance (and should exit).
+fn signal_existing_instance() -> bool {
+    let pid_path = pid_file_path();
+    
+    if let Ok(contents) = std::fs::read_to_string(&pid_path) {
+        if let Ok(pid) = contents.trim().parse::<i32>() {
+            // Check if process is alive
+            let alive = unsafe { libc::kill(pid, 0) == 0 };
+            
+            if alive {
+                // Send SIGUSR1 to show window
+                log::info!("Signaling existing instance (PID {})", pid);
+                unsafe { libc::kill(pid, libc::SIGUSR1) };
+                return true;
+            } else {
+                // Stale PID file, remove it
+                let _ = std::fs::remove_file(&pid_path);
+            }
+        }
+    }
+    
+    false
+}
+
+/// Write our PID to the PID file.
+fn write_pid_file() -> std::io::Result<()> {
+    let pid = std::process::id();
+    std::fs::write(pid_file_path(), pid.to_string())
+}
+
+/// Remove the PID file on exit.
+fn remove_pid_file() {
+    let _ = std::fs::remove_file(pid_file_path());
+}
+
+/// A cell position in the terminal grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CellPosition {
+    col: usize,
+    row: isize,
+}
+
+/// Selection state for mouse text selection.
+#[derive(Clone, Debug)]
+struct Selection {
+    start: CellPosition,
+    end: CellPosition,
+}
+
+impl Selection {
+    fn normalized(&self) -> (CellPosition, CellPosition) {
+        if self.start.row < self.end.row 
+            || (self.start.row == self.end.row && self.start.col <= self.end.col) {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        }
+    }
+    
+    fn to_screen_coords(&self, current_scroll_offset: usize, visible_rows: usize) -> Option<(usize, usize, usize, usize)> {
+        let (start, end) = self.normalized();
+        let scroll_offset = current_scroll_offset as isize;
+        let screen_start_row = start.row + scroll_offset;
+        let screen_end_row = end.row + scroll_offset;
+        
+        if screen_end_row < 0 || screen_start_row >= visible_rows as isize {
+            return None;
+        }
+        
+        let screen_start_row = screen_start_row.max(0) as usize;
+        let screen_end_row = (screen_end_row as usize).min(visible_rows.saturating_sub(1));
+        let start_col = if start.row + scroll_offset < 0 { 0 } else { start.col };
+        let end_col = if end.row + scroll_offset >= visible_rows as isize { usize::MAX } else { end.col };
+        
+        Some((start_col, screen_start_row, end_col, screen_end_row))
+    }
+}
+
+/// User event for the event loop.
+#[derive(Debug, Clone)]
+enum UserEvent {
+    /// Signal received to show the window.
+    ShowWindow,
+    /// PTY has data available for a specific pane.
+    PtyReadable(PaneId),
+}
+
 /// Main application state.
 struct App {
+    /// Window (None when headless/closed).
     window: Option<Arc<Window>>,
+    /// GPU renderer (None when headless).
     renderer: Option<Renderer>,
-    daemon_client: Option<DaemonClient>,
-    /// Current window state (tabs info) from daemon.
-    window_state: Option<WindowState>,
-    /// All pane snapshots from daemon.
-    panes: Vec<PaneSnapshot>,
-    /// Whether we need to redraw.
-    dirty: bool,
-    /// Current modifier state.
-    modifiers: WinitModifiers,
-    /// Keyboard state for encoding (tracks protocol mode from daemon).
-    keyboard_state: KeyboardState,
+    /// All open tabs.
+    tabs: Vec<Tab>,
+    /// Index of the currently active tab.
+    active_tab: usize,
     /// Application configuration.
     config: Config,
     /// Keybinding action map.
     action_map: HashMap<(bool, bool, bool, bool, String), Action>,
-    /// Event loop proxy for waking from daemon poll thread.
-    event_loop_proxy: Option<EventLoopProxy<()>>,
-    /// Shutdown signal for daemon poll thread.
+    /// Current modifier state.
+    modifiers: WinitModifiers,
+    /// Keyboard state for encoding.
+    keyboard_state: KeyboardState,
+    /// Event loop proxy for signaling from other threads.
+    event_loop_proxy: Option<EventLoopProxy<UserEvent>>,
+    /// Shutdown signal.
     shutdown: Arc<AtomicBool>,
+    /// Current mouse cursor position.
+    cursor_position: PhysicalPosition<f64>,
+    /// Frame counter for FPS logging.
+    frame_count: u64,
+    /// Last time we logged FPS.
+    last_frame_log: std::time::Instant,
+    /// Whether window should be created on next opportunity.
+    should_create_window: bool,
 }
 
-const DAEMON_SOCKET_KEY: usize = 1;
+const PTY_KEY: usize = 1;
 
 impl App {
     fn new() -> Self {
         let config = Config::load();
         log::info!("Config: font_size={}", config.font_size);
         
-        // Build action map from keybindings
         let action_map = config.keybindings.build_action_map();
+        log::info!("Action map built with {} bindings:", action_map.len());
+        for (key, action) in &action_map {
+            log::info!("  {:?} => {:?}", key, action);
+        }
         
         Self {
             window: None,
             renderer: None,
-            daemon_client: None,
-            window_state: None,
-            panes: Vec::new(),
-            dirty: true,
-            modifiers: WinitModifiers::default(),
-            keyboard_state: KeyboardState::new(),
+            tabs: Vec::new(),
+            active_tab: 0,
             config,
             action_map,
+            modifiers: WinitModifiers::default(),
+            keyboard_state: KeyboardState::new(),
             event_loop_proxy: None,
             shutdown: Arc::new(AtomicBool::new(false)),
+            cursor_position: PhysicalPosition::new(0.0, 0.0),
+            frame_count: 0,
+            last_frame_log: std::time::Instant::now(),
+            should_create_window: false,
         }
     }
     
-    fn set_event_loop_proxy(&mut self, proxy: EventLoopProxy<()>) {
+    fn set_event_loop_proxy(&mut self, proxy: EventLoopProxy<UserEvent>) {
         self.event_loop_proxy = Some(proxy);
     }
-
-    fn initialize(&mut self, event_loop: &ActiveEventLoop) {
-        let init_start = std::time::Instant::now();
+    
+    /// Create a new tab and start its I/O thread.
+    /// Returns the index of the new tab.
+    fn create_tab(&mut self, cols: usize, rows: usize) -> Option<usize> {
+        log::info!("Creating new tab with {}x{} terminal", cols, rows);
         
-        // Create window first so it appears immediately
+        match Tab::new(cols, rows, self.config.scrollback_lines) {
+            Ok(tab) => {
+                let tab_idx = self.tabs.len();
+                
+                // Start I/O threads for all panes in this tab
+                for pane in tab.panes.values() {
+                    self.start_pane_io_thread(pane);
+                }
+                
+                self.tabs.push(tab);
+                self.active_tab = tab_idx;
+                
+                log::info!("Tab {} created (total: {})", tab_idx, self.tabs.len());
+                Some(tab_idx)
+            }
+            Err(e) => {
+                log::error!("Failed to create tab: {}", e);
+                None
+            }
+        }
+    }
+    
+    /// Start background I/O thread for a pane's PTY.
+    fn start_pane_io_thread(&self, pane: &Pane) {
+        self.start_pane_io_thread_with_info(pane.id, pane.pty_fd, pane.pty_buffer.clone());
+    }
+    
+    /// Start background I/O thread for a pane's PTY with explicit info.
+    fn start_pane_io_thread_with_info(&self, pane_id: PaneId, pty_fd: i32, pty_buffer: Arc<SharedPtyBuffer>) {
+        let Some(proxy) = self.event_loop_proxy.clone() else { return };
+        let shutdown = self.shutdown.clone();
+        
+        std::thread::Builder::new()
+            .name(format!("pty-io-{}", pane_id.0))
+            .spawn(move || {
+                const INPUT_DELAY: Duration = Duration::from_millis(3);
+                
+                let poller = match Poller::new() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::error!("Failed to create PTY poller: {}", e);
+                        return;
+                    }
+                };
+                
+                unsafe {
+                    if let Err(e) = poller.add(pty_fd, Event::readable(PTY_KEY)) {
+                        log::error!("Failed to add PTY to poller: {}", e);
+                        return;
+                    }
+                }
+                
+                let mut events = Events::new();
+                let mut last_wakeup_at = std::time::Instant::now();
+                let mut has_pending_wakeup = false;
+                
+                while !shutdown.load(Ordering::Relaxed) {
+                    events.clear();
+                    
+                    let has_space = pty_buffer.has_space();
+                    
+                    let timeout = if has_pending_wakeup {
+                        let elapsed = last_wakeup_at.elapsed();
+                        Some(INPUT_DELAY.saturating_sub(elapsed))
+                    } else {
+                        Some(Duration::from_millis(100))
+                    };
+                    
+                    match poller.wait(&mut events, timeout) {
+                        Ok(_) if !events.is_empty() && has_space => {
+                            loop {
+                                let result = pty_buffer.read_from_fd(pty_fd);
+                                if result < 0 {
+                                    let err = std::io::Error::last_os_error();
+                                    if err.kind() == std::io::ErrorKind::Interrupted {
+                                        continue;
+                                    }
+                                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                                        break;
+                                    }
+                                    log::debug!("PTY read error: {}", err);
+                                    break;
+                                } else if result == 0 {
+                                    break;
+                                } else {
+                                    has_pending_wakeup = true;
+                                    continue;
+                                }
+                            }
+                            
+                            let now = std::time::Instant::now();
+                            if now.duration_since(last_wakeup_at) >= INPUT_DELAY {
+                                let _ = proxy.send_event(UserEvent::PtyReadable(pane_id));
+                                last_wakeup_at = now;
+                                has_pending_wakeup = false;
+                            }
+                            
+                            unsafe {
+                                let _ = poller.modify(
+                                    std::os::fd::BorrowedFd::borrow_raw(pty_fd),
+                                    Event::readable(PTY_KEY),
+                                );
+                            }
+                        }
+                        Ok(_) => {
+                            if has_pending_wakeup {
+                                let now = std::time::Instant::now();
+                                if now.duration_since(last_wakeup_at) >= INPUT_DELAY {
+                                    let _ = proxy.send_event(UserEvent::PtyReadable(pane_id));
+                                    last_wakeup_at = now;
+                                    has_pending_wakeup = false;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("PTY poll error: {}", e);
+                            break;
+                        }
+                    }
+                }
+                
+                log::debug!("PTY I/O thread for pane {} exiting", pane_id.0);
+            })
+            .expect("Failed to spawn PTY I/O thread");
+    }
+    
+    /// Create the window and renderer.
+    fn create_window(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return; // Window already exists
+        }
+        
+        log::info!("Creating window");
+        
         let mut window_attributes = Window::default_attributes()
             .with_title("ZTerm")
             .with_inner_size(PhysicalSize::new(800, 600));
 
-        // Enable transparency if background opacity is less than 1.0
         if self.config.background_opacity < 1.0 {
             window_attributes = window_attributes.with_transparent(true);
         }
@@ -93,277 +979,147 @@ impl App {
                 .create_window(window_attributes)
                 .expect("Failed to create window"),
         );
-        log::debug!("Window created in {:?}", init_start.elapsed());
 
-        // Start daemon connection in parallel with renderer initialization
-        let daemon_start = std::time::Instant::now();
-        let mut daemon_client = match DaemonClient::connect() {
-            Ok(client) => client,
-            Err(e) => {
-                log::error!("Failed to connect to daemon: {}", e);
-                event_loop.exit();
-                return;
-            }
-        };
-        log::debug!("Daemon connected in {:?}", daemon_start.elapsed());
-
-        // Create renderer (this is the slow part - GPU initialization)
-        let renderer_start = std::time::Instant::now();
         let renderer = pollster::block_on(Renderer::new(window.clone(), &self.config));
-        log::debug!("Renderer created in {:?}", renderer_start.elapsed());
-
-        // Calculate terminal size based on window size
         let (cols, rows) = renderer.terminal_size();
-
-        // Send hello with our size
-        if let Err(e) = daemon_client.hello(cols, rows) {
-            log::error!("Failed to send hello: {}", e);
-            event_loop.exit();
-            return;
-        }
-
-        // Wait for initial state
-        match daemon_client.recv() {
-            Ok(DaemonMessage::FullState { window: win_state, panes }) => {
-                log::debug!("Received initial state with {} tabs, {} panes", 
-                    win_state.tabs.len(), panes.len());
-                self.window_state = Some(win_state);
-                self.panes = panes;
-            }
-            Ok(msg) => {
-                log::warn!("Unexpected initial message: {:?}", msg);
-            }
-            Err(e) => {
-                log::error!("Failed to receive initial state: {}", e);
-                event_loop.exit();
-                return;
-            }
-        }
         
-        // Switch to non-blocking mode for the event loop
-        if let Err(e) = daemon_client.set_nonblocking() {
-            log::error!("Failed to set non-blocking mode: {}", e);
-            event_loop.exit();
-            return;
-        }
-
-        // Set up polling for daemon socket in a background thread
-        // This thread will wake the event loop when data is available
-        if let Some(proxy) = self.event_loop_proxy.clone() {
-            let daemon_fd = daemon_client.as_raw_fd();
-            let shutdown = self.shutdown.clone();
-            
-            std::thread::spawn(move || {
-                let poller = match Poller::new() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log::error!("Failed to create poller: {}", e);
-                        return;
-                    }
-                };
-                
-                // SAFETY: daemon_fd is valid for the lifetime of the daemon_client,
-                // and we signal shutdown before dropping daemon_client
-                unsafe {
-                    if let Err(e) = poller.add(daemon_fd, Event::readable(DAEMON_SOCKET_KEY)) {
-                        log::error!("Failed to add daemon socket to poller: {}", e);
-                        return;
-                    }
-                }
-                
-                let mut events = Events::new();
-                
-                while !shutdown.load(Ordering::Relaxed) {
-                    events.clear();
-                    
-                    // Wait for data with a timeout so we can check shutdown
-                    match poller.wait(&mut events, Some(Duration::from_millis(100))) {
-                        Ok(_) if !events.is_empty() => {
-                            // Wake the event loop by sending an empty event
-                            let _ = proxy.send_event(());
-                            
-                            // Re-register for more events
-                            // SAFETY: daemon_fd is still valid
-                            unsafe {
-                                let _ = poller.modify(
-                                    std::os::fd::BorrowedFd::borrow_raw(daemon_fd),
-                                    Event::readable(DAEMON_SOCKET_KEY)
-                                );
-                            }
-                        }
-                        Ok(_) => {} // Timeout, no events
-                        Err(e) => {
-                            log::error!("Poller error: {}", e);
-                            break;
-                        }
-                    }
-                }
-                
-                log::debug!("Daemon poll thread exiting");
-            });
+        // Create first tab if no tabs exist
+        if self.tabs.is_empty() {
+            self.create_tab(cols, rows);
+        } else {
+            // Resize existing tabs to match window
+            self.resize_all_panes();
         }
 
         self.window = Some(window);
         self.renderer = Some(renderer);
-        self.daemon_client = Some(daemon_client);
-
-        log::info!("Client initialized in {:?}: {}x{} cells", init_start.elapsed(), cols, rows);
+        self.should_create_window = false;
+        
+        log::info!("Window created: {}x{} cells", cols, rows);
     }
+    
+    /// Destroy the window but keep terminal state.
+    fn destroy_window(&mut self) {
+        log::info!("Destroying window (keeping terminal alive)");
+        self.renderer = None;
+        self.window = None;
+    }
+    
+    /// Resize all panes in all tabs based on renderer dimensions.
+    fn resize_all_panes(&mut self) {
+        let Some(renderer) = &self.renderer else { return };
+        
+        let cell_width = renderer.cell_width;
+        let cell_height = renderer.cell_height;
+        let width = renderer.width as f32;
+        let height = renderer.height as f32 - renderer.tab_bar_height();
+        let border_width = 2.0; // Border width in pixels
+        
+        for tab in &mut self.tabs {
+            tab.resize(width, height, cell_width, cell_height, border_width);
+        }
+    }
+    
+    /// Process PTY data for a specific pane.
+    /// Returns true if any data was processed.
+    fn poll_pane(&mut self, pane_id: PaneId) -> bool {
+        // Find the pane across all tabs
+        for tab in &mut self.tabs {
+            if let Some(pane) = tab.get_pane_mut(pane_id) {
+                // Take all pending data atomically
+                let data = pane.pty_buffer.take_pending();
+                let len = data.len();
+                
+                if len == 0 {
+                    return false;
+                }
+                
+                let process_start = std::time::Instant::now();
+                pane.terminal.process(&data);
+                let process_time_ns = process_start.elapsed().as_nanos() as u64;
+                
+                if process_time_ns > 5_000_000 {
+                    log::info!("PTY: process={:.2}ms bytes={}",
+                        process_time_ns as f64 / 1_000_000.0,
+                        len);
+                }
+                
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Send bytes to the active tab's PTY.
+    fn write_to_pty(&mut self, data: &[u8]) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.write_to_pty(data);
+        }
+    }
+    
+    /// Get the active tab, if any.
+    fn active_tab(&self) -> Option<&Tab> {
+        self.tabs.get(self.active_tab)
+    }
+    
+    /// Get the active tab mutably, if any.
+    fn active_tab_mut(&mut self) -> Option<&mut Tab> {
+        self.tabs.get_mut(self.active_tab)
+    }
+    
+    fn resize(&mut self, new_size: PhysicalSize<u32>) {
+        if new_size.width == 0 || new_size.height == 0 {
+            return;
+        }
 
-    /// Gets all pane snapshots with their layout info for the active tab.
-    /// Returns (panes_with_info, active_pane_id) with cloned/owned data.
-    fn active_tab_panes(&self) -> (Vec<(PaneSnapshot, PaneInfo)>, PaneId) {
-        let Some(win) = self.window_state.as_ref() else {
-            return (Vec::new(), 0);
+        if let Some(renderer) = &mut self.renderer {
+            renderer.resize(new_size.width, new_size.height);
+        }
+        
+        // Resize all panes
+        self.resize_all_panes();
+        
+        if let Some(renderer) = &self.renderer {
+            let (cols, rows) = renderer.terminal_size();
+            log::debug!("Resized to {}x{} cells", cols, rows);
+        }
+    }
+    
+    fn get_scroll_offset(&self) -> usize {
+        self.active_tab()
+            .and_then(|t| t.active_pane())
+            .map(|p| p.terminal.scroll_offset)
+            .unwrap_or(0)
+    }
+    
+    fn has_mouse_tracking(&self) -> bool {
+        self.active_tab()
+            .and_then(|t| t.active_pane())
+            .map(|p| p.terminal.mouse_tracking != MouseTrackingMode::None)
+            .unwrap_or(false)
+    }
+    
+    fn get_mouse_modifiers(&self) -> u8 {
+        let mod_state = self.modifiers.state();
+        let mut mods = 0u8;
+        if mod_state.shift_key() { mods |= 1; }
+        if mod_state.alt_key() { mods |= 2; }
+        if mod_state.control_key() { mods |= 4; }
+        mods
+    }
+    
+    fn send_mouse_event(&mut self, button: u8, col: u16, row: u16, pressed: bool, is_motion: bool) {
+        let seq = {
+            let Some(tab) = self.active_tab() else { return };
+            let Some(pane) = tab.active_pane() else { return };
+            pane.terminal.encode_mouse(button, col, row, pressed, is_motion, self.get_mouse_modifiers())
         };
-        let Some(tab) = win.tabs.get(win.active_tab) else {
-            return (Vec::new(), 0);
-        };
-        
-        let active_pane_id = tab.panes.get(tab.active_pane)
-            .map(|p| p.id)
-            .unwrap_or(0);
-        
-        let panes_with_info: Vec<(PaneSnapshot, PaneInfo)> = tab.panes.iter()
-            .filter_map(|pane_info| {
-                self.panes.iter()
-                    .find(|snap| snap.pane_id == pane_info.id)
-                    .map(|snap| (snap.clone(), pane_info.clone()))
-            })
-            .collect();
-        
-        (panes_with_info, active_pane_id)
-    }
-
-    /// Gets the active pane ID and its snapshot.
-    fn get_active_pane(&self) -> Option<(PaneId, &PaneSnapshot)> {
-        let win = self.window_state.as_ref()?;
-        let tab = win.tabs.get(win.active_tab)?;
-        let pane_info = tab.panes.get(tab.active_pane)?;
-        let snapshot = self.panes.iter().find(|s| s.pane_id == pane_info.id)?;
-        Some((pane_info.id, snapshot))
-    }
-
-    fn poll_daemon(&mut self) {
-        let Some(client) = &mut self.daemon_client else { return };
-
-        // Read all available messages (non-blocking)
-        // The background thread wakes us when data is available
-        let mut messages = Vec::new();
-        loop {
-            match client.try_recv() {
-                Ok(Some(msg)) => {
-                    messages.push(msg);
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    log::error!("Daemon connection error: {}", e);
-                    // Daemon disconnected - we'll handle this after the loop
-                    messages.push(DaemonMessage::Shutdown);
-                    break;
-                }
-            }
-        }
-
-        // Now process messages without holding the client borrow
-        for msg in messages {
-            self.handle_daemon_message(msg);
+        if !seq.is_empty() {
+            self.write_to_pty(&seq);
         }
     }
 
-    fn handle_daemon_message(&mut self, msg: DaemonMessage) {
-        match msg {
-            DaemonMessage::FullState { window, panes } => {
-                log::debug!("Received full state: {} tabs, {} panes", 
-                    window.tabs.len(), panes.len());
-                self.window_state = Some(window);
-                self.panes = panes;
-                self.dirty = true;
-            }
-            DaemonMessage::PaneUpdate { pane_id, cells, cursor } => {
-                log::debug!("Received pane update for pane {}", pane_id);
-                if let Some(pane) = self.panes.iter_mut().find(|p| p.pane_id == pane_id) {
-                    pane.cells = cells;
-                    pane.cursor = cursor;
-                } else {
-                    // New pane
-                    self.panes.push(PaneSnapshot {
-                        pane_id,
-                        cells,
-                        cursor,
-                        scroll_offset: 0,
-                        scrollback_len: 0,
-                    });
-                }
-                self.dirty = true;
-            }
-            DaemonMessage::TabChanged { active_tab } => {
-                log::debug!("Tab changed to {}", active_tab);
-                if let Some(ref mut win) = self.window_state {
-                    win.active_tab = active_tab;
-                }
-                self.dirty = true;
-            }
-            DaemonMessage::TabCreated { tab } => {
-                log::debug!("Tab created: {:?}", tab);
-                if let Some(ref mut win) = self.window_state {
-                    win.tabs.push(tab);
-                }
-                self.dirty = true;
-            }
-            DaemonMessage::TabClosed { tab_id } => {
-                log::debug!("Tab closed: {}", tab_id);
-                if let Some(ref mut win) = self.window_state {
-                    win.tabs.retain(|t| t.id != tab_id);
-                    // Adjust active tab if needed
-                    if win.active_tab >= win.tabs.len() && !win.tabs.is_empty() {
-                        win.active_tab = win.tabs.len() - 1;
-                    }
-                }
-                // Remove panes for closed tab
-                // Note: daemon should send updated panes, but we clean up just in case
-                self.dirty = true;
-            }
-            DaemonMessage::PaneCreated { tab_id, pane } => {
-                log::debug!("Pane created in tab {}: {:?}", tab_id, pane);
-                if let Some(ref mut win) = self.window_state {
-                    if let Some(tab) = win.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.panes.push(pane);
-                    }
-                }
-                self.dirty = true;
-            }
-            DaemonMessage::PaneClosed { tab_id, pane_id } => {
-                log::debug!("Pane {} closed in tab {}", pane_id, tab_id);
-                if let Some(ref mut win) = self.window_state {
-                    if let Some(tab) = win.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.panes.retain(|p| p.id != pane_id);
-                    }
-                }
-                // Also remove from pane snapshots
-                self.panes.retain(|p| p.pane_id != pane_id);
-                self.dirty = true;
-            }
-            DaemonMessage::PaneFocused { tab_id, active_pane } => {
-                log::debug!("Pane focus changed in tab {}: pane {}", tab_id, active_pane);
-                if let Some(ref mut win) = self.window_state {
-                    if let Some(tab) = win.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.active_pane = active_pane;
-                    }
-                }
-                self.dirty = true;
-            }
-            DaemonMessage::Shutdown => {
-                log::info!("Daemon shutting down");
-                self.daemon_client = None;
-            }
-        }
-    }
-
-    /// Checks if the key event matches a keybinding and executes the action.
-    /// Returns true if the key was consumed by a keybinding.
     fn check_keybinding(&mut self, event: &KeyEvent) -> bool {
-        // Only process key presses, not releases or repeats
         if event.state != ElementState::Pressed || event.repeat {
             return false;
         }
@@ -374,7 +1130,6 @@ impl App {
         let shift = mod_state.shift_key();
         let super_key = mod_state.super_key();
 
-        // Get the key name
         let key_name = match &event.logical_key {
             Key::Named(named) => {
                 match named {
@@ -412,97 +1167,269 @@ impl App {
             _ => return false,
         };
 
-        // Look up the action
-        let lookup = (ctrl, alt, shift, super_key, key_name);
+        let lookup = (ctrl, alt, shift, super_key, key_name.clone());
+        log::debug!("Keybind lookup: {:?}", lookup);
         let Some(action) = self.action_map.get(&lookup).copied() else {
             return false;
         };
 
-        // Execute the action
+        log::info!("Executing action: {:?}", action);
+
         self.execute_action(action);
         true
     }
 
     fn execute_action(&mut self, action: Action) {
-        let Some(client) = &mut self.daemon_client else { return };
-
         match action {
+            Action::Copy => {
+                self.copy_selection_to_clipboard();
+            }
+            Action::Paste => {
+                self.paste_from_clipboard();
+            }
             Action::NewTab => {
-                log::debug!("Action: NewTab");
-                let _ = client.create_tab();
-            }
-            Action::NextTab => {
-                log::debug!("Action: NextTab");
-                let _ = client.next_tab();
-            }
-            Action::PrevTab => {
-                log::debug!("Action: PrevTab");
-                let _ = client.prev_tab();
-            }
-            Action::Tab1 => { let _ = client.switch_tab_index(0); }
-            Action::Tab2 => { let _ = client.switch_tab_index(1); }
-            Action::Tab3 => { let _ = client.switch_tab_index(2); }
-            Action::Tab4 => { let _ = client.switch_tab_index(3); }
-            Action::Tab5 => { let _ = client.switch_tab_index(4); }
-            Action::Tab6 => { let _ = client.switch_tab_index(5); }
-            Action::Tab7 => { let _ = client.switch_tab_index(6); }
-            Action::Tab8 => { let _ = client.switch_tab_index(7); }
-            Action::Tab9 => { let _ = client.switch_tab_index(8); }
-            Action::SplitHorizontal => {
-                log::debug!("Action: SplitHorizontal");
-                let _ = client.split_horizontal();
-            }
-            Action::SplitVertical => {
-                log::debug!("Action: SplitVertical");
-                let _ = client.split_vertical();
+                if let Some(renderer) = &self.renderer {
+                    let (cols, rows) = renderer.terminal_size();
+                    self.create_tab(cols, rows);
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
             }
             Action::ClosePane => {
-                log::debug!("Action: ClosePane");
-                let _ = client.close_pane();
+                self.close_active_pane();
+            }
+            Action::NextTab => {
+                if !self.tabs.is_empty() {
+                    self.active_tab = (self.active_tab + 1) % self.tabs.len();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+            Action::PrevTab => {
+                if !self.tabs.is_empty() {
+                    self.active_tab = if self.active_tab == 0 {
+                        self.tabs.len() - 1
+                    } else {
+                        self.active_tab - 1
+                    };
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+            Action::Tab1 => self.switch_to_tab(0),
+            Action::Tab2 => self.switch_to_tab(1),
+            Action::Tab3 => self.switch_to_tab(2),
+            Action::Tab4 => self.switch_to_tab(3),
+            Action::Tab5 => self.switch_to_tab(4),
+            Action::Tab6 => self.switch_to_tab(5),
+            Action::Tab7 => self.switch_to_tab(6),
+            Action::Tab8 => self.switch_to_tab(7),
+            Action::Tab9 => self.switch_to_tab(8),
+            Action::SplitHorizontal => {
+                self.split_pane(true);
+            }
+            Action::SplitVertical => {
+                self.split_pane(false);
             }
             Action::FocusPaneUp => {
-                log::debug!("Action: FocusPaneUp");
-                let _ = client.focus_pane(Direction::Up);
+                self.focus_pane(Direction::Up);
             }
             Action::FocusPaneDown => {
-                log::debug!("Action: FocusPaneDown");
-                let _ = client.focus_pane(Direction::Down);
+                self.focus_pane(Direction::Down);
             }
             Action::FocusPaneLeft => {
-                log::debug!("Action: FocusPaneLeft");
-                let _ = client.focus_pane(Direction::Left);
+                self.focus_pane(Direction::Left);
             }
             Action::FocusPaneRight => {
-                log::debug!("Action: FocusPaneRight");
-                let _ = client.focus_pane(Direction::Right);
+                self.focus_pane(Direction::Right);
             }
         }
     }
-
+    
+    fn split_pane(&mut self, horizontal: bool) {
+        // Get terminal dimensions
+        let (cols, rows) = if let Some(renderer) = &self.renderer {
+            renderer.terminal_size()
+        } else {
+            return;
+        };
+        
+        let scrollback_lines = self.config.scrollback_lines;
+        let active_tab = self.active_tab;
+        
+        // Create the new pane and get its info for the I/O thread
+        let new_pane_info = if let Some(tab) = self.tabs.get_mut(active_tab) {
+            match tab.split(horizontal, cols, rows, scrollback_lines) {
+                Ok(new_pane_id) => {
+                    // Get the info we need to start the I/O thread
+                    tab.get_pane(new_pane_id).map(|pane| {
+                        (pane.id, pane.pty_fd, pane.pty_buffer.clone())
+                    })
+                }
+                Err(e) => {
+                    log::error!("Failed to split pane: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        
+        // Start I/O thread for the new pane (outside the tab borrow)
+        if let Some((pane_id, pty_fd, pty_buffer)) = new_pane_info {
+            self.start_pane_io_thread_with_info(pane_id, pty_fd, pty_buffer);
+            // Recalculate layout
+            self.resize_all_panes();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            log::info!("Split pane (horizontal={}), new pane {}", horizontal, pane_id.0);
+        }
+    }
+    
+    fn focus_pane(&mut self, direction: Direction) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.focus_neighbor(direction);
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+    
+    fn close_active_pane(&mut self) {
+        let should_close_tab = if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.close_active_pane();
+            tab.panes.is_empty()
+        } else {
+            false
+        };
+        
+        if should_close_tab {
+            self.tabs.remove(self.active_tab);
+            if !self.tabs.is_empty() && self.active_tab >= self.tabs.len() {
+                self.active_tab = self.tabs.len() - 1;
+            }
+        } else {
+            // Recalculate layout after removing pane
+            self.resize_all_panes();
+        }
+        
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+    
+    fn switch_to_tab(&mut self, idx: usize) {
+        if idx < self.tabs.len() {
+            self.active_tab = idx;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+    
+    fn paste_from_clipboard(&mut self) {
+        let output = match Command::new("wl-paste")
+            .arg("--no-newline")
+            .output()
+        {
+            Ok(output) => output,
+            Err(e) => {
+                log::warn!("Failed to run wl-paste: {}", e);
+                return;
+            }
+        };
+        
+        if output.status.success() && !output.stdout.is_empty() {
+            self.write_to_pty(&output.stdout);
+        }
+    }
+    
+    fn copy_selection_to_clipboard(&mut self) {
+        let Some(tab) = self.active_tab() else { return };
+        let Some(pane) = tab.active_pane() else { return };
+        let Some(selection) = &pane.selection else { return };
+        let terminal = &pane.terminal;
+        
+        let (start, end) = selection.normalized();
+        let mut text = String::new();
+        
+        let scroll_offset = terminal.scroll_offset as isize;
+        let rows = terminal.rows;
+        
+        let screen_start_row = (start.row + scroll_offset).max(0) as usize;
+        let screen_end_row = ((end.row + scroll_offset).max(0) as usize).min(rows.saturating_sub(1));
+        
+        let visible_rows = terminal.visible_rows();
+        
+        for screen_row in screen_start_row..=screen_end_row {
+            if screen_row >= visible_rows.len() {
+                break;
+            }
+            
+            let content_row = screen_row as isize - scroll_offset;
+            if content_row < start.row || content_row > end.row {
+                continue;
+            }
+            
+            let row_cells = visible_rows[screen_row];
+            let cols = row_cells.len();
+            let col_start = if content_row == start.row { start.col } else { 0 };
+            let col_end = if content_row == end.row { end.col } else { cols.saturating_sub(1) };
+            
+            let mut line = String::new();
+            for col in col_start..=col_end.min(cols.saturating_sub(1)) {
+                let c = row_cells[col].character;
+                if c != '\0' {
+                    line.push(c);
+                }
+            }
+            
+            text.push_str(line.trim_end());
+            if content_row < end.row {
+                text.push('\n');
+            }
+        }
+        
+        if text.is_empty() {
+            return;
+        }
+        
+        match Command::new("wl-copy")
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let _ = child.wait();
+            }
+            Err(e) => {
+                log::warn!("Failed to run wl-copy: {}", e);
+            }
+        }
+    }
+    
     fn handle_keyboard_input(&mut self, event: KeyEvent) {
-        // First check if this is a keybinding
         if self.check_keybinding(&event) {
             return;
         }
 
-        // Determine event type
         let event_type = match event.state {
             ElementState::Pressed => {
-                if event.repeat {
-                    KeyEventType::Repeat
-                } else {
-                    KeyEventType::Press
-                }
+                if event.repeat { KeyEventType::Repeat } else { KeyEventType::Press }
             }
             ElementState::Released => KeyEventType::Release,
         };
 
-        // In legacy mode, ignore release events
         if event_type == KeyEventType::Release && !self.keyboard_state.report_events() {
             return;
         }
 
-        // Build modifiers from the tracked state
         let mod_state = self.modifiers.state();
         let modifiers = Modifiers {
             shift: mod_state.shift_key(),
@@ -576,58 +1503,58 @@ impl App {
         };
 
         if let Some(bytes) = bytes {
-            // Check scroll offset before borrowing client mutably
-            let scroll_reset = self.get_active_pane()
-                .filter(|(_, snapshot)| snapshot.scroll_offset > 0)
-                .map(|(pane_id, snapshot)| (pane_id, snapshot.scroll_offset));
-            
-            // Now borrow client mutably
-            if let Some(client) = &mut self.daemon_client {
-                let _ = client.send_input(bytes);
-                
-                // Reset scroll position when typing (go back to live terminal)
-                if let Some((active_pane_id, scroll_offset)) = scroll_reset {
-                    let _ = client.send(&ClientMessage::Scroll { 
-                        pane_id: active_pane_id, 
-                        delta: -(scroll_offset as i32) 
-                    });
+            // Reset scroll when typing
+            if let Some(tab) = self.active_tab_mut() {
+                if let Some(pane) = tab.active_pane_mut() {
+                    if pane.terminal.scroll_offset > 0 {
+                        pane.terminal.scroll_offset = 0;
+                    }
                 }
             }
-        }
-    }
-
-    fn resize(&mut self, new_size: PhysicalSize<u32>) {
-        if new_size.width == 0 || new_size.height == 0 {
-            return;
-        }
-
-        if let Some(renderer) = &mut self.renderer {
-            renderer.resize(new_size.width, new_size.height);
-
-            let (cols, rows) = renderer.terminal_size();
-
-            if let Some(client) = &mut self.daemon_client {
-                let _ = client.send_resize(cols, rows);
-            }
-
-            log::debug!("Resized to {}x{} cells", cols, rows);
-            self.dirty = true;
+            self.write_to_pty(&bytes);
         }
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
-            self.initialize(event_loop);
+            self.create_window(event_loop);
+        }
+    }
+    
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::ShowWindow => {
+                log::info!("Received signal to show window");
+                if self.window.is_none() {
+                    self.create_window(event_loop);
+                }
+            }
+            UserEvent::PtyReadable(pane_id) => {
+                // I/O thread has batched wakeups - read all available data now
+                let start = std::time::Instant::now();
+                self.poll_pane(pane_id);
+                let process_time = start.elapsed();
+                
+                // Request redraw to display the new content
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+                
+                if process_time.as_millis() > 5 {
+                    log::info!("PTY process took {:?}", process_time);
+                }
+            }
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                log::info!("Window close requested");
-                event_loop.exit();
+                log::info!("Window close requested - hiding window");
+                self.destroy_window();
+                // Don't exit - keep running headless
             }
 
             WindowEvent::Resized(new_size) => {
@@ -636,20 +1563,16 @@ impl ApplicationHandler for App {
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 log::info!("Scale factor changed to {}", scale_factor);
-                if let Some(renderer) = &mut self.renderer {
-                    if renderer.set_scale_factor(scale_factor) {
-                        let (cols, rows) = renderer.terminal_size();
-                        
-                        if let Some(client) = &mut self.daemon_client {
-                            let _ = client.send_resize(cols, rows);
-                        }
-                        
-                        log::info!("Terminal resized to {}x{} cells after scale change", cols, rows);
-                    }
-                    
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
+                let should_resize = if let Some(renderer) = &mut self.renderer {
+                    renderer.set_scale_factor(scale_factor)
+                } else {
+                    false
+                };
+                if should_resize {
+                    self.resize_all_panes();
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
                 }
             }
 
@@ -658,31 +1581,133 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                // Handle mouse wheel for scrollback
                 let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => {
-                        // y > 0 means scrolling up (into history), y < 0 means down
-                        (y * 3.0) as i32  // 3 lines per scroll notch
-                    }
-                    MouseScrollDelta::PixelDelta(pos) => {
-                        // Convert pixels to lines (rough approximation)
-                        (pos.y / 20.0) as i32
-                    }
+                    MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as i32,
+                    MouseScrollDelta::PixelDelta(pos) => (pos.y / 20.0) as i32,
                 };
                 
                 if lines != 0 {
-                    // Get the active pane ID to scroll
-                    if let Some((active_pane_id, _)) = self.get_active_pane() {
-                        if let Some(client) = &mut self.daemon_client {
-                            let _ = client.send(&ClientMessage::Scroll { 
-                                pane_id: active_pane_id, 
-                                delta: lines 
-                            });
+                    if self.has_mouse_tracking() {
+                        if let Some(renderer) = &self.renderer {
+                            if let Some((col, row)) = renderer.pixel_to_cell(
+                                self.cursor_position.x,
+                                self.cursor_position.y
+                            ) {
+                                let button = if lines > 0 { 64 } else { 65 };
+                                let count = lines.abs().min(3);
+                                for _ in 0..count {
+                                    self.send_mouse_event(button, col as u16, row as u16, true, false);
+                                }
+                            }
+                        }
+                    } else if let Some(tab) = self.active_tab_mut() {
+                        // Positive lines = scroll wheel up = go into history (increase offset)
+                        if let Some(pane) = tab.active_pane_mut() {
+                            pane.terminal.scroll(lines);
                         }
                     }
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
+                }
+            }
+            
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_position = position;
+                
+                let is_selecting = self.active_tab()
+                    .and_then(|t| t.active_pane())
+                    .map(|p| p.is_selecting)
+                    .unwrap_or(false);
+                if is_selecting && !self.has_mouse_tracking() {
+                    if let Some(renderer) = &self.renderer {
+                        if let Some((col, screen_row)) = renderer.pixel_to_cell(position.x, position.y) {
+                            let scroll_offset = self.get_scroll_offset();
+                            let content_row = screen_row as isize - scroll_offset as isize;
+                            
+                            if let Some(tab) = self.active_tab_mut() {
+                                if let Some(pane) = tab.active_pane_mut() {
+                                    if let Some(ref mut selection) = pane.selection {
+                                        selection.end = CellPosition { col, row: content_row };
+                                        if let Some(window) = &self.window {
+                                            window.request_redraw();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            WindowEvent::MouseInput { state, button, .. } => {
+                let button_code = match button {
+                    MouseButton::Left => 0,
+                    MouseButton::Middle => 1,
+                    MouseButton::Right => 2,
+                    _ => return,
+                };
+                
+                if self.has_mouse_tracking() {
+                    if let Some(renderer) = &self.renderer {
+                        if let Some((col, row)) = renderer.pixel_to_cell(
+                            self.cursor_position.x,
+                            self.cursor_position.y
+                        ) {
+                            let pressed = state == ElementState::Pressed;
+                            self.send_mouse_event(button_code, col as u16, row as u16, pressed, false);
+                            if button == MouseButton::Left {
+                                if let Some(tab) = self.active_tab_mut() {
+                                    if let Some(pane) = tab.active_pane_mut() {
+                                        pane.is_selecting = pressed;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(tab) = self.active_tab_mut() {
+                        if let Some(pane) = tab.active_pane_mut() {
+                            pane.selection = None;
+                        }
+                    }
+                } else if button == MouseButton::Left {
+                    match state {
+                        ElementState::Pressed => {
+                            if let Some(renderer) = &self.renderer {
+                                if let Some((col, screen_row)) = renderer.pixel_to_cell(
+                                    self.cursor_position.x, 
+                                    self.cursor_position.y
+                                ) {
+                                    let scroll_offset = self.get_scroll_offset();
+                                    let content_row = screen_row as isize - scroll_offset as isize;
+                                    let pos = CellPosition { col, row: content_row };
+                                    if let Some(tab) = self.active_tab_mut() {
+                                        if let Some(pane) = tab.active_pane_mut() {
+                                            pane.selection = Some(Selection { start: pos, end: pos });
+                                            pane.is_selecting = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        ElementState::Released => {
+                            let was_selecting = self.active_tab()
+                                .and_then(|t| t.active_pane())
+                                .map(|p| p.is_selecting)
+                                .unwrap_or(false);
+                            if was_selecting {
+                                if let Some(tab) = self.active_tab_mut() {
+                                    if let Some(pane) = tab.active_pane_mut() {
+                                        pane.is_selecting = false;
+                                    }
+                                }
+                                self.copy_selection_to_clipboard();
+                            }
+                        }
+                    }
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
                 }
             }
 
@@ -694,33 +1719,75 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                // Gather all panes for the active tab with their layout info (cloned to avoid borrow conflict)
-                let (panes_with_info, active_pane_id) = self.active_tab_panes();
-                let tabs = self.window_state.as_ref().map(|w| w.tabs.clone());
-                let active_tab = self.window_state.as_ref().map(|w| w.active_tab).unwrap_or(0);
+                let frame_start = std::time::Instant::now();
+                self.frame_count += 1;
+                
+                if self.last_frame_log.elapsed() >= Duration::from_secs(1) {
+                    log::debug!("FPS: {}", self.frame_count);
+                    self.frame_count = 0;
+                    self.last_frame_log = std::time::Instant::now();
+                }
+                
+                // Note: poll_pane() is called from UserEvent::PtyReadable, not here.
+                // This avoids double-processing and keeps rendering fast.
+                
+                // Send any terminal responses back to PTY (for active pane)
+                if let Some(tab) = self.active_tab_mut() {
+                    if let Some(pane) = tab.active_pane_mut() {
+                        if let Some(response) = pane.terminal.take_response() {
+                            pane.write_to_pty(&response);
+                        }
+                        
+                        // Track scrollback changes for selection adjustment
+                        let scrollback_len = pane.terminal.scrollback.len() as u32;
+                        if scrollback_len != pane.last_scrollback_len {
+                            let lines_added = scrollback_len.saturating_sub(pane.last_scrollback_len) as isize;
+                            if let Some(ref mut selection) = pane.selection {
+                                selection.start.row -= lines_added;
+                                selection.end.row -= lines_added;
+                            }
+                            pane.last_scrollback_len = scrollback_len;
+                        }
+                    }
+                }
+                
+                // Render
+                let render_start = std::time::Instant::now();
+                let num_tabs = self.tabs.len();
+                let active_tab_idx = self.active_tab;
                 
                 if let Some(renderer) = &mut self.renderer {
-                    if !panes_with_info.is_empty() {
-                        let tabs = tabs.unwrap_or_default();
-                        // Convert owned data to references for the renderer
-                        let pane_refs: Vec<(&PaneSnapshot, &PaneInfo)> = panes_with_info.iter()
-                            .map(|(snap, info)| (snap, info))
-                            .collect();
-                        match renderer.render_with_tabs(&pane_refs, active_pane_id, &tabs, active_tab) {
-                            Ok(_) => {}
-                            Err(wgpu::SurfaceError::Lost) => {
-                                renderer.resize(renderer.width, renderer.height);
-                            }
-                            Err(wgpu::SurfaceError::OutOfMemory) => {
-                                log::error!("Out of GPU memory!");
-                                event_loop.exit();
-                            }
-                            Err(e) => {
-                                log::error!("Render error: {:?}", e);
+                    if let Some(tab) = self.tabs.get(active_tab_idx) {
+                        if let Some(pane) = tab.active_pane() {
+                            let scroll_offset = pane.terminal.scroll_offset;
+                            let visible_rows = renderer.terminal_size().1;
+                            let renderer_selection = pane.selection.as_ref()
+                                .and_then(|sel| sel.to_screen_coords(scroll_offset, visible_rows));
+                            
+                            renderer.set_selection(renderer_selection);
+                            
+                            match renderer.render_from_terminal(&pane.terminal, num_tabs, active_tab_idx) {
+                                Ok(_) => {}
+                                Err(wgpu::SurfaceError::Lost) => {
+                                    renderer.resize(renderer.width, renderer.height);
+                                }
+                                Err(wgpu::SurfaceError::OutOfMemory) => {
+                                    log::error!("Out of GPU memory!");
+                                    event_loop.exit();
+                                }
+                                Err(e) => {
+                                    log::error!("Render error: {:?}", e);
+                                }
                             }
                         }
-                        self.dirty = false;
                     }
+                }
+                let render_time = render_start.elapsed();
+                let frame_time = frame_start.elapsed();
+                
+                if frame_time.as_millis() > 10 {
+                    log::info!("Slow frame: total={:?} render={:?}", 
+                        frame_time, render_time);
                 }
             }
 
@@ -729,70 +1796,96 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Check if daemon is still connected
-        if self.daemon_client.is_none() {
-            log::info!("Lost connection to daemon, exiting");
+        // Check if all tabs have exited
+        if self.tabs.is_empty() {
+            log::info!("All tabs closed, exiting");
             event_loop.exit();
             return;
         }
-
-        // Poll daemon for updates
-        self.poll_daemon();
         
-        // Request redraw if we have new content
-        if self.dirty {
-            if let Some(window) = &self.window {
-                window.request_redraw();
+        // Check for exited tabs and remove them
+        let mut i = 0;
+        while i < self.tabs.len() {
+            if self.tabs[i].child_exited() {
+                log::info!("Tab {} shell exited", i);
+                self.tabs.remove(i);
+                if self.active_tab >= self.tabs.len() && !self.tabs.is_empty() {
+                    self.active_tab = self.tabs.len() - 1;
+                }
+            } else {
+                i += 1;
             }
         }
         
-        // Use WaitUntil to wake up periodically and check for daemon messages
-        // This is more compatible than relying on send_event across threads
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            std::time::Instant::now() + Duration::from_millis(16)
-        ));
-    }
-    
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
-        // Daemon poll thread woke us up - poll for messages
-        self.poll_daemon();
-        
-        // Request redraw if we have new content
-        if self.dirty {
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+        if self.tabs.is_empty() {
+            log::info!("All tabs closed, exiting");
+            event_loop.exit();
+            return;
         }
+        
+        // Batching is done in the I/O thread (Kitty-style).
+        // We just wait for events here.
+        event_loop.set_control_flow(ControlFlow::Wait);
     }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
-        // Signal the daemon poll thread to exit
         self.shutdown.store(true, Ordering::Relaxed);
+        remove_pid_file();
     }
 }
 
 fn main() {
-    // Initialize logging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    log::info!("Starting ZTerm client");
+    log::info!("Starting ZTerm");
 
-    // Create event loop with Wayland preference
-    let event_loop = EventLoop::builder()
+    // Check for existing instance
+    if signal_existing_instance() {
+        log::info!("Signaled existing instance, exiting");
+        return;
+    }
+
+    // Write PID file
+    if let Err(e) = write_pid_file() {
+        log::warn!("Failed to write PID file: {}", e);
+    }
+
+    // Set up SIGUSR1 handler
+    unsafe {
+        libc::signal(libc::SIGUSR1, handle_sigusr1 as usize);
+    }
+
+    // Create event loop
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
         .with_any_thread(true)
         .build()
         .expect("Failed to create event loop");
 
-    // Use Wait instead of Poll to avoid busy-looping
-    // The daemon poll thread will wake us when data is available
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = App::new();
+    let proxy = event_loop.create_proxy();
+    app.set_event_loop_proxy(proxy.clone());
     
-    // Give the app a proxy to wake the event loop from the daemon poll thread
-    app.set_event_loop_proxy(event_loop.create_proxy());
-    
+    // Store proxy for signal handler (uses the global static defined below)
+    unsafe {
+        EVENT_PROXY = Some(proxy);
+    }
+
     event_loop.run_app(&mut app).expect("Event loop error");
+}
+
+// Global static for signal handler access
+static mut EVENT_PROXY: Option<EventLoopProxy<UserEvent>> = None;
+
+extern "C" fn handle_sigusr1(_: i32) {
+    // Signal handler - must be async-signal-safe
+    // We can only set a flag here, the actual window creation happens in the event loop
+    unsafe {
+        if let Some(ref proxy) = EVENT_PROXY {
+            let _ = proxy.send_event(UserEvent::ShowWindow);
+        }
+    }
 }

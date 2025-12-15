@@ -11,18 +11,11 @@ path = "src/lib.rs"
 name = "zterm"
 path = "src/main.rs"
 
-[[bin]]
-name = "ztermd"
-path = "src/bin/ztermd.rs"
-
 [dependencies]
 # Window and rendering
 winit = { version = "0.30", features = ["wayland", "x11"] }
 wgpu = "23"
 pollster = "0.4"
-
-# Terminal emulation
-vte = "0.13"
 
 # PTY handling
 rustix = { version = "0.38", features = ["termios", "pty", "process", "fs"] }
@@ -50,4 +43,11 @@ ttf-parser = "0.25"
 # Configuration
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+bincode = "1"
 dirs = "6"
+
+# Shared memory for fast IPC
+memmap2 = "0.9"
+
+# Fast byte searching
+memchr = "2"

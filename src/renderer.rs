@@ -2,12 +2,77 @@
 //! Uses rustybuzz (HarfBuzz port) for text shaping to support font features.
 
 use crate::config::TabBarPosition;
-use crate::protocol::{CellColor, CursorStyle, PaneId, PaneInfo, PaneSnapshot, TabInfo};
-use crate::terminal::{Color, ColorPalette, CursorShape, Terminal};
+use crate::terminal::{Color, ColorPalette, CursorShape, GPUCell, Terminal};
 use fontdue::Font as FontdueFont;
 use rustybuzz::UnicodeBuffer;
 use std::collections::HashMap;
 use std::sync::Arc;
+use wgpu::util::DeviceExt;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KITTY-STYLE INSTANCED RENDERING STRUCTURES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Color table for shader uniform (258 colors: 256 indexed + default fg/bg).
+/// Each color is stored as [R, G, B, A] in linear color space.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct ColorTableUniform {
+    colors: [[f32; 4]; 258],
+}
+
+// Manual bytemuck implementations since Pod/Zeroable aren't derived for [T; 258]
+unsafe impl bytemuck::Zeroable for ColorTableUniform {}
+unsafe impl bytemuck::Pod for ColorTableUniform {}
+
+impl Default for ColorTableUniform {
+    fn default() -> Self {
+        Self {
+            colors: [[0.0; 4]; 258],
+        }
+    }
+}
+
+/// Grid parameters for instanced rendering.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct GridParamsUniform {
+    /// Number of columns
+    cols: u32,
+    /// Number of rows
+    rows: u32,
+    /// Cell width in pixels
+    cell_width: f32,
+    /// Cell height in pixels
+    cell_height: f32,
+    /// Screen width in pixels
+    screen_width: f32,
+    /// Screen height in pixels
+    screen_height: f32,
+    /// Y offset for tab bar
+    y_offset: f32,
+    /// Cursor column (-1 if hidden)
+    cursor_col: i32,
+    /// Cursor row (-1 if hidden)
+    cursor_row: i32,
+    /// Cursor style: 0=block, 1=underline, 2=bar
+    cursor_style: u32,
+    /// Padding for 16-byte alignment
+    _padding: [u32; 2],
+}
+
+/// Sprite info for glyph atlas lookup.
+/// Matches the SpriteInfo struct in the shader.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SpriteInfo {
+    /// UV coordinates in atlas (x, y, width, height) - normalized 0-1
+    pub uv: [f32; 4],
+    /// Offset from cell origin (x, y) in pixels
+    pub offset: [f32; 2],
+    /// Size in pixels (width, height)
+    pub size: [f32; 2],
+}
 
 /// Size of the glyph atlas texture.
 const ATLAS_SIZE: u32 = 1024;
@@ -21,8 +86,6 @@ struct GlyphInfo {
     offset: [f32; 2],
     /// Size of the glyph in pixels.
     size: [f32; 2],
-    /// Advance width (how much to move cursor after this glyph).
-    advance: f32,
 }
 
 /// Wrapper to hold the rustybuzz Face with a 'static lifetime.
@@ -82,6 +145,7 @@ pub struct Renderer {
     atlas_dirty: bool,
 
     // Font and shaping
+    #[allow(dead_code)] // Kept alive for rustybuzz::Face which borrows it
     font_data: Box<[u8]>,
     fontdue_font: FontdueFont,
     fallback_fonts: Vec<FontdueFont>,
@@ -118,6 +182,55 @@ pub struct Renderer {
     tab_bar_position: TabBarPosition,
     /// Background opacity (0.0 = transparent, 1.0 = opaque).
     background_opacity: f32,
+    
+    // Reusable vertex/index buffers to avoid per-frame allocations
+    bg_vertices: Vec<GlyphVertex>,
+    bg_indices: Vec<u32>,
+    glyph_vertices: Vec<GlyphVertex>,
+    glyph_indices: Vec<u32>,
+    
+    /// Current selection range for rendering (start_col, start_row, end_col, end_row).
+    /// If set, cells within this range will be rendered with inverted colors.
+    selection: Option<(usize, usize, usize, usize)>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // KITTY-STYLE INSTANCED RENDERING INFRASTRUCTURE
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// Instanced rendering pipeline for backgrounds
+    cell_bg_pipeline: Option<wgpu::RenderPipeline>,
+    /// Instanced rendering pipeline for glyphs
+    cell_glyph_pipeline: Option<wgpu::RenderPipeline>,
+    /// Bind group for instanced rendering (color table, grid params, cells, sprites)
+    cell_bind_group: Option<wgpu::BindGroup>,
+    /// Bind group layout for instanced rendering
+    cell_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    
+    /// Color table uniform buffer (258 colors)
+    color_table_buffer: Option<wgpu::Buffer>,
+    /// Grid parameters uniform buffer
+    grid_params_buffer: Option<wgpu::Buffer>,
+    /// GPU cell storage buffer
+    cell_buffer: Option<wgpu::Buffer>,
+    /// Cell buffer capacity (number of cells)
+    cell_buffer_capacity: usize,
+    /// Sprite info storage buffer
+    sprite_buffer: Option<wgpu::Buffer>,
+    /// Sprite buffer capacity
+    sprite_buffer_capacity: usize,
+    
+    /// Index buffer for instanced quads (shared between bg and glyph)
+    quad_index_buffer: Option<wgpu::Buffer>,
+    
+    /// CPU-side sprite info array (maps sprite_idx -> SpriteInfo)
+    sprite_info: Vec<SpriteInfo>,
+    /// Map from character to sprite index for fast lookup
+    char_to_sprite: HashMap<char, u32>,
+    /// Next available sprite index
+    next_sprite_idx: u32,
+    
+    /// Whether to use instanced rendering (can be disabled for debugging)
+    use_instanced_rendering: bool,
 }
 
 use crate::config::Config;
@@ -185,7 +298,13 @@ impl Renderer {
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Mailbox,
+            // Use Immediate for lowest latency (no vsync wait)
+            // Fall back to Mailbox if Immediate not supported
+            present_mode: if surface_caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+                wgpu::PresentMode::Immediate
+            } else {
+                wgpu::PresentMode::Mailbox
+            },
             alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -365,6 +484,213 @@ impl Renderer {
             cache: None,
         });
 
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // KITTY-STYLE INSTANCED RENDERING INITIALIZATION
+        // ═══════════════════════════════════════════════════════════════════════════════
+        
+        // Initial capacity for cell buffer (e.g., 80x24 terminal = 1920 cells)
+        let initial_cell_capacity: usize = 80 * 40;
+        let initial_sprite_capacity: usize = 512;
+        
+        // Create color table uniform buffer (258 colors * 4 floats * 4 bytes = 4128 bytes)
+        let color_table_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Color Table Buffer"),
+            size: std::mem::size_of::<ColorTableUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Create grid params uniform buffer
+        let grid_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Grid Params Buffer"),
+            size: std::mem::size_of::<GridParamsUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Create cell storage buffer (GPUCell is 20 bytes)
+        let cell_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Cell Storage Buffer"),
+            size: (initial_cell_capacity * std::mem::size_of::<GPUCell>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Create sprite info storage buffer (SpriteInfo is 32 bytes)
+        let sprite_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Sprite Storage Buffer"),
+            size: (initial_sprite_capacity * std::mem::size_of::<SpriteInfo>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Create index buffer for instanced quads (6 indices per quad: 0,1,2, 0,2,3)
+        let quad_indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
+        let quad_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Quad Index Buffer"),
+            contents: bytemuck::cast_slice(&quad_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        
+        // Create bind group layout for instanced rendering (group 1)
+        let cell_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Cell Bind Group Layout"),
+            entries: &[
+                // binding 0: ColorTable uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // binding 1: GridParams uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // binding 2: cells storage buffer (read-only)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // binding 3: sprites storage buffer (read-only)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        
+        // Create bind group for instanced rendering
+        let cell_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Cell Bind Group"),
+            layout: &cell_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: color_table_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: grid_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: cell_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: sprite_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        
+        // Create pipeline layout for instanced rendering (uses both group 0 and group 1)
+        let cell_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Cell Pipeline Layout"),
+            bind_group_layouts: &[&glyph_bind_group_layout, &cell_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        
+        // Create background pipeline
+        let cell_bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Cell Background Pipeline"),
+            layout: Some(&cell_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_cell_bg"),
+                buffers: &[], // No vertex buffers - using instancing
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_cell"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        
+        // Create glyph pipeline
+        let cell_glyph_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Cell Glyph Pipeline"),
+            layout: Some(&cell_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_cell_glyph"),
+                buffers: &[], // No vertex buffers - using instancing
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_cell"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        
+        // Initialize sprite info array with entry 0 = no glyph/empty
+        let sprite_info = vec![SpriteInfo::default()];
+        
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // END KITTY-STYLE INSTANCED RENDERING INITIALIZATION
+        // ═══════════════════════════════════════════════════════════════════════════════
+
         // Create initial buffers with some capacity
         let initial_vertex_capacity = 4096;
         let initial_index_capacity = 6144;
@@ -418,6 +744,29 @@ impl Renderer {
             palette: ColorPalette::default(),
             tab_bar_position: config.tab_bar_position,
             background_opacity: config.background_opacity.clamp(0.0, 1.0),
+            // Pre-allocate reusable buffers for rendering
+            bg_vertices: Vec::with_capacity(4096),
+            bg_indices: Vec::with_capacity(6144),
+            glyph_vertices: Vec::with_capacity(4096),
+            glyph_indices: Vec::with_capacity(6144),
+            selection: None,
+            
+            // Kitty-style instanced rendering infrastructure
+            cell_bg_pipeline: Some(cell_bg_pipeline),
+            cell_glyph_pipeline: Some(cell_glyph_pipeline),
+            cell_bind_group: Some(cell_bind_group),
+            cell_bind_group_layout: Some(cell_bind_group_layout),
+            color_table_buffer: Some(color_table_buffer),
+            grid_params_buffer: Some(grid_params_buffer),
+            cell_buffer: Some(cell_buffer),
+            cell_buffer_capacity: initial_cell_capacity,
+            sprite_buffer: Some(sprite_buffer),
+            sprite_buffer_capacity: initial_sprite_capacity,
+            quad_index_buffer: Some(quad_index_buffer),
+            sprite_info,
+            char_to_sprite: HashMap::new(),
+            next_sprite_idx: 1, // 0 is reserved for empty/no glyph
+            use_instanced_rendering: true, // Use Kitty-style instanced rendering
         }
     }
 
@@ -434,6 +783,42 @@ impl Renderer {
         match self.tab_bar_position {
             TabBarPosition::Top => self.tab_bar_height(),
             _ => 0.0,
+        }
+    }
+    
+    /// Sets the current selection range for highlighting.
+    /// Pass None to clear the selection.
+    /// The selection is specified as (start_col, start_row, end_col, end_row) in normalized order.
+    pub fn set_selection(&mut self, selection: Option<(usize, usize, usize, usize)>) {
+        self.selection = selection;
+    }
+    
+    /// Checks if a cell at (col, row) is within the current selection.
+    fn is_cell_selected(&self, col: usize, row: usize) -> bool {
+        let Some((start_col, start_row, end_col, end_row)) = self.selection else {
+            return false;
+        };
+        
+        // Check if the row is within the selection range
+        if row < start_row || row > end_row {
+            return false;
+        }
+        
+        // For single-row selection
+        if start_row == end_row {
+            return col >= start_col && col <= end_col;
+        }
+        
+        // For multi-row selection
+        if row == start_row {
+            // First row: from start_col to end of line
+            return col >= start_col;
+        } else if row == end_row {
+            // Last row: from start of line to end_col
+            return col <= end_col;
+        } else {
+            // Middle rows: entire row is selected
+            return true;
         }
     }
 
@@ -454,6 +839,45 @@ impl Renderer {
         let cols = (self.width as f32 / self.cell_width).floor() as usize;
         let rows = (available_height / self.cell_height).floor() as usize;
         (cols.max(1), rows.max(1))
+    }
+    
+    /// Converts a pixel position to a terminal cell position.
+    /// Returns None if the position is outside the terminal area (e.g., in the tab bar).
+    pub fn pixel_to_cell(&self, x: f64, y: f64) -> Option<(usize, usize)> {
+        let terminal_y_offset = self.terminal_y_offset();
+        let tab_bar_height = self.tab_bar_height();
+        let height = self.height as f32;
+        
+        // Check if position is in the tab bar area (which could be at top or bottom)
+        match self.tab_bar_position {
+            TabBarPosition::Top => {
+                if (y as f32) < tab_bar_height {
+                    return None;
+                }
+            }
+            TabBarPosition::Bottom => {
+                if (y as f32) >= height - tab_bar_height {
+                    return None;
+                }
+            }
+            TabBarPosition::Hidden => {}
+        }
+        
+        // Adjust y to be relative to terminal area
+        let terminal_y = y as f32 - terminal_y_offset;
+        
+        // Calculate cell position
+        let col = (x as f32 / self.cell_width).floor() as usize;
+        let row = (terminal_y / self.cell_height).floor() as usize;
+        
+        // Get terminal dimensions to clamp
+        let (max_cols, max_rows) = self.terminal_size();
+        
+        // Clamp to valid range
+        let col = col.min(max_cols.saturating_sub(1));
+        let row = row.min(max_rows.saturating_sub(1));
+        
+        Some((col, row))
     }
 
     /// Updates the scale factor and recalculates font/cell dimensions.
@@ -1416,7 +1840,6 @@ impl Renderer {
                         uv: [0.0, 0.0, 0.0, 0.0],
                         offset: [0.0, 0.0],
                         size: [0.0, 0.0],
-                        advance: self.cell_width,
                     };
                     self.char_cache.insert(c, info);
                     return info;
@@ -1445,7 +1868,6 @@ impl Renderer {
                     uv: [uv_x, uv_y, uv_w, uv_h],
                     offset: [0.0, 0.0],
                     size: [glyph_width as f32, glyph_height as f32],
-                    advance: self.cell_width,
                 };
 
                 // Update atlas cursor
@@ -1499,7 +1921,6 @@ impl Renderer {
                 uv: [0.0, 0.0, 0.0, 0.0],
                 offset: [0.0, 0.0],
                 size: [0.0, 0.0],
-                advance: metrics.advance_width,
             };
             self.char_cache.insert(c, info);
             return info;
@@ -1522,7 +1943,6 @@ impl Renderer {
                 uv: [0.0, 0.0, 0.0, 0.0],
                 offset: [0.0, 0.0],
                 size: [0.0, 0.0],
-                advance: metrics.advance_width,
             };
             self.char_cache.insert(c, info);
             return info;
@@ -1550,7 +1970,6 @@ impl Renderer {
             uv: [uv_x, uv_y, uv_w, uv_h],
             offset: [metrics.xmin as f32, metrics.ymin as f32],
             size: [glyph_width as f32, glyph_height as f32],
-            advance: metrics.advance_width,
         };
 
         // Update atlas cursor
@@ -1578,7 +1997,6 @@ impl Renderer {
                 uv: [0.0, 0.0, 0.0, 0.0],
                 offset: [0.0, 0.0],
                 size: [0.0, 0.0],
-                advance: metrics.advance_width,
             };
             self.glyph_cache.insert(cache_key, info);
             return info;
@@ -1601,7 +2019,6 @@ impl Renderer {
                 uv: [0.0, 0.0, 0.0, 0.0],
                 offset: [0.0, 0.0],
                 size: [0.0, 0.0],
-                advance: metrics.advance_width,
             };
             self.glyph_cache.insert(cache_key, info);
             return info;
@@ -1629,7 +2046,6 @@ impl Renderer {
             uv: [uv_x, uv_y, uv_w, uv_h],
             offset: [metrics.xmin as f32, metrics.ymin as f32],
             size: [glyph_width as f32, glyph_height as f32],
-            advance: metrics.advance_width,
         };
 
         // Update atlas cursor
@@ -1709,35 +2125,6 @@ impl Renderer {
         ]
     }
 
-    /// Converts a protocol CellColor to RGBA in linear color space.
-    /// Default backgrounds are fully transparent to let the window clear color show through.
-    /// Explicit background colors remain fully opaque.
-    fn cell_color_to_rgba(&self, color: &CellColor, is_foreground: bool) -> [f32; 4] {
-        // For default background: fully transparent so clear color shows through
-        if !is_foreground && *color == CellColor::Default {
-            return [0.0, 0.0, 0.0, 0.0];
-        }
-
-        let srgb = match color {
-            CellColor::Default => {
-                // Only foreground gets here (background returns early above)
-                let [r, g, b] = self.palette.default_fg;
-                [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
-            }
-            CellColor::Rgb(r, g, b) => [*r as f32 / 255.0, *g as f32 / 255.0, *b as f32 / 255.0, 1.0],
-            CellColor::Indexed(idx) => {
-                let [r, g, b] = self.palette.colors[*idx as usize];
-                [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
-            }
-        };
-        [
-            Self::srgb_to_linear(srgb[0]),
-            Self::srgb_to_linear(srgb[1]),
-            Self::srgb_to_linear(srgb[2]),
-            srgb[3],
-        ]
-    }
-
     /// Convert pixel X coordinate to NDC, snapped to pixel boundaries.
     #[inline]
     fn pixel_to_ndc_x(pixel: f32, screen_width: f32) -> f32 {
@@ -1759,13 +2146,13 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Use two separate lists: backgrounds first, then glyphs
+        // Reuse pre-allocated buffers - clear instead of reallocating
         // This ensures wide glyphs (like Nerd Font icons) can extend beyond their cell
         // without being covered by adjacent cell backgrounds
-        let mut bg_vertices: Vec<GlyphVertex> = Vec::with_capacity(terminal.cols * terminal.rows * 4);
-        let mut bg_indices: Vec<u32> = Vec::with_capacity(terminal.cols * terminal.rows * 6);
-        let mut glyph_vertices: Vec<GlyphVertex> = Vec::with_capacity(terminal.cols * terminal.rows * 4);
-        let mut glyph_indices: Vec<u32> = Vec::with_capacity(terminal.cols * terminal.rows * 6);
+        self.bg_vertices.clear();
+        self.bg_indices.clear();
+        self.glyph_vertices.clear();
+        self.glyph_indices.clear();
 
         let width = self.width as f32;
         let height = self.height as f32;
@@ -1828,32 +2215,32 @@ impl Renderer {
                         let cell_top = Self::pixel_to_ndc_y(cell_y, height);
                         let cell_bottom = Self::pixel_to_ndc_y(cell_y + self.cell_height, height);
 
-                        let base_idx = bg_vertices.len() as u32;
-                        bg_vertices.push(GlyphVertex {
+                        let base_idx = self.bg_vertices.len() as u32;
+                        self.bg_vertices.push(GlyphVertex {
                             position: [cell_left, cell_top],
                             uv: [0.0, 0.0],
                             color: fg_color,
                             bg_color,
                         });
-                        bg_vertices.push(GlyphVertex {
+                        self.bg_vertices.push(GlyphVertex {
                             position: [cell_right, cell_top],
                             uv: [0.0, 0.0],
                             color: fg_color,
                             bg_color,
                         });
-                        bg_vertices.push(GlyphVertex {
+                        self.bg_vertices.push(GlyphVertex {
                             position: [cell_right, cell_bottom],
                             uv: [0.0, 0.0],
                             color: fg_color,
                             bg_color,
                         });
-                        bg_vertices.push(GlyphVertex {
+                        self.bg_vertices.push(GlyphVertex {
                             position: [cell_left, cell_bottom],
                             uv: [0.0, 0.0],
                             color: fg_color,
                             bg_color,
                         });
-                        bg_indices.extend_from_slice(&[
+                        self.bg_indices.extend_from_slice(&[
                             base_idx, base_idx + 1, base_idx + 2,
                             base_idx, base_idx + 2, base_idx + 3,
                         ]);
@@ -1871,32 +2258,32 @@ impl Renderer {
                         let top = Self::pixel_to_ndc_y(glyph_y, height);
                         let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
 
-                        let base_idx = glyph_vertices.len() as u32;
-                        glyph_vertices.push(GlyphVertex {
+                        let base_idx = self.glyph_vertices.len() as u32;
+                        self.glyph_vertices.push(GlyphVertex {
                             position: [left, top],
                             uv: [glyph.uv[0], glyph.uv[1]],
                             color: fg_color,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_vertices.push(GlyphVertex {
+                        self.glyph_vertices.push(GlyphVertex {
                             position: [right, top],
                             uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
                             color: fg_color,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_vertices.push(GlyphVertex {
+                        self.glyph_vertices.push(GlyphVertex {
                             position: [right, bottom],
                             uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
                             color: fg_color,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_vertices.push(GlyphVertex {
+                        self.glyph_vertices.push(GlyphVertex {
                             position: [left, bottom],
                             uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
                             color: fg_color,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_indices.extend_from_slice(&[
+                        self.glyph_indices.extend_from_slice(&[
                             base_idx, base_idx + 1, base_idx + 2,
                             base_idx, base_idx + 2, base_idx + 3,
                         ]);
@@ -1914,32 +2301,32 @@ impl Renderer {
                     let cell_bottom = Self::pixel_to_ndc_y(cell_y + self.cell_height, height);
 
                     // Add background quad
-                    let base_idx = bg_vertices.len() as u32;
-                    bg_vertices.push(GlyphVertex {
+                    let base_idx = self.bg_vertices.len() as u32;
+                    self.bg_vertices.push(GlyphVertex {
                         position: [cell_left, cell_top],
                         uv: [0.0, 0.0],
                         color: fg_color,
                         bg_color,
                     });
-                    bg_vertices.push(GlyphVertex {
+                    self.bg_vertices.push(GlyphVertex {
                         position: [cell_right, cell_top],
                         uv: [0.0, 0.0],
                         color: fg_color,
                         bg_color,
                     });
-                    bg_vertices.push(GlyphVertex {
+                    self.bg_vertices.push(GlyphVertex {
                         position: [cell_right, cell_bottom],
                         uv: [0.0, 0.0],
                         color: fg_color,
                         bg_color,
                     });
-                    bg_vertices.push(GlyphVertex {
+                    self.bg_vertices.push(GlyphVertex {
                         position: [cell_left, cell_bottom],
                         uv: [0.0, 0.0],
                         color: fg_color,
                         bg_color,
                     });
-                    bg_indices.extend_from_slice(&[
+                    self.bg_indices.extend_from_slice(&[
                         base_idx, base_idx + 1, base_idx + 2,
                         base_idx, base_idx + 2, base_idx + 3,
                     ]);
@@ -1963,32 +2350,32 @@ impl Renderer {
                         let top = Self::pixel_to_ndc_y(glyph_y, height);
                         let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
 
-                        let base_idx = glyph_vertices.len() as u32;
-                        glyph_vertices.push(GlyphVertex {
+                        let base_idx = self.glyph_vertices.len() as u32;
+                        self.glyph_vertices.push(GlyphVertex {
                             position: [left, top],
                             uv: [glyph.uv[0], glyph.uv[1]],
                             color: fg_color,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_vertices.push(GlyphVertex {
+                        self.glyph_vertices.push(GlyphVertex {
                             position: [right, top],
                             uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
                             color: fg_color,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_vertices.push(GlyphVertex {
+                        self.glyph_vertices.push(GlyphVertex {
                             position: [right, bottom],
                             uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
                             color: fg_color,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_vertices.push(GlyphVertex {
+                        self.glyph_vertices.push(GlyphVertex {
                             position: [left, bottom],
                             uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
                             color: fg_color,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_indices.extend_from_slice(&[
+                        self.glyph_indices.extend_from_slice(&[
                             base_idx, base_idx + 1, base_idx + 2,
                             base_idx, base_idx + 2, base_idx + 3,
                         ]);
@@ -2071,34 +2458,34 @@ impl Renderer {
         let cursor_top = Self::pixel_to_ndc_y(top, height);
         let cursor_bottom = Self::pixel_to_ndc_y(bottom, height);
 
-        let base_idx = glyph_vertices.len() as u32;
+        let base_idx = self.glyph_vertices.len() as u32;
 
-        glyph_vertices.push(GlyphVertex {
+        self.glyph_vertices.push(GlyphVertex {
             position: [cursor_left, cursor_top],
             uv: [0.0, 0.0],
             color: cursor_bg_color,
             bg_color: cursor_bg_color,
         });
-        glyph_vertices.push(GlyphVertex {
+        self.glyph_vertices.push(GlyphVertex {
             position: [cursor_right, cursor_top],
             uv: [0.0, 0.0],
             color: cursor_bg_color,
             bg_color: cursor_bg_color,
         });
-        glyph_vertices.push(GlyphVertex {
+        self.glyph_vertices.push(GlyphVertex {
             position: [cursor_right, cursor_bottom],
             uv: [0.0, 0.0],
             color: cursor_bg_color,
             bg_color: cursor_bg_color,
         });
-        glyph_vertices.push(GlyphVertex {
+        self.glyph_vertices.push(GlyphVertex {
             position: [cursor_left, cursor_bottom],
             uv: [0.0, 0.0],
             color: cursor_bg_color,
             bg_color: cursor_bg_color,
         });
 
-        glyph_indices.extend_from_slice(&[
+        self.glyph_indices.extend_from_slice(&[
             base_idx,
             base_idx + 1,
             base_idx + 2,
@@ -2139,32 +2526,32 @@ impl Renderer {
                 let g_top = Self::pixel_to_ndc_y(glyph_y, height);
                 let g_bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
 
-                let base_idx = glyph_vertices.len() as u32;
-                glyph_vertices.push(GlyphVertex {
+                let base_idx = self.glyph_vertices.len() as u32;
+                self.glyph_vertices.push(GlyphVertex {
                     position: [g_left, g_top],
                     uv: [glyph.uv[0], glyph.uv[1]],
                     color: char_color,
                     bg_color: [0.0, 0.0, 0.0, 0.0],
                 });
-                glyph_vertices.push(GlyphVertex {
+                self.glyph_vertices.push(GlyphVertex {
                     position: [g_right, g_top],
                     uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
                     color: char_color,
                     bg_color: [0.0, 0.0, 0.0, 0.0],
                 });
-                glyph_vertices.push(GlyphVertex {
+                self.glyph_vertices.push(GlyphVertex {
                     position: [g_right, g_bottom],
                     uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
                     color: char_color,
                     bg_color: [0.0, 0.0, 0.0, 0.0],
                 });
-                glyph_vertices.push(GlyphVertex {
+                self.glyph_vertices.push(GlyphVertex {
                     position: [g_left, g_bottom],
                     uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
                     color: char_color,
                     bg_color: [0.0, 0.0, 0.0, 0.0],
                 });
-                glyph_indices.extend_from_slice(&[
+                self.glyph_indices.extend_from_slice(&[
                     base_idx, base_idx + 1, base_idx + 2,
                     base_idx, base_idx + 2, base_idx + 3,
                 ]);
@@ -2172,16 +2559,14 @@ impl Renderer {
         }
 
         // Combine: backgrounds first, then glyphs (with adjusted indices)
-        let mut vertices = bg_vertices;
-        let mut indices = bg_indices;
-        
-        let glyph_vertex_offset = vertices.len() as u32;
-        vertices.extend(glyph_vertices);
-        indices.extend(glyph_indices.iter().map(|i| i + glyph_vertex_offset));
+        // We need to calculate total counts and adjust glyph indices
+        let bg_vertex_count = self.bg_vertices.len();
+        let total_vertex_count = bg_vertex_count + self.glyph_vertices.len();
+        let total_index_count = self.bg_indices.len() + self.glyph_indices.len();
 
         // Resize buffers if needed
-        if vertices.len() > self.vertex_capacity {
-            self.vertex_capacity = vertices.len() * 2;
+        if total_vertex_count > self.vertex_capacity {
+            self.vertex_capacity = total_vertex_count * 2;
             self.vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Glyph Vertex Buffer"),
                 size: (self.vertex_capacity * std::mem::size_of::<GlyphVertex>()) as u64,
@@ -2190,8 +2575,8 @@ impl Renderer {
             });
         }
 
-        if indices.len() > self.index_capacity {
-            self.index_capacity = indices.len() * 2;
+        if total_index_count > self.index_capacity {
+            self.index_capacity = total_index_count * 2;
             self.index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Glyph Index Buffer"),
                 size: (self.index_capacity * std::mem::size_of::<u32>()) as u64,
@@ -2200,9 +2585,35 @@ impl Renderer {
             });
         }
 
-        // Upload vertex and index data
-        self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        self.queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
+        // Upload background vertices first, then glyph vertices
+        self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.bg_vertices));
+        self.queue.write_buffer(
+            &self.vertex_buffer,
+            (bg_vertex_count * std::mem::size_of::<GlyphVertex>()) as u64,
+            bytemuck::cast_slice(&self.glyph_vertices),
+        );
+        
+        // Upload background indices first
+        self.queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&self.bg_indices));
+        
+        // Upload glyph indices with offset adjustment (need to adjust indices by bg_vertex_count)
+        // Create adjusted indices on the stack if small enough, otherwise use temporary allocation
+        let glyph_vertex_offset = bg_vertex_count as u32;
+        let bg_index_bytes = self.bg_indices.len() * std::mem::size_of::<u32>();
+        
+        // Write adjusted glyph indices
+        if !self.glyph_indices.is_empty() {
+            // For large batches, we need a temporary buffer - this is unavoidable
+            // but happens only once per frame instead of incrementally
+            let adjusted_indices: Vec<u32> = self.glyph_indices.iter()
+                .map(|i| i + glyph_vertex_offset)
+                .collect();
+            self.queue.write_buffer(
+                &self.index_buffer,
+                bg_index_bytes as u64,
+                bytemuck::cast_slice(&adjusted_indices),
+            );
+        }
 
         // Upload atlas if dirty
         if self.atlas_dirty {
@@ -2266,7 +2677,7 @@ impl Renderer {
             render_pass.set_bind_group(0, &self.glyph_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+            render_pass.draw_indexed(0..total_index_count as u32, 0, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -2276,540 +2687,35 @@ impl Renderer {
 
         Ok(())
     }
-
-    /// Renders a pane from protocol data (used by client).
-    pub fn render_pane(&mut self, pane: &PaneSnapshot) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let rows = pane.cells.len();
-        let cols = if rows > 0 { pane.cells[0].len() } else { 0 };
-
-        let mut bg_vertices: Vec<GlyphVertex> = Vec::with_capacity(cols * rows * 4);
-        let mut bg_indices: Vec<u32> = Vec::with_capacity(cols * rows * 6);
-        let mut glyph_vertices: Vec<GlyphVertex> = Vec::with_capacity(cols * rows * 4);
-        let mut glyph_indices: Vec<u32> = Vec::with_capacity(cols * rows * 6);
-
-        let width = self.width as f32;
-        let height = self.height as f32;
-
-        // Common programming ligatures to check (longest first for greedy matching)
-        const LIGATURE_PATTERNS: &[&str] = &[
-            // 3-char
-            "===", "!==", ">>>", "<<<", "||=", "&&=", "??=", "...", "-->", "<--", "<->",
-            // 2-char  
-            "=>", "->", "<-", ">=", "<=", "==", "!=", "::", "&&", "||", "??", "..", "++",
-            "--", "<<", ">>", "|>", "<|", "/*", "*/", "//", "##", ":=", "~=", "<>",
-        ];
-
-        for (row_idx, row) in pane.cells.iter().enumerate() {
-            let mut col_idx = 0;
-            while col_idx < row.len() {
-                let cell = &row[col_idx];
-                let cell_x = col_idx as f32 * self.cell_width;
-                let cell_y = row_idx as f32 * self.cell_height;
-
-                let fg_color = self.cell_color_to_rgba(&cell.fg_color, true);
-                let bg_color = self.cell_color_to_rgba(&cell.bg_color, false);
-
-                // Check for ligatures by looking ahead
-                let mut ligature_len = 0;
-                let mut ligature_glyph: Option<GlyphInfo> = None;
-
-                for pattern in LIGATURE_PATTERNS {
-                    let pat_len = pattern.len();
-                    if col_idx + pat_len <= row.len() {
-                        let candidate: String = row[col_idx..col_idx + pat_len]
-                            .iter()
-                            .map(|c| c.character)
-                            .collect();
-                        
-                        if candidate == *pattern {
-                            let shaped = self.shape_text(&candidate);
-                            if shaped.glyphs.len() == 1 {
-                                let glyph_id = shaped.glyphs[0].0;
-                                ligature_glyph = Some(self.get_glyph_by_id(glyph_id));
-                                ligature_len = pat_len;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if let Some(glyph) = ligature_glyph {
-                    let span_width = ligature_len as f32 * self.cell_width;
-                    
-                    for i in 0..ligature_len {
-                        let bg_cell_x = (col_idx + i) as f32 * self.cell_width;
-                        let cell_left = Self::pixel_to_ndc_x(bg_cell_x, width);
-                        let cell_right = Self::pixel_to_ndc_x(bg_cell_x + self.cell_width, width);
-                        let cell_top = Self::pixel_to_ndc_y(cell_y, height);
-                        let cell_bottom = Self::pixel_to_ndc_y(cell_y + self.cell_height, height);
-
-                        let base_idx = bg_vertices.len() as u32;
-                        bg_vertices.push(GlyphVertex {
-                            position: [cell_left, cell_top],
-                            uv: [0.0, 0.0],
-                            color: fg_color,
-                            bg_color,
-                        });
-                        bg_vertices.push(GlyphVertex {
-                            position: [cell_right, cell_top],
-                            uv: [0.0, 0.0],
-                            color: fg_color,
-                            bg_color,
-                        });
-                        bg_vertices.push(GlyphVertex {
-                            position: [cell_right, cell_bottom],
-                            uv: [0.0, 0.0],
-                            color: fg_color,
-                            bg_color,
-                        });
-                        bg_vertices.push(GlyphVertex {
-                            position: [cell_left, cell_bottom],
-                            uv: [0.0, 0.0],
-                            color: fg_color,
-                            bg_color,
-                        });
-                        bg_indices.extend_from_slice(&[
-                            base_idx, base_idx + 1, base_idx + 2,
-                            base_idx, base_idx + 2, base_idx + 3,
-                        ]);
-                    }
-
-                    if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
-                        let baseline_y = (cell_y + self.cell_height * 0.8).round();
-                        let glyph_x = (cell_x + (span_width - glyph.size[0]) / 2.0 + glyph.offset[0]).round();
-                        let glyph_y = (baseline_y - glyph.offset[1] - glyph.size[1]).round();
-
-                        let left = Self::pixel_to_ndc_x(glyph_x, width);
-                        let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
-                        let top = Self::pixel_to_ndc_y(glyph_y, height);
-                        let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
-
-                        let base_idx = glyph_vertices.len() as u32;
-                        glyph_vertices.push(GlyphVertex {
-                            position: [left, top],
-                            uv: [glyph.uv[0], glyph.uv[1]],
-                            color: fg_color,
-                            bg_color: [0.0, 0.0, 0.0, 0.0],
-                        });
-                        glyph_vertices.push(GlyphVertex {
-                            position: [right, top],
-                            uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
-                            color: fg_color,
-                            bg_color: [0.0, 0.0, 0.0, 0.0],
-                        });
-                        glyph_vertices.push(GlyphVertex {
-                            position: [right, bottom],
-                            uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
-                            color: fg_color,
-                            bg_color: [0.0, 0.0, 0.0, 0.0],
-                        });
-                        glyph_vertices.push(GlyphVertex {
-                            position: [left, bottom],
-                            uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
-                            color: fg_color,
-                            bg_color: [0.0, 0.0, 0.0, 0.0],
-                        });
-                        glyph_indices.extend_from_slice(&[
-                            base_idx, base_idx + 1, base_idx + 2,
-                            base_idx, base_idx + 2, base_idx + 3,
-                        ]);
-                    }
-
-                    col_idx += ligature_len;
-                } else {
-                    // Single character rendering
-                    let cell_left = Self::pixel_to_ndc_x(cell_x, width);
-                    let cell_right = Self::pixel_to_ndc_x(cell_x + self.cell_width, width);
-                    let cell_top = Self::pixel_to_ndc_y(cell_y, height);
-                    let cell_bottom = Self::pixel_to_ndc_y(cell_y + self.cell_height, height);
-
-                    let base_idx = bg_vertices.len() as u32;
-                    bg_vertices.push(GlyphVertex {
-                        position: [cell_left, cell_top],
-                        uv: [0.0, 0.0],
-                        color: fg_color,
-                        bg_color,
-                    });
-                    bg_vertices.push(GlyphVertex {
-                        position: [cell_right, cell_top],
-                        uv: [0.0, 0.0],
-                        color: fg_color,
-                        bg_color,
-                    });
-                    bg_vertices.push(GlyphVertex {
-                        position: [cell_right, cell_bottom],
-                        uv: [0.0, 0.0],
-                        color: fg_color,
-                        bg_color,
-                    });
-                    bg_vertices.push(GlyphVertex {
-                        position: [cell_left, cell_bottom],
-                        uv: [0.0, 0.0],
-                        color: fg_color,
-                        bg_color,
-                    });
-                    bg_indices.extend_from_slice(&[
-                        base_idx, base_idx + 1, base_idx + 2,
-                        base_idx, base_idx + 2, base_idx + 3,
-                    ]);
-
-                    let c = cell.character;
-                    if c != ' ' && c != '\0' {
-                        let glyph = self.rasterize_char(c);
-                        if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
-                            // Box-drawing characters fill the entire cell
-                            let (glyph_x, glyph_y) = if Self::is_box_drawing(c) {
-                                (cell_x, cell_y)
-                            } else {
-                                // Calculate glyph position with baseline alignment
-                                let baseline_y = (cell_y + self.cell_height * 0.8).round();
-                                let gx = (cell_x + glyph.offset[0]).round();
-                                let gy = (baseline_y - glyph.offset[1] - glyph.size[1]).round();
-                                (gx, gy)
-                            };
-
-                            let left = Self::pixel_to_ndc_x(glyph_x, width);
-                            let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
-                            let top = Self::pixel_to_ndc_y(glyph_y, height);
-                            let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
-
-                            let base_idx = glyph_vertices.len() as u32;
-                            glyph_vertices.push(GlyphVertex {
-                                position: [left, top],
-                                uv: [glyph.uv[0], glyph.uv[1]],
-                                color: fg_color,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            glyph_vertices.push(GlyphVertex {
-                                position: [right, top],
-                                uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
-                                color: fg_color,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            glyph_vertices.push(GlyphVertex {
-                                position: [right, bottom],
-                                uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
-                                color: fg_color,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            glyph_vertices.push(GlyphVertex {
-                                position: [left, bottom],
-                                uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
-                                color: fg_color,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            glyph_indices.extend_from_slice(&[
-                                base_idx, base_idx + 1, base_idx + 2,
-                                base_idx, base_idx + 2, base_idx + 3,
-                            ]);
-                        }
-                    }
-
-                    col_idx += 1;
-                }
-            }
-        }
-
-        // Add cursor
-        if pane.cursor.visible {
-            let cursor_x = pane.cursor.col as f32 * self.cell_width;
-            let cursor_y = pane.cursor.row as f32 * self.cell_height;
-
-            // Get the cell under the cursor to determine colors
-            let cursor_cell = pane.cells
-                .get(pane.cursor.row)
-                .and_then(|row| row.get(pane.cursor.col));
-
-            // Get fg and bg colors from the cell under cursor
-            let (cell_fg, cell_bg, cell_char) = if let Some(cell) = cursor_cell {
-                let fg = self.cell_color_to_rgba(&cell.fg_color, true);
-                let bg = self.cell_color_to_rgba(&cell.bg_color, false);
-                (fg, bg, cell.character)
-            } else {
-                // Default colors if cell doesn't exist
-                let fg = self.cell_color_to_rgba(&CellColor::Default, true);
-                let bg = [0.0, 0.0, 0.0, 0.0];
-                (fg, bg, ' ')
-            };
-
-            let has_character = cell_char != ' ' && cell_char != '\0';
-
-            // Cursor color: invert the background, or use fg if there's a character
-            let cursor_bg_color = if has_character {
-                // Character present: cursor takes fg color as background
-                [cell_fg[0], cell_fg[1], cell_fg[2], 1.0]
-            } else {
-                // Empty cell: invert the background color
-                if cell_bg[3] < 0.01 {
-                    // Transparent background -> white cursor
-                    let white = Self::srgb_to_linear(0.9);
-                    [white, white, white, 1.0]
-                } else {
-                    // Invert the background color
-                    [1.0 - cell_bg[0], 1.0 - cell_bg[1], 1.0 - cell_bg[2], 1.0]
-                }
-            };
-
-            // Determine cursor bounds based on style
-            let (left, right, top, bottom) = match pane.cursor.style {
-                CursorStyle::Block => (
-                    cursor_x,
-                    cursor_x + self.cell_width,
-                    cursor_y,
-                    cursor_y + self.cell_height,
-                ),
-                CursorStyle::Underline => {
-                    let underline_height = 2.0_f32.max(self.cell_height * 0.1);
-                    (
-                        cursor_x,
-                        cursor_x + self.cell_width,
-                        cursor_y + self.cell_height - underline_height,
-                        cursor_y + self.cell_height,
-                    )
-                }
-                CursorStyle::Bar => {
-                    let bar_width = 2.0_f32.max(self.cell_width * 0.1);
-                    (
-                        cursor_x,
-                        cursor_x + bar_width,
-                        cursor_y,
-                        cursor_y + self.cell_height,
-                    )
-                }
-            };
-
-            let cursor_left = Self::pixel_to_ndc_x(left, width);
-            let cursor_right = Self::pixel_to_ndc_x(right, width);
-            let cursor_top = Self::pixel_to_ndc_y(top, height);
-            let cursor_bottom = Self::pixel_to_ndc_y(bottom, height);
-
-            let base_idx = glyph_vertices.len() as u32;
-
-            glyph_vertices.push(GlyphVertex {
-                position: [cursor_left, cursor_top],
-                uv: [0.0, 0.0],
-                color: cursor_bg_color,
-                bg_color: cursor_bg_color,
-            });
-            glyph_vertices.push(GlyphVertex {
-                position: [cursor_right, cursor_top],
-                uv: [0.0, 0.0],
-                color: cursor_bg_color,
-                bg_color: cursor_bg_color,
-            });
-            glyph_vertices.push(GlyphVertex {
-                position: [cursor_right, cursor_bottom],
-                uv: [0.0, 0.0],
-                color: cursor_bg_color,
-                bg_color: cursor_bg_color,
-            });
-            glyph_vertices.push(GlyphVertex {
-                position: [cursor_left, cursor_bottom],
-                uv: [0.0, 0.0],
-                color: cursor_bg_color,
-                bg_color: cursor_bg_color,
-            });
-
-            glyph_indices.extend_from_slice(&[
-                base_idx, base_idx + 1, base_idx + 2,
-                base_idx, base_idx + 2, base_idx + 3,
-            ]);
-
-            // If block cursor and there's a character, re-render it with inverted color
-            if matches!(pane.cursor.style, CursorStyle::Block) && has_character {
-                // Character color: use bg color (inverted from normal)
-                let char_color = if cell_bg[3] < 0.01 {
-                    // If bg was transparent, use black for the character
-                    [0.0, 0.0, 0.0, 1.0]
-                } else {
-                    [cell_bg[0], cell_bg[1], cell_bg[2], 1.0]
-                };
-
-                let glyph = self.rasterize_char(cell_char);
-                if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
-                    let cell_x = cursor_x;
-                    let cell_y = cursor_y;
-                    let (glyph_x, glyph_y) = if Self::is_box_drawing(cell_char) {
-                        (cell_x, cell_y)
-                    } else {
-                        let baseline_y = (cell_y + self.cell_height * 0.8).round();
-                        let gx = (cell_x + glyph.offset[0]).round();
-                        let gy = (baseline_y - glyph.offset[1] - glyph.size[1]).round();
-                        (gx, gy)
-                    };
-
-                    let g_left = Self::pixel_to_ndc_x(glyph_x, width);
-                    let g_right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
-                    let g_top = Self::pixel_to_ndc_y(glyph_y, height);
-                    let g_bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
-
-                    let base_idx = glyph_vertices.len() as u32;
-                    glyph_vertices.push(GlyphVertex {
-                        position: [g_left, g_top],
-                        uv: [glyph.uv[0], glyph.uv[1]],
-                        color: char_color,
-                        bg_color: [0.0, 0.0, 0.0, 0.0],
-                    });
-                    glyph_vertices.push(GlyphVertex {
-                        position: [g_right, g_top],
-                        uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
-                        color: char_color,
-                        bg_color: [0.0, 0.0, 0.0, 0.0],
-                    });
-                    glyph_vertices.push(GlyphVertex {
-                        position: [g_right, g_bottom],
-                        uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
-                        color: char_color,
-                        bg_color: [0.0, 0.0, 0.0, 0.0],
-                    });
-                    glyph_vertices.push(GlyphVertex {
-                        position: [g_left, g_bottom],
-                        uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
-                        color: char_color,
-                        bg_color: [0.0, 0.0, 0.0, 0.0],
-                    });
-                    glyph_indices.extend_from_slice(&[
-                        base_idx, base_idx + 1, base_idx + 2,
-                        base_idx, base_idx + 2, base_idx + 3,
-                    ]);
-                }
-            }
-        }
-
-        // Combine vertices
-        let mut vertices = bg_vertices;
-        let mut indices = bg_indices;
-        
-        let glyph_vertex_offset = vertices.len() as u32;
-        vertices.extend(glyph_vertices);
-        indices.extend(glyph_indices.iter().map(|i| i + glyph_vertex_offset));
-
-        // Resize buffers if needed
-        if vertices.len() > self.vertex_capacity {
-            self.vertex_capacity = vertices.len() * 2;
-            self.vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Glyph Vertex Buffer"),
-                size: (self.vertex_capacity * std::mem::size_of::<GlyphVertex>()) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-
-        if indices.len() > self.index_capacity {
-            self.index_capacity = indices.len() * 2;
-            self.index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Glyph Index Buffer"),
-                size: (self.index_capacity * std::mem::size_of::<u32>()) as u64,
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-
-        // Upload data
-        self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        self.queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
-
-        if self.atlas_dirty {
-            self.queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture: &self.atlas_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &self.atlas_data,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(ATLAS_SIZE),
-                    rows_per_image: Some(ATLAS_SIZE),
-                },
-                wgpu::Extent3d {
-                    width: ATLAS_SIZE,
-                    height: ATLAS_SIZE,
-                    depth_or_array_layers: 1,
-                },
-            );
-            self.atlas_dirty = false;
-        }
-
-        // Create command encoder and render
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render Encoder"),
-        });
-
-        {
-            let [bg_r, bg_g, bg_b] = self.palette.default_bg;
-            let bg_r_linear = Self::srgb_to_linear(bg_r as f32 / 255.0) as f64;
-            let bg_g_linear = Self::srgb_to_linear(bg_g as f32 / 255.0) as f64;
-            let bg_b_linear = Self::srgb_to_linear(bg_b as f32 / 255.0) as f64;
-            let bg_alpha = self.background_opacity as f64;
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: bg_r_linear,
-                            g: bg_g_linear,
-                            b: bg_b_linear,
-                            a: bg_alpha,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-            });
-
-            render_pass.set_pipeline(&self.glyph_pipeline);
-            render_pass.set_bind_group(0, &self.glyph_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
-        }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
-
-        Ok(())
-    }
-
-    /// Renders multiple panes with tab bar from protocol data (used by client).
-    /// The tab bar is rendered outside the terminal grid at the configured position.
+    /// Renders terminal content directly from a Terminal reference.
+    /// This is the new preferred method that avoids cross-process synchronization.
     /// 
     /// Arguments:
-    /// - `panes`: All pane snapshots with their layout info for the active tab
-    /// - `active_pane_id`: The ID of the focused pane (for cursor rendering)
-    /// - `tabs`: Tab information for the tab bar
+    /// - `terminal`: Reference to the terminal state (same process)
+    /// - `num_tabs`: Number of tabs for the tab bar (0 to hide)
     /// - `active_tab`: Index of the active tab
-    pub fn render_with_tabs(
+    pub fn render_from_terminal(
         &mut self,
-        panes: &[(&PaneSnapshot, &PaneInfo)],
-        active_pane_id: PaneId,
-        tabs: &[TabInfo],
+        terminal: &Terminal,
+        num_tabs: usize,
         active_tab: usize,
     ) -> Result<(), wgpu::SurfaceError> {
+        // Sync palette from terminal (OSC sequences update terminal.palette)
+        self.palette = terminal.palette.clone();
+        
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Estimate total cells across all panes for buffer capacity
-        let total_cells: usize = panes.iter()
-            .map(|(snap, _)| snap.cells.len() * snap.cells.first().map_or(0, |r| r.len()))
-            .sum();
+        let cols = terminal.cols;
+        let rows = terminal.rows;
         
-        let mut bg_vertices: Vec<GlyphVertex> = Vec::with_capacity(total_cells * 4 + 64);
-        let mut bg_indices: Vec<u32> = Vec::with_capacity(total_cells * 6 + 96);
-        let mut glyph_vertices: Vec<GlyphVertex> = Vec::with_capacity(total_cells * 4 + 256);
-        let mut glyph_indices: Vec<u32> = Vec::with_capacity(total_cells * 6 + 384);
+        // Reuse pre-allocated buffers
+        self.bg_vertices.clear();
+        self.bg_indices.clear();
+        self.glyph_vertices.clear();
+        self.glyph_indices.clear();
 
         let width = self.width as f32;
         let height = self.height as f32;
@@ -2817,19 +2723,17 @@ impl Renderer {
         let terminal_y_offset = self.terminal_y_offset();
 
         // ═══════════════════════════════════════════════════════════════════
-        // RENDER TAB BAR (outside terminal grid)
+        // RENDER TAB BAR
         // ═══════════════════════════════════════════════════════════════════
-        if self.tab_bar_position != TabBarPosition::Hidden && !tabs.is_empty() {
+        if self.tab_bar_position != TabBarPosition::Hidden && num_tabs > 0 {
             let tab_bar_y = match self.tab_bar_position {
                 TabBarPosition::Top => 0.0,
                 TabBarPosition::Bottom => height - tab_bar_height,
                 TabBarPosition::Hidden => unreachable!(),
             };
 
-            // Tab bar background - slightly different from terminal background
             let tab_bar_bg = {
                 let [r, g, b] = self.palette.default_bg;
-                // Darken/lighten slightly for visual separation
                 let factor = 0.85_f32;
                 [
                     Self::srgb_to_linear((r as f32 / 255.0) * factor),
@@ -2845,52 +2749,48 @@ impl Renderer {
             let bar_top = Self::pixel_to_ndc_y(tab_bar_y, height);
             let bar_bottom = Self::pixel_to_ndc_y(tab_bar_y + tab_bar_height, height);
 
-            let base_idx = bg_vertices.len() as u32;
-            bg_vertices.push(GlyphVertex {
+            let base_idx = self.bg_vertices.len() as u32;
+            self.bg_vertices.push(GlyphVertex {
                 position: [bar_left, bar_top],
                 uv: [0.0, 0.0],
                 color: tab_bar_bg,
                 bg_color: tab_bar_bg,
             });
-            bg_vertices.push(GlyphVertex {
+            self.bg_vertices.push(GlyphVertex {
                 position: [bar_right, bar_top],
                 uv: [0.0, 0.0],
                 color: tab_bar_bg,
                 bg_color: tab_bar_bg,
             });
-            bg_vertices.push(GlyphVertex {
+            self.bg_vertices.push(GlyphVertex {
                 position: [bar_right, bar_bottom],
                 uv: [0.0, 0.0],
                 color: tab_bar_bg,
                 bg_color: tab_bar_bg,
             });
-            bg_vertices.push(GlyphVertex {
+            self.bg_vertices.push(GlyphVertex {
                 position: [bar_left, bar_bottom],
                 uv: [0.0, 0.0],
                 color: tab_bar_bg,
                 bg_color: tab_bar_bg,
             });
-            bg_indices.extend_from_slice(&[
+            self.bg_indices.extend_from_slice(&[
                 base_idx, base_idx + 1, base_idx + 2,
                 base_idx, base_idx + 2, base_idx + 3,
             ]);
 
             // Render each tab
-            let mut tab_x = 4.0_f32; // Start with small padding
+            let mut tab_x = 4.0_f32;
             let tab_padding = 8.0_f32;
-            let min_tab_width = self.cell_width * 8.0; // Minimum width for tab
+            let min_tab_width = self.cell_width * 8.0;
 
-            for (idx, _tab) in tabs.iter().enumerate() {
+            for idx in 0..num_tabs {
                 let is_active = idx == active_tab;
-                
-                // Generate tab title (for now, just "Tab N" or use first pane info)
                 let title = format!(" {} ", idx + 1);
                 let title_width = title.chars().count() as f32 * self.cell_width;
                 let tab_width = title_width.max(min_tab_width);
 
-                // Tab background
                 let tab_bg = if is_active {
-                    // Active tab uses terminal background
                     let [r, g, b] = self.palette.default_bg;
                     [
                         Self::srgb_to_linear(r as f32 / 255.0),
@@ -2899,7 +2799,6 @@ impl Renderer {
                         1.0,
                     ]
                 } else {
-                    // Inactive tabs are slightly darker
                     tab_bar_bg
                 };
 
@@ -2914,57 +2813,37 @@ impl Renderer {
                     ]
                 };
 
-                // Tab background rect
+                let tab_top = Self::pixel_to_ndc_y(tab_bar_y + 2.0, height);
+                let tab_bottom = Self::pixel_to_ndc_y(tab_bar_y + tab_bar_height - 2.0, height);
                 let tab_left = Self::pixel_to_ndc_x(tab_x, width);
                 let tab_right = Self::pixel_to_ndc_x(tab_x + tab_width, width);
-                
-                // For top tab bar: active tab extends to touch terminal content
-                // For bottom tab bar: active tab extends upward
-                let (tab_top, tab_bottom) = if is_active {
-                    match self.tab_bar_position {
-                        TabBarPosition::Top => (
-                            Self::pixel_to_ndc_y(tab_bar_y + 2.0, height),
-                            Self::pixel_to_ndc_y(tab_bar_y + tab_bar_height, height),
-                        ),
-                        TabBarPosition::Bottom => (
-                            Self::pixel_to_ndc_y(tab_bar_y, height),
-                            Self::pixel_to_ndc_y(tab_bar_y + tab_bar_height - 2.0, height),
-                        ),
-                        TabBarPosition::Hidden => unreachable!(),
-                    }
-                } else {
-                    (
-                        Self::pixel_to_ndc_y(tab_bar_y + 4.0, height),
-                        Self::pixel_to_ndc_y(tab_bar_y + tab_bar_height - 2.0, height),
-                    )
-                };
 
-                let base_idx = bg_vertices.len() as u32;
-                bg_vertices.push(GlyphVertex {
+                let base_idx = self.bg_vertices.len() as u32;
+                self.bg_vertices.push(GlyphVertex {
                     position: [tab_left, tab_top],
                     uv: [0.0, 0.0],
                     color: tab_bg,
                     bg_color: tab_bg,
                 });
-                bg_vertices.push(GlyphVertex {
+                self.bg_vertices.push(GlyphVertex {
                     position: [tab_right, tab_top],
                     uv: [0.0, 0.0],
                     color: tab_bg,
                     bg_color: tab_bg,
                 });
-                bg_vertices.push(GlyphVertex {
+                self.bg_vertices.push(GlyphVertex {
                     position: [tab_right, tab_bottom],
                     uv: [0.0, 0.0],
                     color: tab_bg,
                     bg_color: tab_bg,
                 });
-                bg_vertices.push(GlyphVertex {
+                self.bg_vertices.push(GlyphVertex {
                     position: [tab_left, tab_bottom],
                     uv: [0.0, 0.0],
                     color: tab_bg,
                     bg_color: tab_bg,
                 });
-                bg_indices.extend_from_slice(&[
+                self.bg_indices.extend_from_slice(&[
                     base_idx, base_idx + 1, base_idx + 2,
                     base_idx, base_idx + 2, base_idx + 3,
                 ]);
@@ -2989,32 +2868,32 @@ impl Renderer {
                         let top = Self::pixel_to_ndc_y(glyph_y, height);
                         let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
 
-                        let base_idx = glyph_vertices.len() as u32;
-                        glyph_vertices.push(GlyphVertex {
+                        let base_idx = self.glyph_vertices.len() as u32;
+                        self.glyph_vertices.push(GlyphVertex {
                             position: [left, top],
                             uv: [glyph.uv[0], glyph.uv[1]],
                             color: tab_fg,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_vertices.push(GlyphVertex {
+                        self.glyph_vertices.push(GlyphVertex {
                             position: [right, top],
                             uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
                             color: tab_fg,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_vertices.push(GlyphVertex {
+                        self.glyph_vertices.push(GlyphVertex {
                             position: [right, bottom],
                             uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
                             color: tab_fg,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_vertices.push(GlyphVertex {
+                        self.glyph_vertices.push(GlyphVertex {
                             position: [left, bottom],
                             uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
                             color: tab_fg,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_indices.extend_from_slice(&[
+                        self.glyph_indices.extend_from_slice(&[
                             base_idx, base_idx + 1, base_idx + 2,
                             base_idx, base_idx + 2, base_idx + 3,
                         ]);
@@ -3026,369 +2905,125 @@ impl Renderer {
         }
 
         // ═══════════════════════════════════════════════════════════════════
-        // RENDER TERMINAL CONTENT (all panes, offset by tab bar)
+        // RENDER TERMINAL CONTENT FROM TERMINAL STATE
         // ═══════════════════════════════════════════════════════════════════
-        const LIGATURE_PATTERNS: &[&str] = &[
-            "===", "!==", ">>>", "<<<", "||=", "&&=", "??=", "...", "-->", "<--", "<->",
-            "=>", "->", "<-", ">=", "<=", "==", "!=", "::", "&&", "||", "??", "..", "++",
-            "--", "<<", ">>", "|>", "<|", "/*", "*/", "//", "##", ":=", "~=", "<>",
-        ];
-
-        // Separator line color (slightly brighter than background)
-        let separator_color = {
-            let [r, g, b] = self.palette.default_bg;
-            let factor = 1.5_f32;
-            [
-                Self::srgb_to_linear(((r as f32 / 255.0) * factor).min(1.0)),
-                Self::srgb_to_linear(((g as f32 / 255.0) * factor).min(1.0)),
-                Self::srgb_to_linear(((b as f32 / 255.0) * factor).min(1.0)),
-                1.0,
-            ]
+        
+        // Get visible rows (accounts for scroll offset)
+        let visible_rows = terminal.visible_rows();
+        
+        // Cache palette values to avoid borrow conflicts with rasterize_char
+        let palette_default_fg = self.palette.default_fg;
+        let palette_colors = self.palette.colors;
+        
+        // Helper to convert Color to linear RGBA (uses cached palette)
+        let color_to_rgba = |color: &Color, is_foreground: bool| -> [f32; 4] {
+            match color {
+                Color::Default => {
+                    if is_foreground {
+                        let [r, g, b] = palette_default_fg;
+                        [
+                            Self::srgb_to_linear(r as f32 / 255.0),
+                            Self::srgb_to_linear(g as f32 / 255.0),
+                            Self::srgb_to_linear(b as f32 / 255.0),
+                            1.0,
+                        ]
+                    } else {
+                        // Default background: transparent
+                        [0.0, 0.0, 0.0, 0.0]
+                    }
+                }
+                Color::Rgb(r, g, b) => [
+                    Self::srgb_to_linear(*r as f32 / 255.0),
+                    Self::srgb_to_linear(*g as f32 / 255.0),
+                    Self::srgb_to_linear(*b as f32 / 255.0),
+                    1.0,
+                ],
+                Color::Indexed(idx) => {
+                    let [r, g, b] = palette_colors[*idx as usize];
+                    [
+                        Self::srgb_to_linear(r as f32 / 255.0),
+                        Self::srgb_to_linear(g as f32 / 255.0),
+                        Self::srgb_to_linear(b as f32 / 255.0),
+                        1.0,
+                    ]
+                }
+            }
         };
 
-        // Render each pane
-        for (pane, pane_info) in panes.iter() {
-            let is_active_pane = pane.pane_id == active_pane_id;
+        // Render each row
+        for (row_idx, row) in visible_rows.iter().enumerate() {
+            if row_idx >= rows {
+                break;
+            }
             
-            // Calculate pane position in pixels
-            let pane_x_offset = pane_info.x as f32 * self.cell_width;
-            let pane_y_offset = terminal_y_offset + pane_info.y as f32 * self.cell_height;
-
-            for (row_idx, row) in pane.cells.iter().enumerate() {
-                // Skip rows outside the pane bounds
-                if row_idx >= pane_info.rows {
+            // Find the last non-empty cell in this row for selection clipping
+            let last_content_col = row.iter()
+                .enumerate()
+                .rev()
+                .find(|(_, cell)| cell.character != ' ' && cell.character != '\0')
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+            
+            for (col_idx, cell) in row.iter().enumerate() {
+                if col_idx >= cols {
                     break;
                 }
                 
-                let mut col_idx = 0;
-                while col_idx < row.len() && col_idx < pane_info.cols {
-                    let cell = &row[col_idx];
-                    let cell_x = pane_x_offset + col_idx as f32 * self.cell_width;
-                    let cell_y = pane_y_offset + row_idx as f32 * self.cell_height;
+                let cell_x = col_idx as f32 * self.cell_width;
+                let cell_y = terminal_y_offset + row_idx as f32 * self.cell_height;
 
-                    let fg_color = self.cell_color_to_rgba(&cell.fg_color, true);
-                    let bg_color = self.cell_color_to_rgba(&cell.bg_color, false);
-
-                    // Check for ligatures
-                    let mut ligature_len = 0;
-                    let mut ligature_glyph: Option<GlyphInfo> = None;
-
-                    for pattern in LIGATURE_PATTERNS {
-                        let pat_len = pattern.len();
-                        if col_idx + pat_len <= row.len() && col_idx + pat_len <= pane_info.cols {
-                            let candidate: String = row[col_idx..col_idx + pat_len]
-                                .iter()
-                                .map(|c| c.character)
-                                .collect();
-                            
-                            if candidate == *pattern {
-                                let shaped = self.shape_text(&candidate);
-                                if shaped.glyphs.len() == 1 {
-                                    let glyph_id = shaped.glyphs[0].0;
-                                    ligature_glyph = Some(self.get_glyph_by_id(glyph_id));
-                                    ligature_len = pat_len;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some(glyph) = ligature_glyph {
-                        let span_width = ligature_len as f32 * self.cell_width;
-                        
-                        for i in 0..ligature_len {
-                            let bg_cell_x = pane_x_offset + (col_idx + i) as f32 * self.cell_width;
-                            let cell_left = Self::pixel_to_ndc_x(bg_cell_x, width);
-                            let cell_right = Self::pixel_to_ndc_x(bg_cell_x + self.cell_width, width);
-                            let cell_top = Self::pixel_to_ndc_y(cell_y, height);
-                            let cell_bottom = Self::pixel_to_ndc_y(cell_y + self.cell_height, height);
-
-                            let base_idx = bg_vertices.len() as u32;
-                            bg_vertices.push(GlyphVertex {
-                                position: [cell_left, cell_top],
-                                uv: [0.0, 0.0],
-                                color: fg_color,
-                                bg_color,
-                            });
-                            bg_vertices.push(GlyphVertex {
-                                position: [cell_right, cell_top],
-                                uv: [0.0, 0.0],
-                                color: fg_color,
-                                bg_color,
-                            });
-                            bg_vertices.push(GlyphVertex {
-                                position: [cell_right, cell_bottom],
-                                uv: [0.0, 0.0],
-                                color: fg_color,
-                                bg_color,
-                            });
-                            bg_vertices.push(GlyphVertex {
-                                position: [cell_left, cell_bottom],
-                                uv: [0.0, 0.0],
-                                color: fg_color,
-                                bg_color,
-                            });
-                            bg_indices.extend_from_slice(&[
-                                base_idx, base_idx + 1, base_idx + 2,
-                                base_idx, base_idx + 2, base_idx + 3,
-                            ]);
-                        }
-
-                        if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
-                            let baseline_y = (cell_y + self.cell_height * 0.8).round();
-                            let glyph_x = (cell_x + (span_width - glyph.size[0]) / 2.0 + glyph.offset[0]).round();
-                            let glyph_y = (baseline_y - glyph.offset[1] - glyph.size[1]).round();
-
-                            let left = Self::pixel_to_ndc_x(glyph_x, width);
-                            let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
-                            let top = Self::pixel_to_ndc_y(glyph_y, height);
-                            let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
-
-                            let base_idx = glyph_vertices.len() as u32;
-                            glyph_vertices.push(GlyphVertex {
-                                position: [left, top],
-                                uv: [glyph.uv[0], glyph.uv[1]],
-                                color: fg_color,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            glyph_vertices.push(GlyphVertex {
-                                position: [right, top],
-                                uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
-                                color: fg_color,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            glyph_vertices.push(GlyphVertex {
-                                position: [right, bottom],
-                                uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
-                                color: fg_color,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            glyph_vertices.push(GlyphVertex {
-                                position: [left, bottom],
-                                uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
-                                color: fg_color,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            glyph_indices.extend_from_slice(&[
-                                base_idx, base_idx + 1, base_idx + 2,
-                                base_idx, base_idx + 2, base_idx + 3,
-                            ]);
-                        }
-
-                        col_idx += ligature_len;
-                    } else {
-                        // Single character rendering
-                        let cell_left = Self::pixel_to_ndc_x(cell_x, width);
-                        let cell_right = Self::pixel_to_ndc_x(cell_x + self.cell_width, width);
-                        let cell_top = Self::pixel_to_ndc_y(cell_y, height);
-                        let cell_bottom = Self::pixel_to_ndc_y(cell_y + self.cell_height, height);
-
-                        let base_idx = bg_vertices.len() as u32;
-                        bg_vertices.push(GlyphVertex {
-                            position: [cell_left, cell_top],
-                            uv: [0.0, 0.0],
-                            color: fg_color,
-                            bg_color,
-                        });
-                        bg_vertices.push(GlyphVertex {
-                            position: [cell_right, cell_top],
-                            uv: [0.0, 0.0],
-                            color: fg_color,
-                            bg_color,
-                        });
-                        bg_vertices.push(GlyphVertex {
-                            position: [cell_right, cell_bottom],
-                            uv: [0.0, 0.0],
-                            color: fg_color,
-                            bg_color,
-                        });
-                        bg_vertices.push(GlyphVertex {
-                            position: [cell_left, cell_bottom],
-                            uv: [0.0, 0.0],
-                            color: fg_color,
-                            bg_color,
-                        });
-                        bg_indices.extend_from_slice(&[
-                            base_idx, base_idx + 1, base_idx + 2,
-                            base_idx, base_idx + 2, base_idx + 3,
-                        ]);
-
-                        let c = cell.character;
-                        if c != ' ' && c != '\0' {
-                            let glyph = self.rasterize_char(c);
-                            if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
-                                let (glyph_x, glyph_y) = if Self::is_box_drawing(c) {
-                                    (cell_x, cell_y)
-                                } else {
-                                    let baseline_y = (cell_y + self.cell_height * 0.8).round();
-                                    let gx = (cell_x + glyph.offset[0]).round();
-                                    let gy = (baseline_y - glyph.offset[1] - glyph.size[1]).round();
-                                    (gx, gy)
-                                };
-
-                                let left = Self::pixel_to_ndc_x(glyph_x, width);
-                                let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
-                                let top = Self::pixel_to_ndc_y(glyph_y, height);
-                                let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
-
-                                let base_idx = glyph_vertices.len() as u32;
-                                glyph_vertices.push(GlyphVertex {
-                                    position: [left, top],
-                                    uv: [glyph.uv[0], glyph.uv[1]],
-                                    color: fg_color,
-                                    bg_color: [0.0, 0.0, 0.0, 0.0],
-                                });
-                                glyph_vertices.push(GlyphVertex {
-                                    position: [right, top],
-                                    uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
-                                    color: fg_color,
-                                    bg_color: [0.0, 0.0, 0.0, 0.0],
-                                });
-                                glyph_vertices.push(GlyphVertex {
-                                    position: [right, bottom],
-                                    uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
-                                    color: fg_color,
-                                    bg_color: [0.0, 0.0, 0.0, 0.0],
-                                });
-                                glyph_vertices.push(GlyphVertex {
-                                    position: [left, bottom],
-                                    uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
-                                    color: fg_color,
-                                    bg_color: [0.0, 0.0, 0.0, 0.0],
-                                });
-                                glyph_indices.extend_from_slice(&[
-                                    base_idx, base_idx + 1, base_idx + 2,
-                                    base_idx, base_idx + 2, base_idx + 3,
-                                ]);
-                            }
-                        }
-
-                        col_idx += 1;
-                    }
+                let mut fg_color = color_to_rgba(&cell.fg_color, true);
+                let mut bg_color = color_to_rgba(&cell.bg_color, false);
+                
+                // Handle selection
+                if self.is_cell_selected(col_idx, row_idx) && col_idx <= last_content_col {
+                    fg_color = [0.0, 0.0, 0.0, 1.0];  // Black foreground
+                    bg_color = [1.0, 1.0, 1.0, 1.0];  // White background
                 }
-            }
 
-            // Draw cursor only in the active pane
-            if is_active_pane && pane.cursor.visible {
-                let cursor_x = pane_x_offset + pane.cursor.col as f32 * self.cell_width;
-                let cursor_y = pane_y_offset + pane.cursor.row as f32 * self.cell_height;
+                // Cell bounds
+                let cell_left = Self::pixel_to_ndc_x(cell_x, width);
+                let cell_right = Self::pixel_to_ndc_x(cell_x + self.cell_width, width);
+                let cell_top = Self::pixel_to_ndc_y(cell_y, height);
+                let cell_bottom = Self::pixel_to_ndc_y(cell_y + self.cell_height, height);
 
-                // Get the cell under the cursor to determine colors
-                let cursor_cell = pane.cells
-                    .get(pane.cursor.row)
-                    .and_then(|row| row.get(pane.cursor.col));
-
-                // Get fg and bg colors from the cell under cursor
-                let (cell_fg, cell_bg, cell_char) = if let Some(cell) = cursor_cell {
-                    let fg = self.cell_color_to_rgba(&cell.fg_color, true);
-                    let bg = self.cell_color_to_rgba(&cell.bg_color, false);
-                    (fg, bg, cell.character)
-                } else {
-                    // Default colors if cell doesn't exist
-                    let fg = self.cell_color_to_rgba(&CellColor::Default, true);
-                    let bg = [0.0, 0.0, 0.0, 0.0];
-                    (fg, bg, ' ')
-                };
-
-                let has_character = cell_char != ' ' && cell_char != '\0';
-
-                // Cursor color: invert the background, or use fg if there's a character
-                let cursor_bg_color = if has_character {
-                    // Character present: cursor takes fg color as background
-                    [cell_fg[0], cell_fg[1], cell_fg[2], 1.0]
-                } else {
-                    // Empty cell: invert the background color
-                    // If bg is transparent/default, invert to white; otherwise invert RGB
-                    if cell_bg[3] < 0.01 {
-                        // Transparent background -> white cursor
-                        let white = Self::srgb_to_linear(0.9);
-                        [white, white, white, 1.0]
-                    } else {
-                        // Invert the background color
-                        [1.0 - cell_bg[0], 1.0 - cell_bg[1], 1.0 - cell_bg[2], 1.0]
-                    }
-                };
-
-                // Determine cursor bounds based on style
-                let (left, right, top, bottom) = match pane.cursor.style {
-                    CursorStyle::Block => (
-                        cursor_x,
-                        cursor_x + self.cell_width,
-                        cursor_y,
-                        cursor_y + self.cell_height,
-                    ),
-                    CursorStyle::Underline => {
-                        let underline_height = 2.0_f32.max(self.cell_height * 0.1);
-                        (
-                            cursor_x,
-                            cursor_x + self.cell_width,
-                            cursor_y + self.cell_height - underline_height,
-                            cursor_y + self.cell_height,
-                        )
-                    }
-                    CursorStyle::Bar => {
-                        let bar_width = 2.0_f32.max(self.cell_width * 0.1);
-                        (
-                            cursor_x,
-                            cursor_x + bar_width,
-                            cursor_y,
-                            cursor_y + self.cell_height,
-                        )
-                    }
-                };
-
-                let cursor_left = Self::pixel_to_ndc_x(left, width);
-                let cursor_right = Self::pixel_to_ndc_x(right, width);
-                let cursor_top = Self::pixel_to_ndc_y(top, height);
-                let cursor_bottom = Self::pixel_to_ndc_y(bottom, height);
-
-                let base_idx = glyph_vertices.len() as u32;
-
-                glyph_vertices.push(GlyphVertex {
-                    position: [cursor_left, cursor_top],
+                // Add background quad
+                let base_idx = self.bg_vertices.len() as u32;
+                self.bg_vertices.push(GlyphVertex {
+                    position: [cell_left, cell_top],
                     uv: [0.0, 0.0],
-                    color: cursor_bg_color,
-                    bg_color: cursor_bg_color,
+                    color: fg_color,
+                    bg_color,
                 });
-                glyph_vertices.push(GlyphVertex {
-                    position: [cursor_right, cursor_top],
+                self.bg_vertices.push(GlyphVertex {
+                    position: [cell_right, cell_top],
                     uv: [0.0, 0.0],
-                    color: cursor_bg_color,
-                    bg_color: cursor_bg_color,
+                    color: fg_color,
+                    bg_color,
                 });
-                glyph_vertices.push(GlyphVertex {
-                    position: [cursor_right, cursor_bottom],
+                self.bg_vertices.push(GlyphVertex {
+                    position: [cell_right, cell_bottom],
                     uv: [0.0, 0.0],
-                    color: cursor_bg_color,
-                    bg_color: cursor_bg_color,
+                    color: fg_color,
+                    bg_color,
                 });
-                glyph_vertices.push(GlyphVertex {
-                    position: [cursor_left, cursor_bottom],
+                self.bg_vertices.push(GlyphVertex {
+                    position: [cell_left, cell_bottom],
                     uv: [0.0, 0.0],
-                    color: cursor_bg_color,
-                    bg_color: cursor_bg_color,
+                    color: fg_color,
+                    bg_color,
                 });
-
-                glyph_indices.extend_from_slice(&[
+                self.bg_indices.extend_from_slice(&[
                     base_idx, base_idx + 1, base_idx + 2,
                     base_idx, base_idx + 2, base_idx + 3,
                 ]);
 
-                // If block cursor and there's a character, re-render it with inverted color
-                if matches!(pane.cursor.style, CursorStyle::Block) && has_character {
-                    // Character color: use bg color (inverted from normal)
-                    let char_color = if cell_bg[3] < 0.01 {
-                        // If bg was transparent, use black for the character
-                        [0.0, 0.0, 0.0, 1.0]
-                    } else {
-                        [cell_bg[0], cell_bg[1], cell_bg[2], 1.0]
-                    };
-
-                    let glyph = self.rasterize_char(cell_char);
+                // Add glyph if it has content
+                let c = cell.character;
+                if c != ' ' && c != '\0' {
+                    let glyph = self.rasterize_char(c);
                     if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
-                        let cell_x = cursor_x;
-                        let cell_y = cursor_y;
-                        let (glyph_x, glyph_y) = if Self::is_box_drawing(cell_char) {
+                        let (glyph_x, glyph_y) = if Self::is_box_drawing(c) {
                             (cell_x, cell_y)
                         } else {
                             let baseline_y = (cell_y + self.cell_height * 0.8).round();
@@ -3397,166 +3032,208 @@ impl Renderer {
                             (gx, gy)
                         };
 
-                        let g_left = Self::pixel_to_ndc_x(glyph_x, width);
-                        let g_right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
-                        let g_top = Self::pixel_to_ndc_y(glyph_y, height);
-                        let g_bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
+                        let left = Self::pixel_to_ndc_x(glyph_x, width);
+                        let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
+                        let top = Self::pixel_to_ndc_y(glyph_y, height);
+                        let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
 
-                        let base_idx = glyph_vertices.len() as u32;
-                        glyph_vertices.push(GlyphVertex {
-                            position: [g_left, g_top],
+                        let base_idx = self.glyph_vertices.len() as u32;
+                        self.glyph_vertices.push(GlyphVertex {
+                            position: [left, top],
                             uv: [glyph.uv[0], glyph.uv[1]],
-                            color: char_color,
+                            color: fg_color,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_vertices.push(GlyphVertex {
-                            position: [g_right, g_top],
+                        self.glyph_vertices.push(GlyphVertex {
+                            position: [right, top],
                             uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
-                            color: char_color,
+                            color: fg_color,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_vertices.push(GlyphVertex {
-                            position: [g_right, g_bottom],
+                        self.glyph_vertices.push(GlyphVertex {
+                            position: [right, bottom],
                             uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
-                            color: char_color,
+                            color: fg_color,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_vertices.push(GlyphVertex {
-                            position: [g_left, g_bottom],
+                        self.glyph_vertices.push(GlyphVertex {
+                            position: [left, bottom],
                             uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
-                            color: char_color,
+                            color: fg_color,
                             bg_color: [0.0, 0.0, 0.0, 0.0],
                         });
-                        glyph_indices.extend_from_slice(&[
+                        self.glyph_indices.extend_from_slice(&[
                             base_idx, base_idx + 1, base_idx + 2,
                             base_idx, base_idx + 2, base_idx + 3,
                         ]);
                     }
                 }
             }
-
         }
 
         // ═══════════════════════════════════════════════════════════════════
-        // DRAW PANE SEPARATORS (only between adjacent panes, sized to the pane bounds)
+        // RENDER CURSOR
         // ═══════════════════════════════════════════════════════════════════
-        if panes.len() > 1 {
-            let separator_thickness = 1.0_f32;
+        // Only show cursor when viewing live terminal (not scrolled into history)
+        if terminal.cursor_visible && terminal.scroll_offset == 0 
+           && terminal.cursor_row < rows && terminal.cursor_col < cols {
+            let cursor_col = terminal.cursor_col;
+            let cursor_row = terminal.cursor_row;
+            let cursor_x = cursor_col as f32 * self.cell_width;
+            let cursor_y = terminal_y_offset + cursor_row as f32 * self.cell_height;
+
+            // Get cell under cursor
+            let cursor_cell = visible_rows.get(cursor_row).and_then(|row| row.get(cursor_col));
             
-            for (_, pane_info) in panes.iter() {
-                let pane_left_x = pane_info.x as f32 * self.cell_width;
-                let pane_right_x = pane_left_x + pane_info.cols as f32 * self.cell_width;
-                let pane_top_y = terminal_y_offset + pane_info.y as f32 * self.cell_height;
-                let pane_bottom_y = pane_top_y + pane_info.rows as f32 * self.cell_height;
-                
-                // Check if there's a pane directly to the right (draw vertical separator on right edge)
-                let has_pane_right = panes.iter().any(|(_, other)| {
-                    let other_left_x = other.x as f32 * self.cell_width;
-                    let other_top_y = terminal_y_offset + other.y as f32 * self.cell_height;
-                    let other_bottom_y = other_top_y + other.rows as f32 * self.cell_height;
-                    // Other pane starts at our right edge and overlaps vertically
-                    (other_left_x - pane_right_x).abs() < 2.0
-                        && other_top_y < pane_bottom_y
-                        && other_bottom_y > pane_top_y
-                });
-                
-                if has_pane_right {
-                    // Draw vertical separator at right edge, spanning this pane's height
-                    // Extend to window edges if this pane is at top/bottom
-                    let sep_top = if pane_info.y == 0 { terminal_y_offset } else { pane_top_y };
-                    let terminal_bottom = height - if matches!(self.tab_bar_position, TabBarPosition::Bottom) { tab_bar_height } else { 0.0 };
-                    let max_pane_bottom: f32 = panes.iter()
-                        .map(|(_, p)| terminal_y_offset + p.y as f32 * self.cell_height + p.rows as f32 * self.cell_height)
-                        .fold(0.0_f32, |a, b| a.max(b));
-                    let sep_bottom = if (pane_bottom_y - max_pane_bottom).abs() < 2.0 { terminal_bottom } else { pane_bottom_y };
-                    
-                    let sep_left_ndc = Self::pixel_to_ndc_x(pane_right_x, width);
-                    let sep_right_ndc = Self::pixel_to_ndc_x(pane_right_x + separator_thickness, width);
-                    let sep_top_ndc = Self::pixel_to_ndc_y(sep_top, height);
-                    let sep_bottom_ndc = Self::pixel_to_ndc_y(sep_bottom, height);
+            let (cell_fg, cell_bg, cell_char) = if let Some(cell) = cursor_cell {
+                let fg = color_to_rgba(&cell.fg_color, true);
+                let bg = color_to_rgba(&cell.bg_color, false);
+                (fg, bg, cell.character)
+            } else {
+                let fg = {
+                    let [r, g, b] = self.palette.default_fg;
+                    [
+                        Self::srgb_to_linear(r as f32 / 255.0),
+                        Self::srgb_to_linear(g as f32 / 255.0),
+                        Self::srgb_to_linear(b as f32 / 255.0),
+                        1.0,
+                    ]
+                };
+                (fg, [0.0, 0.0, 0.0, 0.0], ' ')
+            };
 
-                    let base_idx = glyph_vertices.len() as u32;
-                    glyph_vertices.push(GlyphVertex {
-                        position: [sep_left_ndc, sep_top_ndc],
-                        uv: [0.0, 0.0],
-                        color: separator_color,
-                        bg_color: separator_color,
-                    });
-                    glyph_vertices.push(GlyphVertex {
-                        position: [sep_right_ndc, sep_top_ndc],
-                        uv: [0.0, 0.0],
-                        color: separator_color,
-                        bg_color: separator_color,
-                    });
-                    glyph_vertices.push(GlyphVertex {
-                        position: [sep_right_ndc, sep_bottom_ndc],
-                        uv: [0.0, 0.0],
-                        color: separator_color,
-                        bg_color: separator_color,
-                    });
-                    glyph_vertices.push(GlyphVertex {
-                        position: [sep_left_ndc, sep_bottom_ndc],
-                        uv: [0.0, 0.0],
-                        color: separator_color,
-                        bg_color: separator_color,
-                    });
-                    glyph_indices.extend_from_slice(&[
-                        base_idx, base_idx + 1, base_idx + 2,
-                        base_idx, base_idx + 2, base_idx + 3,
-                    ]);
+            let has_character = cell_char != ' ' && cell_char != '\0';
+
+            let cursor_bg_color = if has_character {
+                [cell_fg[0], cell_fg[1], cell_fg[2], 1.0]
+            } else {
+                if cell_bg[3] < 0.01 {
+                    let white = Self::srgb_to_linear(0.9);
+                    [white, white, white, 1.0]
+                } else {
+                    [1.0 - cell_bg[0], 1.0 - cell_bg[1], 1.0 - cell_bg[2], 1.0]
                 }
-                
-                // Check if there's a pane directly below (draw horizontal separator on bottom edge)
-                let has_pane_below = panes.iter().any(|(_, other)| {
-                    let other_left_x = other.x as f32 * self.cell_width;
-                    let other_right_x = other_left_x + other.cols as f32 * self.cell_width;
-                    let other_top_y = terminal_y_offset + other.y as f32 * self.cell_height;
-                    // Other pane starts at our bottom edge and overlaps horizontally
-                    (other_top_y - pane_bottom_y).abs() < 2.0
-                        && other_left_x < pane_right_x
-                        && other_right_x > pane_left_x
-                });
-                
-                if has_pane_below {
-                    // Draw horizontal separator at bottom edge, spanning this pane's width
-                    // Extend to window edges if this pane is at left/right
-                    let sep_left = if pane_info.x == 0 { 0.0 } else { pane_left_x };
-                    let max_pane_right: f32 = panes.iter()
-                        .map(|(_, p)| p.x as f32 * self.cell_width + p.cols as f32 * self.cell_width)
-                        .fold(0.0_f32, |a, b| a.max(b));
-                    let sep_right = if (pane_right_x - max_pane_right).abs() < 2.0 { width } else { pane_right_x };
-                    
-                    let sep_left_ndc = Self::pixel_to_ndc_x(sep_left, width);
-                    let sep_right_ndc = Self::pixel_to_ndc_x(sep_right, width);
-                    let sep_top_ndc = Self::pixel_to_ndc_y(pane_bottom_y, height);
-                    let sep_bottom_ndc = Self::pixel_to_ndc_y(pane_bottom_y + separator_thickness, height);
+            };
 
-                    let base_idx = glyph_vertices.len() as u32;
-                    glyph_vertices.push(GlyphVertex {
-                        position: [sep_left_ndc, sep_top_ndc],
-                        uv: [0.0, 0.0],
-                        color: separator_color,
-                        bg_color: separator_color,
+            // Convert cursor shape to style
+            let cursor_style = match terminal.cursor_shape {
+                CursorShape::BlinkingBlock | CursorShape::SteadyBlock => 0,
+                CursorShape::BlinkingUnderline | CursorShape::SteadyUnderline => 1,
+                CursorShape::BlinkingBar | CursorShape::SteadyBar => 2,
+            };
+
+            let (left, right, top, bottom) = match cursor_style {
+                0 => ( // Block
+                    cursor_x,
+                    cursor_x + self.cell_width,
+                    cursor_y,
+                    cursor_y + self.cell_height,
+                ),
+                1 => { // Underline
+                    let underline_height = 2.0_f32.max(self.cell_height * 0.1);
+                    (
+                        cursor_x,
+                        cursor_x + self.cell_width,
+                        cursor_y + self.cell_height - underline_height,
+                        cursor_y + self.cell_height,
+                    )
+                }
+                _ => { // Bar
+                    let bar_width = 2.0_f32.max(self.cell_width * 0.1);
+                    (
+                        cursor_x,
+                        cursor_x + bar_width,
+                        cursor_y,
+                        cursor_y + self.cell_height,
+                    )
+                }
+            };
+
+            let cursor_left = Self::pixel_to_ndc_x(left, width);
+            let cursor_right = Self::pixel_to_ndc_x(right, width);
+            let cursor_top = Self::pixel_to_ndc_y(top, height);
+            let cursor_bottom = Self::pixel_to_ndc_y(bottom, height);
+
+            let base_idx = self.glyph_vertices.len() as u32;
+            self.glyph_vertices.push(GlyphVertex {
+                position: [cursor_left, cursor_top],
+                uv: [0.0, 0.0],
+                color: cursor_bg_color,
+                bg_color: cursor_bg_color,
+            });
+            self.glyph_vertices.push(GlyphVertex {
+                position: [cursor_right, cursor_top],
+                uv: [0.0, 0.0],
+                color: cursor_bg_color,
+                bg_color: cursor_bg_color,
+            });
+            self.glyph_vertices.push(GlyphVertex {
+                position: [cursor_right, cursor_bottom],
+                uv: [0.0, 0.0],
+                color: cursor_bg_color,
+                bg_color: cursor_bg_color,
+            });
+            self.glyph_vertices.push(GlyphVertex {
+                position: [cursor_left, cursor_bottom],
+                uv: [0.0, 0.0],
+                color: cursor_bg_color,
+                bg_color: cursor_bg_color,
+            });
+            self.glyph_indices.extend_from_slice(&[
+                base_idx, base_idx + 1, base_idx + 2,
+                base_idx, base_idx + 2, base_idx + 3,
+            ]);
+
+            // If block cursor and there's a character, render it inverted
+            if cursor_style == 0 && has_character {
+                let char_color = if cell_bg[3] < 0.01 {
+                    [0.0, 0.0, 0.0, 1.0]
+                } else {
+                    [cell_bg[0], cell_bg[1], cell_bg[2], 1.0]
+                };
+
+                let glyph = self.rasterize_char(cell_char);
+                if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
+                    let (glyph_x, glyph_y) = if Self::is_box_drawing(cell_char) {
+                        (cursor_x, cursor_y)
+                    } else {
+                        let baseline_y = (cursor_y + self.cell_height * 0.8).round();
+                        let gx = (cursor_x + glyph.offset[0]).round();
+                        let gy = (baseline_y - glyph.offset[1] - glyph.size[1]).round();
+                        (gx, gy)
+                    };
+
+                    let g_left = Self::pixel_to_ndc_x(glyph_x, width);
+                    let g_right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
+                    let g_top = Self::pixel_to_ndc_y(glyph_y, height);
+                    let g_bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
+
+                    let base_idx = self.glyph_vertices.len() as u32;
+                    self.glyph_vertices.push(GlyphVertex {
+                        position: [g_left, g_top],
+                        uv: [glyph.uv[0], glyph.uv[1]],
+                        color: char_color,
+                        bg_color: [0.0, 0.0, 0.0, 0.0],
                     });
-                    glyph_vertices.push(GlyphVertex {
-                        position: [sep_right_ndc, sep_top_ndc],
-                        uv: [0.0, 0.0],
-                        color: separator_color,
-                        bg_color: separator_color,
+                    self.glyph_vertices.push(GlyphVertex {
+                        position: [g_right, g_top],
+                        uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
+                        color: char_color,
+                        bg_color: [0.0, 0.0, 0.0, 0.0],
                     });
-                    glyph_vertices.push(GlyphVertex {
-                        position: [sep_right_ndc, sep_bottom_ndc],
-                        uv: [0.0, 0.0],
-                        color: separator_color,
-                        bg_color: separator_color,
+                    self.glyph_vertices.push(GlyphVertex {
+                        position: [g_right, g_bottom],
+                        uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
+                        color: char_color,
+                        bg_color: [0.0, 0.0, 0.0, 0.0],
                     });
-                    glyph_vertices.push(GlyphVertex {
-                        position: [sep_left_ndc, sep_bottom_ndc],
-                        uv: [0.0, 0.0],
-                        color: separator_color,
-                        bg_color: separator_color,
+                    self.glyph_vertices.push(GlyphVertex {
+                        position: [g_left, g_bottom],
+                        uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
+                        color: char_color,
+                        bg_color: [0.0, 0.0, 0.0, 0.0],
                     });
-                    glyph_indices.extend_from_slice(&[
+                    self.glyph_indices.extend_from_slice(&[
                         base_idx, base_idx + 1, base_idx + 2,
                         base_idx, base_idx + 2, base_idx + 3,
                     ]);
@@ -3564,17 +3241,16 @@ impl Renderer {
             }
         }
 
-        // Combine vertices
-        let mut vertices = bg_vertices;
-        let mut indices = bg_indices;
-        
-        let glyph_vertex_offset = vertices.len() as u32;
-        vertices.extend(glyph_vertices);
-        indices.extend(glyph_indices.iter().map(|i| i + glyph_vertex_offset));
+        // ═══════════════════════════════════════════════════════════════════
+        // SUBMIT TO GPU
+        // ═══════════════════════════════════════════════════════════════════
+        let bg_vertex_count = self.bg_vertices.len();
+        let total_vertex_count = bg_vertex_count + self.glyph_vertices.len();
+        let total_index_count = self.bg_indices.len() + self.glyph_indices.len();
 
         // Resize buffers if needed
-        if vertices.len() > self.vertex_capacity {
-            self.vertex_capacity = vertices.len() * 2;
+        if total_vertex_count > self.vertex_capacity {
+            self.vertex_capacity = total_vertex_count * 2;
             self.vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Glyph Vertex Buffer"),
                 size: (self.vertex_capacity * std::mem::size_of::<GlyphVertex>()) as u64,
@@ -3583,8 +3259,8 @@ impl Renderer {
             });
         }
 
-        if indices.len() > self.index_capacity {
-            self.index_capacity = indices.len() * 2;
+        if total_index_count > self.index_capacity {
+            self.index_capacity = total_index_count * 2;
             self.index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Glyph Index Buffer"),
                 size: (self.index_capacity * std::mem::size_of::<u32>()) as u64,
@@ -3593,9 +3269,30 @@ impl Renderer {
             });
         }
 
-        // Upload data
-        self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        self.queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
+        // Upload vertices
+        self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.bg_vertices));
+        self.queue.write_buffer(
+            &self.vertex_buffer,
+            (bg_vertex_count * std::mem::size_of::<GlyphVertex>()) as u64,
+            bytemuck::cast_slice(&self.glyph_vertices),
+        );
+
+        // Upload indices
+        self.queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&self.bg_indices));
+
+        let glyph_vertex_offset = bg_vertex_count as u32;
+        let bg_index_bytes = self.bg_indices.len() * std::mem::size_of::<u32>();
+
+        if !self.glyph_indices.is_empty() {
+            let adjusted_indices: Vec<u32> = self.glyph_indices.iter()
+                .map(|i| i + glyph_vertex_offset)
+                .collect();
+            self.queue.write_buffer(
+                &self.index_buffer,
+                bg_index_bytes as u64,
+                bytemuck::cast_slice(&adjusted_indices),
+            );
+        }
 
         if self.atlas_dirty {
             self.queue.write_texture(
@@ -3655,7 +3352,346 @@ impl Renderer {
             render_pass.set_bind_group(0, &self.glyph_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+            render_pass.draw_indexed(0..total_index_count as u32, 0, 0..1);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+
+        Ok(())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // KITTY-STYLE INSTANCED RENDERING HELPER METHODS
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// Update the color table uniform buffer with the current palette.
+    /// The color table contains 258 colors: 256 indexed colors + default fg (256) + default bg (257).
+    fn update_color_table(&mut self, palette: &ColorPalette) {
+        let Some(ref buffer) = self.color_table_buffer else {
+            return;
+        };
+
+        let mut color_table = ColorTableUniform::default();
+
+        // Fill 256 indexed colors
+        for i in 0..256 {
+            let [r, g, b] = palette.colors[i];
+            color_table.colors[i] = [
+                r as f32 / 255.0,
+                g as f32 / 255.0,
+                b as f32 / 255.0,
+                1.0,
+            ];
+        }
+
+        // Default foreground at index 256
+        let [fg_r, fg_g, fg_b] = palette.default_fg;
+        color_table.colors[256] = [
+            fg_r as f32 / 255.0,
+            fg_g as f32 / 255.0,
+            fg_b as f32 / 255.0,
+            1.0,
+        ];
+
+        // Default background at index 257
+        let [bg_r, bg_g, bg_b] = palette.default_bg;
+        color_table.colors[257] = [
+            bg_r as f32 / 255.0,
+            bg_g as f32 / 255.0,
+            bg_b as f32 / 255.0,
+            1.0,
+        ];
+
+        self.queue.write_buffer(buffer, 0, bytemuck::bytes_of(&color_table));
+    }
+
+    /// Get or create a sprite index for a character.
+    /// Returns the sprite index, or 0 if the character has no visible glyph.
+    fn get_or_create_sprite(&mut self, c: char) -> u32 {
+        // Check cache first
+        if let Some(&idx) = self.char_to_sprite.get(&c) {
+            return idx;
+        }
+
+        // Space and control characters have no visible glyph
+        if c == ' ' || c == '\0' || c.is_control() {
+            self.char_to_sprite.insert(c, 0);
+            return 0;
+        }
+
+        // Rasterize the character to get its glyph info
+        let glyph_info = self.rasterize_char(c);
+
+        // If the glyph has no visible pixels, return 0
+        if glyph_info.size[0] <= 0.0 || glyph_info.size[1] <= 0.0 {
+            self.char_to_sprite.insert(c, 0);
+            return 0;
+        }
+
+        // Assign a new sprite index
+        let sprite_idx = self.next_sprite_idx;
+        self.next_sprite_idx += 1;
+
+        // Ensure we have capacity in the sprite_info vector
+        while self.sprite_info.len() <= sprite_idx as usize {
+            self.sprite_info.push(SpriteInfo::default());
+        }
+
+        // Store sprite info
+        self.sprite_info[sprite_idx as usize] = SpriteInfo {
+            uv: glyph_info.uv,
+            offset: glyph_info.offset,
+            size: glyph_info.size,
+        };
+
+        // Cache the mapping
+        self.char_to_sprite.insert(c, sprite_idx);
+
+        sprite_idx
+    }
+
+    /// Ensure the cell buffer has enough capacity for the given number of cells.
+    fn ensure_cell_buffer_capacity(&mut self, num_cells: usize) {
+        if num_cells <= self.cell_buffer_capacity {
+            return;
+        }
+
+        // Grow by 2x or to the required size, whichever is larger
+        let new_capacity = (self.cell_buffer_capacity * 2).max(num_cells);
+
+        let new_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Cell Storage Buffer"),
+            size: (new_capacity * std::mem::size_of::<GPUCell>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        self.cell_buffer = Some(new_buffer);
+        self.cell_buffer_capacity = new_capacity;
+
+        // Recreate bind group with new buffer
+        self.recreate_cell_bind_group();
+    }
+
+    /// Ensure the sprite buffer has enough capacity.
+    fn ensure_sprite_buffer_capacity(&mut self, num_sprites: usize) {
+        if num_sprites <= self.sprite_buffer_capacity {
+            return;
+        }
+
+        let new_capacity = (self.sprite_buffer_capacity * 2).max(num_sprites);
+
+        let new_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Sprite Storage Buffer"),
+            size: (new_capacity * std::mem::size_of::<SpriteInfo>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        self.sprite_buffer = Some(new_buffer);
+        self.sprite_buffer_capacity = new_capacity;
+
+        // Recreate bind group with new buffer
+        self.recreate_cell_bind_group();
+    }
+
+    /// Recreate the cell bind group after buffer reallocation.
+    fn recreate_cell_bind_group(&mut self) {
+        let Some(ref layout) = self.cell_bind_group_layout else {
+            return;
+        };
+        let Some(ref color_table_buffer) = self.color_table_buffer else {
+            return;
+        };
+        let Some(ref grid_params_buffer) = self.grid_params_buffer else {
+            return;
+        };
+        let Some(ref cell_buffer) = self.cell_buffer else {
+            return;
+        };
+        let Some(ref sprite_buffer) = self.sprite_buffer else {
+            return;
+        };
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Cell Bind Group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: color_table_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: grid_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: cell_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: sprite_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.cell_bind_group = Some(bind_group);
+    }
+
+    /// Render using Kitty-style instanced rendering.
+    /// This is the new high-performance rendering path.
+    pub fn render_instanced(&mut self, terminal: &mut Terminal) -> Result<(), wgpu::SurfaceError> {
+        // Early return if instanced rendering is not set up
+        if !self.use_instanced_rendering {
+            return self.render(terminal);
+        }
+
+        let output = self.surface.get_current_texture()?;
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let (cols, rows) = self.terminal_size();
+        let num_cells = cols * rows;
+
+        // Ensure buffers are large enough
+        self.ensure_cell_buffer_capacity(num_cells);
+        self.ensure_sprite_buffer_capacity(self.next_sprite_idx as usize + 256);
+
+        // Update color table from palette
+        self.update_color_table(&terminal.palette);
+
+        // Build GPU cells array
+        let mut gpu_cells = Vec::with_capacity(num_cells);
+        for row_idx in 0..rows.min(terminal.grid.len()) {
+            let row = &terminal.grid[row_idx];
+            for col_idx in 0..cols {
+                if col_idx < row.len() {
+                    let cell = &row[col_idx];
+                    let sprite_idx = self.get_or_create_sprite(cell.character);
+                    gpu_cells.push(GPUCell::from_cell(cell, sprite_idx));
+                } else {
+                    gpu_cells.push(GPUCell::empty());
+                }
+            }
+        }
+        // Fill remaining rows with empty cells
+        while gpu_cells.len() < num_cells {
+            gpu_cells.push(GPUCell::empty());
+        }
+
+        // Upload cell data
+        if let Some(ref buffer) = self.cell_buffer {
+            self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&gpu_cells));
+        }
+
+        // Upload sprite info
+        if let Some(ref buffer) = self.sprite_buffer {
+            self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.sprite_info));
+        }
+
+        // Update grid params
+        let grid_params = GridParamsUniform {
+            cols: cols as u32,
+            rows: rows as u32,
+            cell_width: self.cell_width,
+            cell_height: self.cell_height,
+            screen_width: self.width as f32,
+            screen_height: self.height as f32,
+            y_offset: self.terminal_y_offset(),
+            cursor_col: if terminal.cursor_visible { terminal.cursor_col as i32 } else { -1 },
+            cursor_row: if terminal.cursor_visible { terminal.cursor_row as i32 } else { -1 },
+            cursor_style: match terminal.cursor_shape {
+                CursorShape::BlinkingBlock | CursorShape::SteadyBlock => 0,
+                CursorShape::BlinkingUnderline | CursorShape::SteadyUnderline => 1,
+                CursorShape::BlinkingBar | CursorShape::SteadyBar => 2,
+            },
+            _padding: [0, 0],
+        };
+
+        if let Some(ref buffer) = self.grid_params_buffer {
+            self.queue.write_buffer(buffer, 0, bytemuck::bytes_of(&grid_params));
+        }
+
+        // Upload atlas if dirty
+        if self.atlas_dirty {
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.atlas_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &self.atlas_data,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(ATLAS_SIZE),
+                    rows_per_image: Some(ATLAS_SIZE),
+                },
+                wgpu::Extent3d {
+                    width: ATLAS_SIZE,
+                    height: ATLAS_SIZE,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.atlas_dirty = false;
+        }
+
+        // Render
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Instanced Render Encoder"),
+        });
+
+        {
+            // Clear with background color
+            let [bg_r, bg_g, bg_b] = terminal.palette.default_bg;
+            let bg_r_linear = Self::srgb_to_linear(bg_r as f32 / 255.0) as f64;
+            let bg_g_linear = Self::srgb_to_linear(bg_g as f32 / 255.0) as f64;
+            let bg_b_linear = Self::srgb_to_linear(bg_b as f32 / 255.0) as f64;
+            let bg_alpha = self.background_opacity as f64;
+
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Instanced Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: bg_r_linear,
+                            g: bg_g_linear,
+                            b: bg_b_linear,
+                            a: bg_alpha,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+
+            // Get references to avoid borrow issues
+            let cell_bg_pipeline = self.cell_bg_pipeline.as_ref();
+            let cell_glyph_pipeline = self.cell_glyph_pipeline.as_ref();
+            let glyph_bind_group = &self.glyph_bind_group;
+            let cell_bind_group = self.cell_bind_group.as_ref();
+            let quad_index_buffer = self.quad_index_buffer.as_ref();
+
+            if let (Some(bg_pipeline), Some(glyph_pipeline), Some(cell_bg), Some(idx_buf)) = 
+                (cell_bg_pipeline, cell_glyph_pipeline, cell_bind_group, quad_index_buffer) 
+            {
+                // Pass 1: Render backgrounds
+                render_pass.set_pipeline(bg_pipeline);
+                render_pass.set_bind_group(0, glyph_bind_group, &[]);
+                render_pass.set_bind_group(1, cell_bg, &[]);
+                render_pass.set_index_buffer(idx_buf.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass.draw_indexed(0..6, 0, 0..num_cells as u32);
+
+                // Pass 2: Render glyphs
+                render_pass.set_pipeline(glyph_pipeline);
+                // Bind groups already set
+                render_pass.draw_indexed(0..6, 0, 0..num_cells as u32);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

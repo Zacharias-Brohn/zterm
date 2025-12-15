@@ -4,7 +4,7 @@ use rustix::fs::{fcntl_setfl, OFlags};
 use rustix::io::{read, write, Errno};
 use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
 use std::ffi::CString;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -94,6 +94,15 @@ impl Pty {
             unsafe { libc::close(slave_fd) };
         }
 
+        // Set TERM environment variable
+        // Try zterm first, fall back to xterm-256color if zterm terminfo isn't installed
+        // SAFETY: We're in a forked child process before exec, single-threaded
+        unsafe {
+            std::env::set_var("TERM", "zterm");
+            // Also set COLORTERM to indicate true color support
+            std::env::set_var("COLORTERM", "truecolor");
+        }
+
         // Determine which shell to use
         let shell_path = shell
             .map(String::from)
@@ -162,6 +171,28 @@ impl Pty {
     /// Returns the child process ID.
     pub fn child_pid(&self) -> rustix::process::Pid {
         self.child_pid
+    }
+    
+    /// Check if the child process has exited.
+    pub fn child_exited(&self) -> bool {
+        let mut status: libc::c_int = 0;
+        let result = unsafe {
+            libc::waitpid(
+                self.child_pid.as_raw_nonzero().get(),
+                &mut status,
+                libc::WNOHANG,
+            )
+        };
+        // If waitpid returns the child PID, the child has exited
+        // If it returns 0, the child is still running
+        // If it returns -1, there was an error (child might have already been reaped)
+        result != 0
+    }
+}
+
+impl AsRawFd for Pty {
+    fn as_raw_fd(&self) -> RawFd {
+        self.master.as_raw_fd()
     }
 }
 

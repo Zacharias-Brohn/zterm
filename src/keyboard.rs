@@ -458,19 +458,17 @@ impl<'a> KeyEncoder<'a> {
         }
     }
 
-    /// Encodes arrow/home/end keys: CSI 1;mod X or SS3 X (no modifiers).
+    /// Encodes arrow/home/end keys: CSI 1;mod X (with modifiers) or SS3 X (no modifiers).
     fn encode_arrow(&self, letter: u8, mod_param: Option<u8>) -> Vec<u8> {
         if let Some(m) = mod_param {
-            vec![0x1b, b'[', b'1', b';', b'0' + (m / 10), b'0' + (m % 10), letter]
-                .into_iter()
-                .filter(|&b| b != b'0' || m >= 10)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .take(6 + if m >= 10 { 1 } else { 0 })
-                .collect()
+            // With modifiers: CSI 1;mod letter
+            let mut result = vec![0x1b, b'[', b'1', b';'];
+            result.extend_from_slice(m.to_string().as_bytes());
+            result.push(letter);
+            result
         } else {
-            // SS3 letter (cursor key mode) or CSI letter
-            vec![0x1b, b'[', letter]
+            // No modifiers: SS3 letter (application cursor mode)
+            vec![0x1b, b'O', letter]
         }
     }
 
