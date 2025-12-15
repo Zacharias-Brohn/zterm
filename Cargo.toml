@@ -39,6 +39,8 @@ bitflags = "2"
 fontdue = "0.9"
 rustybuzz = "0.20"
 ttf-parser = "0.25"
+fontconfig = "0.10"
+fontconfig-sys = { package = "yeslogic-fontconfig-sys", version = "6.0" }
 
 # Configuration
 serde = { version = "1", features = ["derive"] }

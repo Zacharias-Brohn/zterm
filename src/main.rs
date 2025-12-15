@@ -6,7 +6,7 @@
 use zterm::config::{Action, Config};
 use zterm::keyboard::{FunctionalKey, KeyEncoder, KeyEventType, KeyboardState, Modifiers};
 use zterm::pty::Pty;
-use zterm::renderer::Renderer;
+use zterm::renderer::{PaneRenderInfo, Renderer};
 use zterm::terminal::{Terminal, MouseTrackingMode};
 
 use std::collections::HashMap;
@@ -146,6 +146,10 @@ struct Pane {
     is_selecting: bool,
     /// Last scrollback length for tracking changes.
     last_scrollback_len: u32,
+    /// When the focus animation started (for smooth fade).
+    focus_animation_start: std::time::Instant,
+    /// Whether this pane was focused before the current animation.
+    was_focused: bool,
 }
 
 impl Pane {
@@ -170,6 +174,8 @@ impl Pane {
             selection: None,
             is_selecting: false,
             last_scrollback_len: 0,
+            focus_animation_start: std::time::Instant::now(),
+            was_focused: true, // New panes start as focused
         })
     }
     
@@ -191,6 +197,36 @@ impl Pane {
     /// Check if the shell has exited.
     fn child_exited(&self) -> bool {
         self.pty.child_exited()
+    }
+    
+    /// Calculate the current dim factor based on animation progress.
+    /// Returns a value between `inactive_dim` (for unfocused) and 1.0 (for focused).
+    fn calculate_dim_factor(&mut self, is_focused: bool, fade_duration_ms: u64, inactive_dim: f32) -> f32 {
+        // Detect focus change
+        if is_focused != self.was_focused {
+            self.focus_animation_start = std::time::Instant::now();
+            self.was_focused = is_focused;
+        }
+        
+        // If no animation (instant), return target value immediately
+        if fade_duration_ms == 0 {
+            return if is_focused { 1.0 } else { inactive_dim };
+        }
+        
+        let elapsed = self.focus_animation_start.elapsed().as_millis() as f32;
+        let duration = fade_duration_ms as f32;
+        let progress = (elapsed / duration).min(1.0);
+        
+        // Smooth easing (ease-out cubic)
+        let eased = 1.0 - (1.0 - progress).powi(3);
+        
+        if is_focused {
+            // Fading in: from inactive_dim to 1.0
+            inactive_dim + (1.0 - inactive_dim) * eased
+        } else {
+            // Fading out: from 1.0 to inactive_dim
+            1.0 - (1.0 - inactive_dim) * eased
+        }
     }
 }
 
@@ -304,17 +340,6 @@ impl SplitNode {
             }
             SplitNode::Split { first, second, .. } => {
                 first.find_geometry(target_id).or_else(|| second.find_geometry(target_id))
-            }
-        }
-    }
-    
-    /// Collect all pane IDs.
-    fn collect_pane_ids(&self, ids: &mut Vec<PaneId>) {
-        match self {
-            SplitNode::Leaf { pane_id, .. } => ids.push(*pane_id),
-            SplitNode::Split { first, second, .. } => {
-                first.collect_pane_ids(ids);
-                second.collect_pane_ids(ids);
             }
         }
     }
@@ -507,6 +532,7 @@ impl TabId {
 /// A single tab containing one or more panes arranged in a split tree.
 struct Tab {
     /// Unique identifier for this tab.
+    #[allow(dead_code)]
     id: TabId,
     /// All panes in this tab, keyed by PaneId.
     panes: HashMap<PaneId, Pane>,
@@ -515,6 +541,7 @@ struct Tab {
     /// Currently active pane ID.
     active_pane: PaneId,
     /// Tab title (from OSC or shell).
+    #[allow(dead_code)]
     title: String,
 }
 
@@ -635,11 +662,6 @@ impl Tab {
         if let Some(neighbor_id) = self.split_root.find_neighbor(self.active_pane, direction) {
             self.active_pane = neighbor_id;
         }
-    }
-    
-    /// Get all pane IDs.
-    fn pane_ids(&self) -> Vec<PaneId> {
-        self.panes.keys().copied().collect()
     }
     
     /// Get pane by ID.
@@ -1191,6 +1213,8 @@ impl App {
                 if let Some(renderer) = &self.renderer {
                     let (cols, rows) = renderer.terminal_size();
                     self.create_tab(cols, rows);
+                    // Resize the new tab to calculate pane geometries
+                    self.resize_all_panes();
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -1751,33 +1775,93 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 
-                // Render
+                // Render all panes
                 let render_start = std::time::Instant::now();
                 let num_tabs = self.tabs.len();
                 let active_tab_idx = self.active_tab;
+                let fade_duration_ms = self.config.inactive_pane_fade_ms;
+                let inactive_dim = self.config.inactive_pane_dim;
                 
                 if let Some(renderer) = &mut self.renderer {
-                    if let Some(tab) = self.tabs.get(active_tab_idx) {
-                        if let Some(pane) = tab.active_pane() {
-                            let scroll_offset = pane.terminal.scroll_offset;
-                            let visible_rows = renderer.terminal_size().1;
-                            let renderer_selection = pane.selection.as_ref()
-                                .and_then(|sel| sel.to_screen_coords(scroll_offset, visible_rows));
-                            
-                            renderer.set_selection(renderer_selection);
-                            
-                            match renderer.render_from_terminal(&pane.terminal, num_tabs, active_tab_idx) {
-                                Ok(_) => {}
-                                Err(wgpu::SurfaceError::Lost) => {
-                                    renderer.resize(renderer.width, renderer.height);
-                                }
-                                Err(wgpu::SurfaceError::OutOfMemory) => {
-                                    log::error!("Out of GPU memory!");
-                                    event_loop.exit();
-                                }
-                                Err(e) => {
-                                    log::error!("Render error: {:?}", e);
-                                }
+                    if let Some(tab) = self.tabs.get_mut(active_tab_idx) {
+                        // Collect all pane geometries
+                        let geometries = tab.collect_pane_geometries();
+                        let active_pane_id = tab.active_pane;
+                        
+                        // First pass: calculate dim factors (needs mutable access)
+                        let mut dim_factors: Vec<(PaneId, f32)> = Vec::new();
+                        for (pane_id, _) in &geometries {
+                            if let Some(pane) = tab.panes.get_mut(pane_id) {
+                                let is_active = *pane_id == active_pane_id;
+                                let dim_factor = pane.calculate_dim_factor(is_active, fade_duration_ms, inactive_dim);
+                                dim_factors.push((*pane_id, dim_factor));
+                            }
+                        }
+                        
+                        // Build render info for all panes
+                        let mut pane_render_data: Vec<(&Terminal, PaneRenderInfo, Option<(usize, usize, usize, usize)>)> = Vec::new();
+                        
+                        for (pane_id, geom) in &geometries {
+                            if let Some(pane) = tab.panes.get(pane_id) {
+                                let is_active = *pane_id == active_pane_id;
+                                let scroll_offset = pane.terminal.scroll_offset;
+                                
+                                // Get pre-calculated dim factor
+                                let dim_factor = dim_factors.iter()
+                                    .find(|(id, _)| id == pane_id)
+                                    .map(|(_, f)| *f)
+                                    .unwrap_or(if is_active { 1.0 } else { inactive_dim });
+                                
+                                // Convert selection to screen coords for this pane
+                                let selection = if is_active {
+                                    pane.selection.as_ref()
+                                        .and_then(|sel| sel.to_screen_coords(scroll_offset, geom.rows))
+                                } else {
+                                    None
+                                };
+                                
+                                let render_info = PaneRenderInfo {
+                                    x: geom.x,
+                                    y: geom.y,
+                                    width: geom.width,
+                                    height: geom.height,
+                                    cols: geom.cols,
+                                    rows: geom.rows,
+                                    is_active,
+                                    dim_factor,
+                                };
+                                
+                                pane_render_data.push((&pane.terminal, render_info, selection));
+                            }
+                        }
+                        
+                        // Request redraw if any animation is in progress
+                        let animation_in_progress = dim_factors.iter().any(|(id, factor)| {
+                            let is_active = *id == active_pane_id;
+                            if is_active {
+                                *factor < 1.0
+                            } else {
+                                *factor > inactive_dim
+                            }
+                        });
+                        
+                        if animation_in_progress {
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
+                        
+                        match renderer.render_panes(&pane_render_data, num_tabs, active_tab_idx) {
+                            Ok(_) => {}
+                            Err(wgpu::SurfaceError::Lost) => {
+                                renderer.resize(renderer.width, renderer.height);
+                            }
+                            Err(wgpu::SurfaceError::OutOfMemory) => {
+                                log::error!("Out of GPU memory!");
+                                event_loop.exit();
+                            }
+                            Err(e) => {
+                                log::error!("Render error: {:?}", e);
                             }
                         }
                     }

@@ -144,292 +144,6 @@ impl Default for ColorPalette {
     }
 }
 
-/// Packed color value for GPU transfer (Kitty-style encoding).
-/// Layout: type in low 8 bits, RGB value in upper 24 bits.
-/// - Type 0: Default (use color table entries 256/257 for fg/bg)
-/// - Type 1: Indexed (index in bits 8-15, look up in color table)
-/// - Type 2: RGB (R in bits 8-15, G in bits 16-23, B in bits 24-31)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct PackedColor(pub u32);
-
-impl PackedColor {
-    /// Color type: default (resolved from color table)
-    pub const TYPE_DEFAULT: u8 = 0;
-    /// Color type: indexed (look up in 256-color palette)
-    pub const TYPE_INDEXED: u8 = 1;
-    /// Color type: direct RGB
-    pub const TYPE_RGB: u8 = 2;
-
-    /// Create a default color (resolved at render time from palette).
-    #[inline]
-    pub const fn default_color() -> Self {
-        Self(Self::TYPE_DEFAULT as u32)
-    }
-
-    /// Create an indexed color (0-255 palette index).
-    #[inline]
-    pub const fn indexed(index: u8) -> Self {
-        Self(Self::TYPE_INDEXED as u32 | ((index as u32) << 8))
-    }
-
-    /// Create a direct RGB color.
-    #[inline]
-    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Self(Self::TYPE_RGB as u32 | ((r as u32) << 8) | ((g as u32) << 16) | ((b as u32) << 24))
-    }
-
-    /// Get the color type.
-    #[inline]
-    pub const fn color_type(self) -> u8 {
-        (self.0 & 0xFF) as u8
-    }
-
-    /// Get the index for indexed colors.
-    #[inline]
-    pub const fn index(self) -> u8 {
-        ((self.0 >> 8) & 0xFF) as u8
-    }
-
-    /// Get RGB components for RGB colors.
-    #[inline]
-    pub const fn rgb_components(self) -> (u8, u8, u8) {
-        (
-            ((self.0 >> 8) & 0xFF) as u8,
-            ((self.0 >> 16) & 0xFF) as u8,
-            ((self.0 >> 24) & 0xFF) as u8,
-        )
-    }
-}
-
-impl From<Color> for PackedColor {
-    fn from(color: Color) -> Self {
-        match color {
-            Color::Default => Self::default_color(),
-            Color::Indexed(idx) => Self::indexed(idx),
-            Color::Rgb(r, g, b) => Self::rgb(r, g, b),
-        }
-    }
-}
-
-impl From<&Color> for PackedColor {
-    fn from(color: &Color) -> Self {
-        (*color).into()
-    }
-}
-
-/// Packed cell attributes for GPU transfer (Kitty-style).
-/// Layout (32-bit bitfield):
-/// - bits 0-2: decoration (underline style, 0=none, 1=single, 2=double, 3=curly, etc.)
-/// - bit 3: bold
-/// - bit 4: italic
-/// - bit 5: reverse
-/// - bit 6: strike
-/// - bit 7: dim
-/// - bits 8-31: reserved for future use
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct CellAttrs(pub u32);
-
-impl CellAttrs {
-    pub const DECORATION_MASK: u32 = 0b111;
-    pub const BOLD_BIT: u32 = 1 << 3;
-    pub const ITALIC_BIT: u32 = 1 << 4;
-    pub const REVERSE_BIT: u32 = 1 << 5;
-    pub const STRIKE_BIT: u32 = 1 << 6;
-    pub const DIM_BIT: u32 = 1 << 7;
-
-    /// Decoration values
-    pub const DECO_NONE: u32 = 0;
-    pub const DECO_SINGLE: u32 = 1;
-    pub const DECO_DOUBLE: u32 = 2;
-    pub const DECO_CURLY: u32 = 3;
-    pub const DECO_DOTTED: u32 = 4;
-    pub const DECO_DASHED: u32 = 5;
-
-    #[inline]
-    pub const fn new() -> Self {
-        Self(0)
-    }
-
-    #[inline]
-    pub const fn with_underline(self, style: u32) -> Self {
-        Self((self.0 & !Self::DECORATION_MASK) | (style & Self::DECORATION_MASK))
-    }
-
-    #[inline]
-    pub const fn with_bold(self, bold: bool) -> Self {
-        if bold {
-            Self(self.0 | Self::BOLD_BIT)
-        } else {
-            Self(self.0 & !Self::BOLD_BIT)
-        }
-    }
-
-    #[inline]
-    pub const fn with_italic(self, italic: bool) -> Self {
-        if italic {
-            Self(self.0 | Self::ITALIC_BIT)
-        } else {
-            Self(self.0 & !Self::ITALIC_BIT)
-        }
-    }
-
-    #[inline]
-    pub const fn with_reverse(self, reverse: bool) -> Self {
-        if reverse {
-            Self(self.0 | Self::REVERSE_BIT)
-        } else {
-            Self(self.0 & !Self::REVERSE_BIT)
-        }
-    }
-
-    #[inline]
-    pub const fn with_strike(self, strike: bool) -> Self {
-        if strike {
-            Self(self.0 | Self::STRIKE_BIT)
-        } else {
-            Self(self.0 & !Self::STRIKE_BIT)
-        }
-    }
-
-    #[inline]
-    pub const fn with_dim(self, dim: bool) -> Self {
-        if dim {
-            Self(self.0 | Self::DIM_BIT)
-        } else {
-            Self(self.0 & !Self::DIM_BIT)
-        }
-    }
-
-    #[inline]
-    pub const fn decoration(self) -> u32 {
-        self.0 & Self::DECORATION_MASK
-    }
-
-    #[inline]
-    pub const fn is_bold(self) -> bool {
-        (self.0 & Self::BOLD_BIT) != 0
-    }
-
-    #[inline]
-    pub const fn is_italic(self) -> bool {
-        (self.0 & Self::ITALIC_BIT) != 0
-    }
-
-    #[inline]
-    pub const fn is_reverse(self) -> bool {
-        (self.0 & Self::REVERSE_BIT) != 0
-    }
-
-    #[inline]
-    pub const fn is_strike(self) -> bool {
-        (self.0 & Self::STRIKE_BIT) != 0
-    }
-
-    #[inline]
-    pub const fn is_dim(self) -> bool {
-        (self.0 & Self::DIM_BIT) != 0
-    }
-}
-
-/// GPU cell data for instanced rendering (Kitty-style).
-/// 
-/// This struct is uploaded directly to the GPU for each cell.
-/// The shader uses instanced rendering where each cell is one instance.
-/// 
-/// Layout: 20 bytes total
-/// - fg: 4 bytes (packed color)
-/// - bg: 4 bytes (packed color)  
-/// - decoration_fg: 4 bytes (packed color for underline/strikethrough)
-/// - sprite_idx: 4 bytes (glyph atlas index, bit 31 = colored glyph flag)
-/// - attrs: 4 bytes (packed attributes)
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GPUCell {
-    /// Foreground color (packed)
-    pub fg: u32,
-    /// Background color (packed)
-    pub bg: u32,
-    /// Decoration color for underline/strikethrough (packed)
-    pub decoration_fg: u32,
-    /// Sprite index in glyph atlas (bit 31 = colored glyph flag)
-    pub sprite_idx: u32,
-    /// Packed attributes (bold, italic, underline style, etc.)
-    pub attrs: u32,
-}
-
-impl GPUCell {
-    /// Flag indicating this glyph is colored (e.g., emoji) and should not be tinted
-    pub const COLORED_GLYPH_FLAG: u32 = 1 << 31;
-    /// Sprite index indicating no glyph (space/empty)
-    pub const NO_GLYPH: u32 = 0;
-
-    /// Create an empty cell (space with default colors)
-    #[inline]
-    pub const fn empty() -> Self {
-        Self {
-            fg: PackedColor::TYPE_DEFAULT as u32,
-            bg: PackedColor::TYPE_DEFAULT as u32,
-            decoration_fg: PackedColor::TYPE_DEFAULT as u32,
-            sprite_idx: Self::NO_GLYPH,
-            attrs: 0,
-        }
-    }
-
-    /// Create a GPUCell from terminal Cell and a sprite index
-    #[inline]
-    pub fn from_cell(cell: &Cell, sprite_idx: u32) -> Self {
-        let fg = PackedColor::from(&cell.fg_color);
-        let bg = PackedColor::from(&cell.bg_color);
-        
-        let mut attrs = CellAttrs::new();
-        if cell.bold {
-            attrs = attrs.with_bold(true);
-        }
-        if cell.italic {
-            attrs = attrs.with_italic(true);
-        }
-        if cell.underline {
-            attrs = attrs.with_underline(CellAttrs::DECO_SINGLE);
-        }
-
-        Self {
-            fg: fg.0,
-            bg: bg.0,
-            decoration_fg: fg.0, // Use fg color for decoration by default
-            sprite_idx,
-            attrs: attrs.0,
-        }
-    }
-
-    /// Set the sprite index
-    #[inline]
-    pub fn with_sprite(mut self, idx: u32) -> Self {
-        self.sprite_idx = idx;
-        self
-    }
-
-    /// Mark this glyph as colored (emoji)
-    #[inline]
-    pub fn with_colored_glyph(mut self) -> Self {
-        self.sprite_idx |= Self::COLORED_GLYPH_FLAG;
-        self
-    }
-
-    /// Get the sprite index (without the colored flag)
-    #[inline]
-    pub const fn get_sprite_idx(self) -> u32 {
-        self.sprite_idx & !Self::COLORED_GLYPH_FLAG
-    }
-
-    /// Check if this is a colored glyph
-    #[inline]
-    pub const fn is_colored_glyph(self) -> bool {
-        (self.sprite_idx & Self::COLORED_GLYPH_FLAG) != 0
-    }
-}
-
 impl ColorPalette {
     /// Parse a color specification like "#RRGGBB" or "rgb:RR/GG/BB".
     pub fn parse_color_spec(spec: &str) -> Option<[u8; 3]> {
@@ -886,7 +600,10 @@ impl Terminal {
     #[inline]
     fn clear_grid_row(&mut self, grid_row: usize) {
         let blank = self.blank_cell();
-        self.grid[grid_row].fill(blank);
+        let row = &mut self.grid[grid_row];
+        // Ensure row has correct width (may differ after swap with scrollback post-resize)
+        row.resize(self.cols, blank.clone());
+        row.fill(blank);
     }
 
     /// Create a blank cell with the current background color (BCE - Background Color Erase).
@@ -930,13 +647,18 @@ impl Terminal {
             return;
         }
 
+        let old_cols = self.cols;
+        let old_rows = self.rows;
+
         // Create new grid
         let mut new_grid = vec![vec![Cell::default(); cols]; rows];
 
         // Copy existing content using line_map for correct visual ordering
         for visual_row in 0..rows.min(self.rows) {
             let old_grid_row = self.line_map[visual_row];
-            for col in 0..cols.min(self.cols) {
+            // Use actual row length - may differ from self.cols after scrollback swap
+            let old_row_len = self.grid[old_grid_row].len();
+            for col in 0..cols.min(old_row_len) {
                 new_grid[visual_row][col] = self.grid[old_grid_row][col].clone();
             }
         }
@@ -954,6 +676,28 @@ impl Terminal {
         // Adjust cursor position
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+
+        // Also resize the saved alternate screen if it exists
+        if let Some(ref mut saved) = self.alternate_screen {
+            let mut new_saved_grid = vec![vec![Cell::default(); cols]; rows];
+            for visual_row in 0..rows.min(old_rows) {
+                let old_grid_row = saved.line_map.get(visual_row).copied().unwrap_or(visual_row);
+                if old_grid_row < saved.grid.len() {
+                    for col in 0..cols.min(old_cols) {
+                        if col < saved.grid[old_grid_row].len() {
+                            new_saved_grid[visual_row][col] = saved.grid[old_grid_row][col].clone();
+                        }
+                    }
+                }
+            }
+            saved.grid = new_saved_grid;
+            saved.line_map = (0..rows).collect();
+            saved.cursor_col = saved.cursor_col.min(cols.saturating_sub(1));
+            saved.cursor_row = saved.cursor_row.min(rows.saturating_sub(1));
+            saved.scroll_top = 0;
+            saved.scroll_bottom = rows.saturating_sub(1);
+        }
+
         self.dirty = true;
         self.mark_all_lines_dirty();
     }
@@ -1004,11 +748,12 @@ impl Terminal {
         if let Some(saved) = self.alternate_screen.take() {
             self.grid = saved.grid;
             self.line_map = saved.line_map;
-            self.cursor_col = saved.cursor_col;
-            self.cursor_row = saved.cursor_row;
             self.saved_cursor = saved.saved_cursor;
             self.scroll_top = saved.scroll_top;
             self.scroll_bottom = saved.scroll_bottom;
+            // Clamp cursor positions to current grid dimensions (defensive)
+            self.cursor_col = saved.cursor_col.min(self.cols.saturating_sub(1));
+            self.cursor_row = saved.cursor_row.min(self.rows.saturating_sub(1));
         }
 
         self.using_alternate_screen = false;
@@ -1486,6 +1231,10 @@ impl Handler for Terminal {
                     }
                     
                     // Write character directly using cached grid_row
+                    // Safety: ensure grid row has correct width (may differ after scrollback swap)
+                    if self.grid[grid_row].len() != self.cols {
+                        self.grid[grid_row].resize(self.cols, Cell::default());
+                    }
                     self.grid[grid_row][self.cursor_col] = Cell {
                         character: c,
                         fg_color: self.current_fg,

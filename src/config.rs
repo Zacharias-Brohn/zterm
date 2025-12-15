@@ -362,6 +362,11 @@ pub struct Config {
     pub background_opacity: f32,
     /// Number of lines to keep in scrollback buffer.
     pub scrollback_lines: usize,
+    /// Duration in milliseconds for the inactive pane fade animation.
+    /// Set to 0 for instant transitions.
+    pub inactive_pane_fade_ms: u64,
+    /// Dim factor for inactive panes (0.0 = fully dimmed/black, 1.0 = no dimming).
+    pub inactive_pane_dim: f32,
     /// Keybindings.
     pub keybindings: Keybindings,
 }
@@ -373,6 +378,8 @@ impl Default for Config {
             tab_bar_position: TabBarPosition::Top,
             background_opacity: 1.0,
             scrollback_lines: 50_000,
+            inactive_pane_fade_ms: 150,
+            inactive_pane_dim: 0.6,
             keybindings: Keybindings::default(),
         }
     }
