@@ -188,6 +188,31 @@ impl Pty {
         // If it returns -1, there was an error (child might have already been reaped)
         result != 0
     }
+    
+    /// Get the foreground process group ID of this PTY.
+    /// Returns None if the query fails.
+    pub fn foreground_pgid(&self) -> Option<i32> {
+        let fd = self.master.as_raw_fd();
+        let pgid = unsafe { libc::tcgetpgrp(fd) };
+        if pgid > 0 {
+            Some(pgid)
+        } else {
+            None
+        }
+    }
+    
+    /// Get the name of the foreground process running in this PTY.
+    /// Returns the process name (e.g., "nvim", "zsh") or None if unavailable.
+    pub fn foreground_process_name(&self) -> Option<String> {
+        let pgid = self.foreground_pgid()?;
+        
+        // Read the command line from /proc/<pid>/comm
+        // (comm gives just the process name, cmdline gives full command)
+        let comm_path = format!("/proc/{}/comm", pgid);
+        std::fs::read_to_string(&comm_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+    }
 }
 
 impl AsRawFd for Pty {

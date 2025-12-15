@@ -3,6 +3,24 @@
 use crate::keyboard::{query_response, KeyboardState};
 use crate::vt_parser::{CsiParams, Handler, Parser};
 
+/// Commands that the terminal can send to the application.
+/// These are triggered by special escape sequences from programs like Neovim.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TerminalCommand {
+    /// Navigate to a neighboring pane in the given direction.
+    /// Triggered by OSC 51;navigate;<direction> ST
+    NavigatePane(Direction),
+}
+
+/// Direction for pane navigation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
 /// A single cell in the terminal grid.
 #[derive(Clone, Copy, Debug)]
 pub struct Cell {
@@ -467,6 +485,9 @@ pub struct Terminal {
     parser: Option<Parser>,
     /// Performance timing stats (for debugging).
     pub stats: ProcessingStats,
+    /// Command queue for terminal-to-application communication.
+    /// Commands are added by OSC handlers and consumed by the application.
+    command_queue: Vec<TerminalCommand>,
 }
 
 impl Terminal {
@@ -523,6 +544,7 @@ impl Terminal {
             line_pool,
             parser: Some(Parser::new()),
             stats: ProcessingStats::default(),
+            command_queue: Vec::new(),
         }
     }
     
@@ -568,6 +590,13 @@ impl Terminal {
     #[inline]
     pub fn clear_dirty_lines(&mut self) {
         self.dirty_lines = [0u64; 4];
+    }
+    
+    /// Take all pending commands from the queue.
+    /// Returns an empty Vec if no commands are pending.
+    #[inline]
+    pub fn take_commands(&mut self) -> Vec<TerminalCommand> {
+        std::mem::take(&mut self.command_queue)
     }
     
     /// Get the dirty lines bitmap (for passing to shm).
@@ -1332,6 +1361,38 @@ impl Handler for Terminal {
                         if let Some(rgb) = ColorPalette::parse_color_spec(color_spec) {
                             self.palette.default_bg = rgb;
                             log::debug!("OSC 11: Set default background to {:?}", rgb);
+                        }
+                    }
+                }
+            }
+            // OSC 51 - ZTerm custom commands
+            // Format: OSC 51;command;args ST
+            // Currently supported:
+            //   OSC 51;navigate;up/down/left/right ST - Navigate to neighboring pane
+            51 => {
+                if parts.len() >= 2 {
+                    if let Ok(command) = std::str::from_utf8(parts[1]) {
+                        match command {
+                            "navigate" => {
+                                if parts.len() >= 3 {
+                                    if let Ok(direction_str) = std::str::from_utf8(parts[2]) {
+                                        let direction = match direction_str {
+                                            "up" => Some(Direction::Up),
+                                            "down" => Some(Direction::Down),
+                                            "left" => Some(Direction::Left),
+                                            "right" => Some(Direction::Right),
+                                            _ => None,
+                                        };
+                                        if let Some(dir) = direction {
+                                            log::debug!("OSC 51: Navigate {:?}", dir);
+                                            self.command_queue.push(TerminalCommand::NavigatePane(dir));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                log::debug!("OSC 51: Unknown command '{}'", command);
+                            }
                         }
                     }
                 }

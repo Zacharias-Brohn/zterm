@@ -2,7 +2,7 @@
 //! Uses rustybuzz (HarfBuzz port) for text shaping to support font features.
 
 use crate::config::TabBarPosition;
-use crate::terminal::{Color, ColorPalette, CursorShape, Terminal};
+use crate::terminal::{Color, ColorPalette, CursorShape, Direction, Terminal};
 use fontdue::Font as FontdueFont;
 use rustybuzz::UnicodeBuffer;
 use ttf_parser::Tag;
@@ -35,6 +35,43 @@ pub struct PaneRenderInfo {
     /// Dim factor for this pane (0.0 = fully dimmed, 1.0 = fully bright).
     /// Used for smooth fade animations when switching pane focus.
     pub dim_factor: f32,
+}
+
+/// Edge glow animation state for visual feedback when navigation fails.
+/// Creates an organic glow effect: a single light node appears at center,
+/// then splits into two that travel outward to the corners while fading.
+/// Animation logic is handled in the shader (shader.wgsl).
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeGlow {
+    /// Which edge to glow (based on the direction the user tried to navigate).
+    pub direction: Direction,
+    /// When the animation started.
+    pub start_time: std::time::Instant,
+}
+
+impl EdgeGlow {
+    /// Duration of the glow animation in milliseconds.
+    pub const DURATION_MS: u64 = 500;
+    
+    /// Create a new edge glow animation.
+    pub fn new(direction: Direction) -> Self {
+        Self {
+            direction,
+            start_time: std::time::Instant::now(),
+        }
+    }
+    
+    /// Get the current animation progress (0.0 to 1.0).
+    pub fn progress(&self) -> f32 {
+        let elapsed = self.start_time.elapsed().as_millis() as f32;
+        let duration = Self::DURATION_MS as f32;
+        (elapsed / duration).min(1.0)
+    }
+    
+    /// Check if the animation has completed.
+    pub fn is_finished(&self) -> bool {
+        self.progress() >= 1.0
+    }
 }
 
 /// Size of the glyph atlas texture.
@@ -96,6 +133,25 @@ impl GlyphVertex {
     }
 }
 
+/// GPU-compatible edge glow uniform data.
+/// Must match the layout in shader.wgsl exactly.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct EdgeGlowUniforms {
+    screen_width: f32,
+    screen_height: f32,
+    terminal_y_offset: f32,
+    direction: u32,
+    progress: f32,
+    color_r: f32,
+    color_g: f32,
+    color_b: f32,
+    enabled: u32,
+    _padding1: u32,
+    _padding2: u32,
+    _padding3: u32,
+}
+
 /// The terminal renderer.
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -106,6 +162,11 @@ pub struct Renderer {
     // Glyph rendering pipeline
     glyph_pipeline: wgpu::RenderPipeline,
     glyph_bind_group: wgpu::BindGroup,
+    
+    // Edge glow rendering pipeline
+    edge_glow_pipeline: wgpu::RenderPipeline,
+    edge_glow_bind_group: wgpu::BindGroup,
+    edge_glow_uniform_buffer: wgpu::Buffer,
 
     // Atlas texture
     atlas_texture: wgpu::Texture,
@@ -873,6 +934,96 @@ impl Renderer {
             cache: None,
         });
 
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // EDGE GLOW PIPELINE SETUP
+        // ═══════════════════════════════════════════════════════════════════════════════
+        
+        // Create edge glow shader
+        let edge_glow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Edge Glow Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        });
+        
+        // Create uniform buffer for edge glow parameters
+        let edge_glow_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Edge Glow Uniform Buffer"),
+            size: std::mem::size_of::<EdgeGlowUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Create bind group layout for edge glow
+        let edge_glow_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Edge Glow Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        
+        // Create bind group for edge glow
+        let edge_glow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Edge Glow Bind Group"),
+            layout: &edge_glow_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: edge_glow_uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        
+        // Create pipeline layout for edge glow
+        let edge_glow_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Edge Glow Pipeline Layout"),
+            bind_group_layouts: &[&edge_glow_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        
+        // Create edge glow render pipeline
+        let edge_glow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Edge Glow Pipeline"),
+            layout: Some(&edge_glow_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &edge_glow_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[], // Fullscreen triangle, no vertex buffer needed
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &edge_glow_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_config.format,
+                    // Premultiplied alpha blending for proper glow compositing
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         // Create initial buffers with some capacity
         let initial_vertex_capacity = 4096;
         let initial_index_capacity = 6144;
@@ -898,6 +1049,9 @@ impl Renderer {
             surface_config,
             glyph_pipeline,
             glyph_bind_group,
+            edge_glow_pipeline,
+            edge_glow_bind_group,
+            edge_glow_uniform_buffer,
             atlas_texture,
             atlas_data: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE) as usize],
             atlas_dirty: false,
@@ -3271,17 +3425,51 @@ impl Renderer {
         ]);
     }
     
+    /// Prepare edge glow uniform data for shader-based rendering.
+    /// Returns the uniform data to be uploaded to the GPU.
+    fn prepare_edge_glow_uniforms(&self, glow: &EdgeGlow, terminal_y_offset: f32) -> EdgeGlowUniforms {
+        // Use the same color as the active pane border (palette color 4 - typically blue)
+        let [r, g, b] = self.palette.colors[4];
+        let color_r = Self::srgb_to_linear(r as f32 / 255.0);
+        let color_g = Self::srgb_to_linear(g as f32 / 255.0);
+        let color_b = Self::srgb_to_linear(b as f32 / 255.0);
+        
+        let direction = match glow.direction {
+            Direction::Up => 0,
+            Direction::Down => 1,
+            Direction::Left => 2,
+            Direction::Right => 3,
+        };
+        
+        EdgeGlowUniforms {
+            screen_width: self.width as f32,
+            screen_height: self.height as f32,
+            terminal_y_offset,
+            direction,
+            progress: glow.progress(),
+            color_r,
+            color_g,
+            color_b,
+            enabled: 1,
+            _padding1: 0,
+            _padding2: 0,
+            _padding3: 0,
+        }
+    }
+    
     /// Render multiple panes with borders.
     /// 
     /// Arguments:
     /// - `panes`: List of (terminal, pane_info, selection) tuples
     /// - `num_tabs`: Number of tabs for the tab bar
     /// - `active_tab`: Index of the active tab
+    /// - `edge_glow`: Optional edge glow animation for visual feedback
     pub fn render_panes(
         &mut self,
         panes: &[(&Terminal, PaneRenderInfo, Option<(usize, usize, usize, usize)>)],
         num_tabs: usize,
         active_tab: usize,
+        edge_glow: Option<&EdgeGlow>,
     ) -> Result<(), wgpu::SurfaceError> {
         // Sync palette from first terminal
         if let Some((terminal, _, _)) = panes.first() {
@@ -3561,6 +3749,15 @@ impl Renderer {
         }
         
         // ═══════════════════════════════════════════════════════════════════
+        // PREPARE EDGE GLOW UNIFORMS (if navigation failed)
+        // ═══════════════════════════════════════════════════════════════════
+        let edge_glow_uniforms = if let Some(glow) = edge_glow {
+            Some(self.prepare_edge_glow_uniforms(glow, terminal_y_offset))
+        } else {
+            None
+        };
+        
+        // ═══════════════════════════════════════════════════════════════════
         // SUBMIT TO GPU
         // ═══════════════════════════════════════════════════════════════════
         let bg_vertex_count = self.bg_vertices.len();
@@ -3696,6 +3893,38 @@ impl Renderer {
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..total_index_count as u32, 0, 0..1);
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // EDGE GLOW PASS (shader-based, after main rendering)
+        // ═══════════════════════════════════════════════════════════════════
+        if let Some(uniforms) = edge_glow_uniforms {
+            // Upload uniforms
+            self.queue.write_buffer(
+                &self.edge_glow_uniform_buffer,
+                0,
+                bytemuck::cast_slice(&[uniforms]),
+            );
+            
+            // Second render pass for edge glow (load existing content)
+            let mut glow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Edge Glow Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load, // Preserve existing content
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            
+            glow_pass.set_pipeline(&self.edge_glow_pipeline);
+            glow_pass.set_bind_group(0, &self.edge_glow_bind_group, &[]);
+            glow_pass.draw(0..3, 0..1); // Fullscreen triangle
         }
         
         self.queue.submit(std::iter::once(encoder.finish()));

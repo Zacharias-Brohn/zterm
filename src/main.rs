@@ -6,8 +6,8 @@
 use zterm::config::{Action, Config};
 use zterm::keyboard::{FunctionalKey, KeyEncoder, KeyEventType, KeyboardState, Modifiers};
 use zterm::pty::Pty;
-use zterm::renderer::{PaneRenderInfo, Renderer};
-use zterm::terminal::{Terminal, MouseTrackingMode};
+use zterm::renderer::{EdgeGlow, PaneRenderInfo, Renderer};
+use zterm::terminal::{Direction, Terminal, TerminalCommand, MouseTrackingMode};
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -197,6 +197,19 @@ impl Pane {
     /// Check if the shell has exited.
     fn child_exited(&self) -> bool {
         self.pty.child_exited()
+    }
+    
+    /// Check if the foreground process matches any of the given program names.
+    /// Used for pass-through keybindings (e.g., passing Alt+Arrow to Neovim).
+    fn foreground_matches(&self, programs: &[String]) -> bool {
+        if programs.is_empty() {
+            return false;
+        }
+        if let Some(fg_name) = self.pty.foreground_process_name() {
+            programs.iter().any(|p| p == &fg_name)
+        } else {
+            false
+        }
     }
     
     /// Calculate the current dim factor based on animation progress.
@@ -508,15 +521,6 @@ impl SplitNode {
     }
 }
 
-/// Direction for pane navigation.
-#[derive(Debug, Clone, Copy)]
-enum Direction {
-    Up,
-    Down,
-    Left,
-    Right,
-}
-
 /// Unique identifier for a tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TabId(u64);
@@ -812,6 +816,8 @@ struct App {
     last_frame_log: std::time::Instant,
     /// Whether window should be created on next opportunity.
     should_create_window: bool,
+    /// Edge glow animation state (for when navigation fails).
+    edge_glow: Option<EdgeGlow>,
 }
 
 const PTY_KEY: usize = 1;
@@ -842,6 +848,7 @@ impl App {
             frame_count: 0,
             last_frame_log: std::time::Instant::now(),
             should_create_window: false,
+            edge_glow: None,
         }
     }
     
@@ -1045,7 +1052,10 @@ impl App {
     /// Process PTY data for a specific pane.
     /// Returns true if any data was processed.
     fn poll_pane(&mut self, pane_id: PaneId) -> bool {
-        // Find the pane across all tabs
+        // Find the pane across all tabs and process data
+        let mut processed = false;
+        let mut commands = Vec::new();
+        
         for tab in &mut self.tabs {
             if let Some(pane) = tab.get_pane_mut(pane_id) {
                 // Take all pending data atomically
@@ -1066,10 +1076,29 @@ impl App {
                         len);
                 }
                 
-                return true;
+                // Collect any commands from the terminal
+                commands = pane.terminal.take_commands();
+                processed = true;
+                break;
             }
         }
-        false
+        
+        // Handle commands outside the borrow
+        for cmd in commands {
+            self.handle_terminal_command(cmd);
+        }
+        
+        processed
+    }
+    
+    /// Handle a command from the terminal (triggered by OSC sequences).
+    fn handle_terminal_command(&mut self, cmd: TerminalCommand) {
+        match cmd {
+            TerminalCommand::NavigatePane(direction) => {
+                log::debug!("Terminal requested pane navigation: {:?}", direction);
+                self.focus_pane(direction);
+            }
+        }
     }
     
     /// Send bytes to the active tab's PTY.
@@ -1259,16 +1288,16 @@ impl App {
                 self.split_pane(false);
             }
             Action::FocusPaneUp => {
-                self.focus_pane(Direction::Up);
+                self.focus_pane_or_pass_key(Direction::Up, b'A');
             }
             Action::FocusPaneDown => {
-                self.focus_pane(Direction::Down);
+                self.focus_pane_or_pass_key(Direction::Down, b'B');
             }
             Action::FocusPaneLeft => {
-                self.focus_pane(Direction::Left);
+                self.focus_pane_or_pass_key(Direction::Left, b'D');
             }
             Action::FocusPaneRight => {
-                self.focus_pane(Direction::Right);
+                self.focus_pane_or_pass_key(Direction::Right, b'C');
             }
         }
     }
@@ -1314,12 +1343,46 @@ impl App {
         }
     }
     
-    fn focus_pane(&mut self, direction: Direction) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.focus_neighbor(direction);
-            if let Some(window) = &self.window {
-                window.request_redraw();
+    /// Focus neighbor pane or pass keys through to applications like Neovim.
+    /// If the foreground process matches `pass_keys_to_programs`, send the Alt+Arrow
+    /// escape sequence to the PTY. Otherwise, focus the neighboring pane.
+    fn focus_pane_or_pass_key(&mut self, direction: Direction, arrow_letter: u8) {
+        // Check if we should pass keys to the foreground process
+        let should_pass = if let Some(tab) = self.tabs.get(self.active_tab) {
+            if let Some(pane) = tab.active_pane() {
+                pane.foreground_matches(&self.config.pass_keys_to_programs)
+            } else {
+                false
             }
+        } else {
+            false
+        };
+        
+        if should_pass {
+            // Send Alt+Arrow escape sequence: \x1b[1;3X where X is A/B/C/D
+            let escape_seq = [0x1b, b'[', b'1', b';', b'3', arrow_letter];
+            self.write_to_pty(&escape_seq);
+        } else {
+            self.focus_pane(direction);
+        }
+    }
+    
+    fn focus_pane(&mut self, direction: Direction) {
+        let navigated = if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            let old_pane = tab.active_pane;
+            tab.focus_neighbor(direction);
+            tab.active_pane != old_pane
+        } else {
+            false
+        };
+        
+        if !navigated {
+            // No neighbor in that direction - trigger edge glow animation
+            self.edge_glow = Some(EdgeGlow::new(direction));
+        }
+        
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
     
@@ -1851,7 +1914,11 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         
-                        match renderer.render_panes(&pane_render_data, num_tabs, active_tab_idx) {
+                        // Handle edge glow animation
+                        let edge_glow_ref = self.edge_glow.as_ref();
+                        let glow_in_progress = edge_glow_ref.map(|g| !g.is_finished()).unwrap_or(false);
+                        
+                        match renderer.render_panes(&pane_render_data, num_tabs, active_tab_idx, edge_glow_ref) {
                             Ok(_) => {}
                             Err(wgpu::SurfaceError::Lost) => {
                                 renderer.resize(renderer.width, renderer.height);
@@ -1864,8 +1931,21 @@ impl ApplicationHandler<UserEvent> for App {
                                 log::error!("Render error: {:?}", e);
                             }
                         }
+                        
+                        // Request redraw if edge glow is animating
+                        if glow_in_progress {
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
                     }
                 }
+                
+                // Clean up finished edge glow animation
+                if self.edge_glow.as_ref().map(|g| g.is_finished()).unwrap_or(false) {
+                    self.edge_glow = None;
+                }
+                
                 let render_time = render_start.elapsed();
                 let frame_time = frame_start.elapsed();
                 
