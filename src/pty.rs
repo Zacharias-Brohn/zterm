@@ -213,6 +213,18 @@ impl Pty {
             .ok()
             .map(|s| s.trim().to_string())
     }
+    
+    /// Get the current working directory of the foreground process.
+    /// Returns the path or None if unavailable.
+    pub fn foreground_cwd(&self) -> Option<String> {
+        let pgid = self.foreground_pgid()?;
+        
+        // Read the cwd symlink from /proc/<pid>/cwd
+        let cwd_path = format!("/proc/{}/cwd", pgid);
+        std::fs::read_link(&cwd_path)
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+    }
 }
 
 impl AsRawFd for Pty {

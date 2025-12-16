@@ -39,6 +39,126 @@ pub struct PaneRenderInfo {
     pub dim_factor: f32,
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATUSLINE COMPONENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Color specification for statusline components.
+/// Uses the terminal's indexed color palette (0-255), RGB, or default fg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatuslineColor {
+    /// Use the default foreground color.
+    Default,
+    /// Use an indexed color from the 256-color palette (0-15 for ANSI colors).
+    Indexed(u8),
+    /// Use an RGB color.
+    Rgb(u8, u8, u8),
+}
+
+impl Default for StatuslineColor {
+    fn default() -> Self {
+        StatuslineColor::Default
+    }
+}
+
+/// A single component/segment of the statusline.
+/// Components are rendered left-to-right with optional separators.
+#[derive(Debug, Clone)]
+pub struct StatuslineComponent {
+    /// The text content of this component.
+    pub text: String,
+    /// Foreground color for this component.
+    pub fg: StatuslineColor,
+    /// Whether this text should be bold.
+    pub bold: bool,
+}
+
+impl StatuslineComponent {
+    /// Create a new statusline component with default styling.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            fg: StatuslineColor::Default,
+            bold: false,
+        }
+    }
+    
+    /// Set the foreground color using an indexed palette color.
+    pub fn fg(mut self, color_index: u8) -> Self {
+        self.fg = StatuslineColor::Indexed(color_index);
+        self
+    }
+    
+    /// Set the foreground color using RGB values.
+    pub fn rgb_fg(mut self, r: u8, g: u8, b: u8) -> Self {
+        self.fg = StatuslineColor::Rgb(r, g, b);
+        self
+    }
+    
+    /// Set bold styling.
+    pub fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+    
+    /// Create a separator component (e.g., "/", " > ", etc.).
+    pub fn separator(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            fg: StatuslineColor::Indexed(8), // Dim gray by default
+            bold: false,
+        }
+    }
+}
+
+/// A section of the statusline with its own background color.
+/// Sections are rendered left-to-right and end with a powerline transition arrow.
+#[derive(Debug, Clone)]
+pub struct StatuslineSection {
+    /// The components within this section.
+    pub components: Vec<StatuslineComponent>,
+    /// Background color for this section.
+    pub bg: StatuslineColor,
+}
+
+impl StatuslineSection {
+    /// Create a new section with the given indexed background color.
+    pub fn new(bg_color: u8) -> Self {
+        Self {
+            components: Vec::new(),
+            bg: StatuslineColor::Indexed(bg_color),
+        }
+    }
+    
+    /// Create a new section with an RGB background color.
+    pub fn with_rgb_bg(r: u8, g: u8, b: u8) -> Self {
+        Self {
+            components: Vec::new(),
+            bg: StatuslineColor::Rgb(r, g, b),
+        }
+    }
+    
+    /// Create a new section with the default (transparent) background.
+    pub fn transparent() -> Self {
+        Self {
+            components: Vec::new(),
+            bg: StatuslineColor::Default,
+        }
+    }
+    
+    /// Add a component to this section.
+    pub fn push(mut self, component: StatuslineComponent) -> Self {
+        self.components.push(component);
+        self
+    }
+    
+    /// Add multiple components to this section.
+    pub fn with_components(mut self, components: Vec<StatuslineComponent>) -> Self {
+        self.components = components;
+        self
+    }
+}
+
 /// Edge glow animation state for visual feedback when navigation fails.
 /// Creates an organic glow effect: a single light node appears at center,
 /// then splits into two that travel outward to the corners while fading.
@@ -1528,10 +1648,27 @@ impl Renderer {
         }
     }
 
-    /// Returns the Y offset where the terminal content starts.
-    pub fn terminal_y_offset(&self) -> f32 {
+    /// Returns the height of the statusline in pixels (one cell height).
+    pub fn statusline_height(&self) -> f32 {
+        self.cell_height
+    }
+
+    /// Returns the Y position where the statusline starts.
+    /// The statusline is rendered below the tab bar (if top) or above it (if bottom).
+    pub fn statusline_y(&self) -> f32 {
         match self.tab_bar_position {
             TabBarPosition::Top => self.tab_bar_height(),
+            TabBarPosition::Bottom => self.height as f32 - self.tab_bar_height() - self.statusline_height(),
+            TabBarPosition::Hidden => 0.0,
+        }
+    }
+
+    /// Returns the Y offset where the terminal content starts.
+    /// Accounts for both the tab bar and the statusline.
+    pub fn terminal_y_offset(&self) -> f32 {
+        match self.tab_bar_position {
+            TabBarPosition::Top => self.tab_bar_height() + self.statusline_height(),
+            TabBarPosition::Hidden => self.statusline_height(),
             _ => 0.0,
         }
     }
@@ -1554,34 +1691,43 @@ impl Renderer {
         }
     }
 
-    /// Calculates terminal dimensions in cells, accounting for tab bar.
+    /// Calculates terminal dimensions in cells, accounting for tab bar and statusline.
     pub fn terminal_size(&self) -> (usize, usize) {
-        let available_height = self.height as f32 - self.tab_bar_height();
+        let available_height = self.height as f32 - self.tab_bar_height() - self.statusline_height();
         let cols = (self.width as f32 / self.cell_width).floor() as usize;
         let rows = (available_height / self.cell_height).floor() as usize;
         (cols.max(1), rows.max(1))
     }
 
     /// Converts a pixel position to a terminal cell position.
-    /// Returns None if the position is outside the terminal area (e.g., in the tab bar).
+    /// Returns None if the position is outside the terminal area (e.g., in the tab bar or statusline).
     pub fn pixel_to_cell(&self, x: f64, y: f64) -> Option<(usize, usize)> {
         let terminal_y_offset = self.terminal_y_offset();
         let tab_bar_height = self.tab_bar_height();
+        let statusline_height = self.statusline_height();
         let height = self.height as f32;
 
-        // Check if position is in the tab bar area (which could be at top or bottom)
+        // Check if position is in the tab bar or statusline area
         match self.tab_bar_position {
             TabBarPosition::Top => {
-                if (y as f32) < tab_bar_height {
+                // Tab bar at top, statusline below it
+                if (y as f32) < tab_bar_height + statusline_height {
                     return None;
                 }
             }
             TabBarPosition::Bottom => {
-                if (y as f32) >= height - tab_bar_height {
+                // Statusline above tab bar, both at bottom
+                let statusline_y = height - tab_bar_height - statusline_height;
+                if (y as f32) >= statusline_y {
                     return None;
                 }
             }
-            TabBarPosition::Hidden => {}
+            TabBarPosition::Hidden => {
+                // Just statusline at top
+                if (y as f32) < statusline_height {
+                    return None;
+                }
+            }
         }
 
         // Adjust y to be relative to terminal area
@@ -4455,6 +4601,7 @@ impl Renderer {
     /// - `active_tab`: Index of the active tab
     /// - `edge_glows`: Active edge glow animations for visual feedback
     /// - `edge_glow_intensity`: Intensity of edge glow effect (0.0 = disabled, 1.0 = full)
+    /// - `statusline_sections`: Sections to render in the statusline
     pub fn render_panes(
         &mut self,
         panes: &[(&Terminal, PaneRenderInfo, Option<(usize, usize, usize, usize)>)],
@@ -4462,6 +4609,7 @@ impl Renderer {
         active_tab: usize,
         edge_glows: &[EdgeGlow],
         edge_glow_intensity: f32,
+        statusline_sections: &[StatuslineSection],
     ) -> Result<(), wgpu::SurfaceError> {
         // Sync palette from first terminal
         if let Some((terminal, _, _)) = panes.first() {
@@ -4600,6 +4748,210 @@ impl Renderer {
                 }
 
                 tab_x += tab_width + tab_padding;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // RENDER STATUSLINE
+        // ═══════════════════════════════════════════════════════════════════
+        {
+            let statusline_y = self.statusline_y();
+            let statusline_height = self.statusline_height();
+            
+            // Statusline background (slightly different shade than tab bar)
+            let statusline_bg = {
+                let [r, g, b] = self.palette.default_bg;
+                let factor = 0.9_f32;
+                [
+                    Self::srgb_to_linear((r as f32 / 255.0) * factor),
+                    Self::srgb_to_linear((g as f32 / 255.0) * factor),
+                    Self::srgb_to_linear((b as f32 / 255.0) * factor),
+                    1.0,
+                ]
+            };
+            
+            // Draw statusline background
+            self.render_rect(0.0, statusline_y, width, statusline_height, statusline_bg);
+            
+            // Render statusline sections
+            let text_y = statusline_y + (statusline_height - self.cell_height) / 2.0;
+            let mut cursor_x = 0.0_f32;
+            
+            // Helper to convert StatuslineColor to linear RGBA
+            let color_to_rgba = |color: StatuslineColor, palette: &crate::terminal::ColorPalette| -> [f32; 4] {
+                match color {
+                    StatuslineColor::Default => {
+                        let [r, g, b] = palette.default_fg;
+                        [
+                            Self::srgb_to_linear(r as f32 / 255.0),
+                            Self::srgb_to_linear(g as f32 / 255.0),
+                            Self::srgb_to_linear(b as f32 / 255.0),
+                            1.0,
+                        ]
+                    }
+                    StatuslineColor::Indexed(idx) => {
+                        let [r, g, b] = palette.colors[idx as usize];
+                        [
+                            Self::srgb_to_linear(r as f32 / 255.0),
+                            Self::srgb_to_linear(g as f32 / 255.0),
+                            Self::srgb_to_linear(b as f32 / 255.0),
+                            1.0,
+                        ]
+                    }
+                    StatuslineColor::Rgb(r, g, b) => {
+                        [
+                            Self::srgb_to_linear(r as f32 / 255.0),
+                            Self::srgb_to_linear(g as f32 / 255.0),
+                            Self::srgb_to_linear(b as f32 / 255.0),
+                            1.0,
+                        ]
+                    }
+                }
+            };
+            
+            for (section_idx, section) in statusline_sections.iter().enumerate() {
+                let section_start_x = cursor_x;
+                
+                // Calculate section width by counting characters
+                let mut section_char_count = 0usize;
+                for component in &section.components {
+                    section_char_count += component.text.chars().count();
+                }
+                let section_width = section_char_count as f32 * self.cell_width;
+                
+                // Draw section background if it has a color (Indexed or Rgb)
+                let has_bg = matches!(section.bg, StatuslineColor::Indexed(_) | StatuslineColor::Rgb(_, _, _));
+                if has_bg {
+                    let section_bg_color = color_to_rgba(section.bg, &self.palette);
+                    self.render_rect(section_start_x, statusline_y, section_width, statusline_height, section_bg_color);
+                }
+                
+                // Render components within this section
+                for component in &section.components {
+                    let component_fg = color_to_rgba(component.fg, &self.palette);
+                    
+                    for c in component.text.chars() {
+                        if cursor_x + self.cell_width > width {
+                            break;
+                        }
+                        
+                        if c == ' ' {
+                            cursor_x += self.cell_width;
+                            continue;
+                        }
+                        
+                        let glyph = self.rasterize_char(c);
+                        if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
+                            let is_powerline_char = ('\u{E0B0}'..='\u{E0BF}').contains(&c);
+                            
+                            let glyph_x = (cursor_x + glyph.offset[0]).round();
+                            let glyph_y = if is_powerline_char {
+                                statusline_y
+                            } else {
+                                let baseline_y = (text_y + self.cell_height * 0.8).round();
+                                (baseline_y - glyph.offset[1] - glyph.size[1]).round()
+                            };
+
+                            let left = Self::pixel_to_ndc_x(glyph_x, width);
+                            let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
+                            let top = Self::pixel_to_ndc_y(glyph_y, height);
+                            let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
+
+                            let base_idx = self.glyph_vertices.len() as u32;
+                            self.glyph_vertices.push(GlyphVertex {
+                                position: [left, top],
+                                uv: [glyph.uv[0], glyph.uv[1]],
+                                color: component_fg,
+                                bg_color: [0.0, 0.0, 0.0, 0.0],
+                            });
+                            self.glyph_vertices.push(GlyphVertex {
+                                position: [right, top],
+                                uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
+                                color: component_fg,
+                                bg_color: [0.0, 0.0, 0.0, 0.0],
+                            });
+                            self.glyph_vertices.push(GlyphVertex {
+                                position: [right, bottom],
+                                uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
+                                color: component_fg,
+                                bg_color: [0.0, 0.0, 0.0, 0.0],
+                            });
+                            self.glyph_vertices.push(GlyphVertex {
+                                position: [left, bottom],
+                                uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
+                                color: component_fg,
+                                bg_color: [0.0, 0.0, 0.0, 0.0],
+                            });
+                            self.glyph_indices.extend_from_slice(&[
+                                base_idx, base_idx + 1, base_idx + 2,
+                                base_idx, base_idx + 2, base_idx + 3,
+                            ]);
+                        }
+                        
+                        cursor_x += self.cell_width;
+                    }
+                }
+                
+                // Draw powerline transition arrow at end of section (if section has a background)
+                if has_bg {
+                    // Determine the next section's background color (or statusline bg if last section)
+                    let next_bg = if section_idx + 1 < statusline_sections.len() {
+                        color_to_rgba(statusline_sections[section_idx + 1].bg, &self.palette)
+                    } else {
+                        statusline_bg
+                    };
+                    
+                    // The arrow's foreground is this section's background
+                    let arrow_fg = color_to_rgba(section.bg, &self.palette);
+                    
+                    // Render the powerline arrow (U+E0B0)
+                    let arrow_char = '\u{E0B0}';
+                    let glyph = self.rasterize_char(arrow_char);
+                    if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
+                        let glyph_x = (cursor_x + glyph.offset[0]).round();
+                        let glyph_y = statusline_y; // Powerline chars at top
+                        
+                        // Draw background rectangle for the arrow cell
+                        self.render_rect(cursor_x, statusline_y, self.cell_width, statusline_height, next_bg);
+
+                        let left = Self::pixel_to_ndc_x(glyph_x, width);
+                        let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
+                        let top = Self::pixel_to_ndc_y(glyph_y, height);
+                        let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
+
+                        let base_idx = self.glyph_vertices.len() as u32;
+                        self.glyph_vertices.push(GlyphVertex {
+                            position: [left, top],
+                            uv: [glyph.uv[0], glyph.uv[1]],
+                            color: arrow_fg,
+                            bg_color: [0.0, 0.0, 0.0, 0.0],
+                        });
+                        self.glyph_vertices.push(GlyphVertex {
+                            position: [right, top],
+                            uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
+                            color: arrow_fg,
+                            bg_color: [0.0, 0.0, 0.0, 0.0],
+                        });
+                        self.glyph_vertices.push(GlyphVertex {
+                            position: [right, bottom],
+                            uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
+                            color: arrow_fg,
+                            bg_color: [0.0, 0.0, 0.0, 0.0],
+                        });
+                        self.glyph_vertices.push(GlyphVertex {
+                            position: [left, bottom],
+                            uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
+                            color: arrow_fg,
+                            bg_color: [0.0, 0.0, 0.0, 0.0],
+                        });
+                        self.glyph_indices.extend_from_slice(&[
+                            base_idx, base_idx + 1, base_idx + 2,
+                            base_idx, base_idx + 2, base_idx + 3,
+                        ]);
+                    }
+                    
+                    cursor_x += self.cell_width;
+                }
             }
         }
 

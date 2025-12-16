@@ -6,7 +6,7 @@
 use zterm::config::{Action, Config};
 use zterm::keyboard::{FunctionalKey, KeyEncoder, KeyEventType, KeyboardState, Modifiers};
 use zterm::pty::Pty;
-use zterm::renderer::{EdgeGlow, PaneRenderInfo, Renderer};
+use zterm::renderer::{EdgeGlow, PaneRenderInfo, Renderer, StatuslineComponent, StatuslineSection};
 use zterm::terminal::{Direction, Terminal, TerminalCommand, MouseTrackingMode};
 
 use std::collections::HashMap;
@@ -753,6 +753,307 @@ fn write_pid_file() -> std::io::Result<()> {
 /// Remove the PID file on exit.
 fn remove_pid_file() {
     let _ = std::fs::remove_file(pid_file_path());
+}
+
+/// Build a statusline section for the current working directory.
+/// 
+/// Transforms the path into styled segments within a section:
+/// - Replaces $HOME prefix with "~"
+/// - Each directory segment gets " " prefix and its own color
+/// - Arrow separator "" between segments inherits previous segment's color
+/// - Colors cycle through palette indices 2-7 (skipping 0-1 which are often close to white)
+/// - Last segment is bold
+/// - Section has a dark gray background color (#282828)
+/// - Section ends with powerline arrow transition
+fn build_cwd_section(cwd: &str) -> StatuslineSection {
+    // Colors to cycle through (skip 0 and 1 which are often near-white in custom schemes)
+    const COLORS: [u8; 6] = [2, 3, 4, 5, 6, 7];
+    
+    let mut components = Vec::new();
+    
+    // Get home directory and replace prefix with ~
+    let display_path = if let Ok(home) = std::env::var("HOME") {
+        if cwd.starts_with(&home) {
+            format!("~{}", &cwd[home.len()..])
+        } else {
+            cwd.to_string()
+        }
+    } else {
+        cwd.to_string()
+    };
+    
+    // Split path into segments
+    let segments: Vec<&str> = display_path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    
+    if segments.is_empty() {
+        // Root directory
+        components.push(StatuslineComponent::new(" \u{F07C} / ").fg(COLORS[0]));
+        return StatuslineSection::with_rgb_bg(0x28, 0x28, 0x28).with_components(components);
+    }
+    
+    // Add leading space for padding
+    components.push(StatuslineComponent::new(" "));
+    
+    let last_idx = segments.len() - 1;
+    
+    for (i, segment) in segments.iter().enumerate() {
+        // Cycle through colors for each segment
+        let color = COLORS[i % COLORS.len()];
+        
+        if i > 0 {
+            // Add arrow separator with previous segment's color
+            // U+E0B1 is the powerline thin chevron right
+            let prev_color = COLORS[(i - 1) % COLORS.len()];
+            components.push(StatuslineComponent::new(" \u{E0B1} ").fg(prev_color));
+        }
+        
+        // Directory segment with folder icon prefix
+        // U+F07C is the folder-open icon from Nerd Fonts
+        let text = format!("\u{F07C} {}", segment);
+        let component = if i == last_idx {
+            // Last segment is bold
+            StatuslineComponent::new(text).fg(color).bold()
+        } else {
+            StatuslineComponent::new(text).fg(color)
+        };
+        
+        components.push(component);
+    }
+    
+    // Add trailing space for padding before the powerline arrow
+    components.push(StatuslineComponent::new(" "));
+    
+    // Use dark gray (#282828) as section background
+    StatuslineSection::with_rgb_bg(0x28, 0x28, 0x28).with_components(components)
+}
+
+/// Git repository status information.
+#[derive(Debug, Default)]
+struct GitStatus {
+    /// Current branch or HEAD reference.
+    head: String,
+    /// Number of commits ahead of upstream.
+    ahead: usize,
+    /// Number of commits behind upstream.
+    behind: usize,
+    /// Working directory changes (modified, deleted, untracked, etc.).
+    working_changed: usize,
+    /// Working directory status string (e.g., "~1 +2 -1").
+    working_string: String,
+    /// Staged changes count.
+    staging_changed: usize,
+    /// Staging status string.
+    staging_string: String,
+    /// Number of stashed changes.
+    stash_count: usize,
+}
+
+/// Get git status for a directory.
+/// Returns None if not in a git repository.
+fn get_git_status(cwd: &str) -> Option<GitStatus> {
+    use std::process::Command;
+    
+    // Check if we're in a git repo and get the branch name
+    let head_output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    
+    if !head_output.status.success() {
+        return None;
+    }
+    
+    let head = String::from_utf8_lossy(&head_output.stdout).trim().to_string();
+    
+    // Get ahead/behind status
+    let mut ahead = 0;
+    let mut behind = 0;
+    if let Ok(output) = Command::new("git")
+        .args(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
+        .current_dir(cwd)
+        .output()
+    {
+        if output.status.success() {
+            let counts = String::from_utf8_lossy(&output.stdout);
+            let parts: Vec<&str> = counts.trim().split_whitespace().collect();
+            if parts.len() == 2 {
+                ahead = parts[0].parse().unwrap_or(0);
+                behind = parts[1].parse().unwrap_or(0);
+            }
+        }
+    }
+    
+    // Get working directory and staging status using git status --porcelain
+    let mut working_modified = 0;
+    let mut working_added = 0;
+    let mut working_deleted = 0;
+    let mut staging_modified = 0;
+    let mut staging_added = 0;
+    let mut staging_deleted = 0;
+    
+    if let Ok(output) = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(cwd)
+        .output()
+    {
+        if output.status.success() {
+            let status = String::from_utf8_lossy(&output.stdout);
+            for line in status.lines() {
+                if line.len() < 2 {
+                    continue;
+                }
+                let chars: Vec<char> = line.chars().collect();
+                let staging_char = chars[0];
+                let working_char = chars[1];
+                
+                // Staging status (first column)
+                match staging_char {
+                    'M' => staging_modified += 1,
+                    'A' => staging_added += 1,
+                    'D' => staging_deleted += 1,
+                    'R' => staging_modified += 1, // renamed
+                    'C' => staging_added += 1,    // copied
+                    _ => {}
+                }
+                
+                // Working directory status (second column)
+                match working_char {
+                    'M' => working_modified += 1,
+                    'D' => working_deleted += 1,
+                    '?' => working_added += 1, // untracked
+                    _ => {}
+                }
+            }
+        }
+    }
+    
+    // Build status strings like oh-my-posh format
+    let working_changed = working_modified + working_added + working_deleted;
+    let mut working_parts = Vec::new();
+    if working_modified > 0 {
+        working_parts.push(format!("~{}", working_modified));
+    }
+    if working_added > 0 {
+        working_parts.push(format!("+{}", working_added));
+    }
+    if working_deleted > 0 {
+        working_parts.push(format!("-{}", working_deleted));
+    }
+    let working_string = working_parts.join(" ");
+    
+    let staging_changed = staging_modified + staging_added + staging_deleted;
+    let mut staging_parts = Vec::new();
+    if staging_modified > 0 {
+        staging_parts.push(format!("~{}", staging_modified));
+    }
+    if staging_added > 0 {
+        staging_parts.push(format!("+{}", staging_added));
+    }
+    if staging_deleted > 0 {
+        staging_parts.push(format!("-{}", staging_deleted));
+    }
+    let staging_string = staging_parts.join(" ");
+    
+    // Get stash count
+    let mut stash_count = 0;
+    if let Ok(output) = Command::new("git")
+        .args(["stash", "list"])
+        .current_dir(cwd)
+        .output()
+    {
+        if output.status.success() {
+            let stash = String::from_utf8_lossy(&output.stdout);
+            stash_count = stash.lines().count();
+        }
+    }
+    
+    Some(GitStatus {
+        head,
+        ahead,
+        behind,
+        working_changed,
+        working_string,
+        staging_changed,
+        staging_string,
+        stash_count,
+    })
+}
+
+/// Build a statusline section for git status.
+/// Returns None if not in a git repository.
+fn build_git_section(cwd: &str) -> Option<StatuslineSection> {
+    let status = get_git_status(cwd)?;
+    
+    // Determine foreground color based on state (matching oh-my-posh template)
+    // Priority order (last match wins in oh-my-posh):
+    // 1. Default: #0da300 (green)
+    // 2. If working or staging changed: #FF9248 (orange)
+    // 3. If both ahead and behind: #ff4500 (red-orange)
+    // 4. If ahead or behind: #B388FF (purple)
+    let fg_color: (u8, u8, u8) = if status.ahead > 0 && status.behind > 0 {
+        (0xff, 0x45, 0x00) // #ff4500 - red-orange
+    } else if status.ahead > 0 || status.behind > 0 {
+        (0xB3, 0x88, 0xFF) // #B388FF - purple
+    } else if status.working_changed > 0 || status.staging_changed > 0 {
+        (0xFF, 0x92, 0x48) // #FF9248 - orange
+    } else {
+        (0x0d, 0xa3, 0x00) // #0da300 - green
+    };
+    
+    let mut components = Vec::new();
+    
+    // Leading space
+    components.push(StatuslineComponent::new(" ").rgb_fg(fg_color.0, fg_color.1, fg_color.2));
+    
+    // Branch name (HEAD)
+    // Use git branch icon U+E0A0
+    let head_text = format!("\u{E0A0} {}", status.head);
+    components.push(StatuslineComponent::new(head_text).rgb_fg(fg_color.0, fg_color.1, fg_color.2));
+    
+    // Branch status (ahead/behind)
+    if status.ahead > 0 || status.behind > 0 {
+        let mut branch_status = String::new();
+        if status.ahead > 0 {
+            branch_status.push_str(&format!(" ↑{}", status.ahead));
+        }
+        if status.behind > 0 {
+            branch_status.push_str(&format!(" ↓{}", status.behind));
+        }
+        components.push(StatuslineComponent::new(branch_status).rgb_fg(fg_color.0, fg_color.1, fg_color.2));
+    }
+    
+    // Working directory changes - U+F044 is the edit/pencil icon
+    if status.working_changed > 0 {
+        let working_text = format!(" \u{F044} {}", status.working_string);
+        components.push(StatuslineComponent::new(working_text).rgb_fg(fg_color.0, fg_color.1, fg_color.2));
+    }
+    
+    // Separator between working and staging (if both have changes)
+    if status.working_changed > 0 && status.staging_changed > 0 {
+        components.push(StatuslineComponent::new(" |").rgb_fg(fg_color.0, fg_color.1, fg_color.2));
+    }
+    
+    // Staged changes - U+F046 is the check/staged icon
+    if status.staging_changed > 0 {
+        let staging_text = format!(" \u{F046} {}", status.staging_string);
+        components.push(StatuslineComponent::new(staging_text).rgb_fg(fg_color.0, fg_color.1, fg_color.2));
+    }
+    
+    // Stash count - U+EB4B is the stash icon
+    if status.stash_count > 0 {
+        let stash_text = format!(" \u{EB4B} {}", status.stash_count);
+        components.push(StatuslineComponent::new(stash_text).rgb_fg(fg_color.0, fg_color.1, fg_color.2));
+    }
+    
+    // Trailing space
+    components.push(StatuslineComponent::new(" ").rgb_fg(fg_color.0, fg_color.1, fg_color.2));
+    
+    // Background: #232323
+    Some(StatuslineSection::with_rgb_bg(0x23, 0x23, 0x23).with_components(components))
 }
 
 /// A cell position in the terminal grid.
@@ -2018,7 +2319,20 @@ impl ApplicationHandler<UserEvent> for App {
                             pane.terminal.image_storage.has_animations()
                         });
                         
-                        match renderer.render_panes(&pane_render_data, num_tabs, active_tab_idx, &self.edge_glows, self.config.edge_glow_intensity) {
+                        // Get the cwd from the active pane for the statusline
+                        let statusline_sections: Vec<StatuslineSection> = tab.panes.get(&active_pane_id)
+                            .and_then(|pane| pane.pty.foreground_cwd())
+                            .map(|cwd| {
+                                let mut sections = vec![build_cwd_section(&cwd)];
+                                // Add git section if in a git repository
+                                if let Some(git_section) = build_git_section(&cwd) {
+                                    sections.push(git_section);
+                                }
+                                sections
+                            })
+                            .unwrap_or_default();
+                        
+                        match renderer.render_panes(&pane_render_data, num_tabs, active_tab_idx, &self.edge_glows, self.config.edge_glow_intensity, &statusline_sections) {
                             Ok(_) => {}
                             Err(wgpu::SurfaceError::Lost) => {
                                 renderer.resize(renderer.width, renderer.height);
