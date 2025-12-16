@@ -107,7 +107,44 @@ struct GlyphInfo {
 struct ShapingContext {
     face: rustybuzz::Face<'static>,
     /// OpenType features to enable during shaping (liga, calt, etc.)
+    /// Note: This field is kept for potential future use when we need to modify
+    /// features per-context. Currently shaping_features on Renderer is used instead.
+    #[allow(dead_code)]
     features: Vec<rustybuzz::Feature>,
+}
+
+/// Font style variant indices.
+/// These map to the indices in font_variants array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(usize)]
+pub enum FontStyle {
+    Regular = 0,
+    Bold = 1,
+    Italic = 2,
+    BoldItalic = 3,
+}
+
+impl FontStyle {
+    /// Get the font style from bold and italic flags.
+    pub fn from_flags(bold: bool, italic: bool) -> Self {
+        match (bold, italic) {
+            (false, false) => FontStyle::Regular,
+            (true, false) => FontStyle::Bold,
+            (false, true) => FontStyle::Italic,
+            (true, true) => FontStyle::BoldItalic,
+        }
+    }
+}
+
+/// A font variant with its data and parsed references.
+struct FontVariant {
+    /// Owned font data (kept alive for the lifetime of the font references).
+    #[allow(dead_code)]
+    data: Box<[u8]>,
+    /// ab_glyph font reference for rasterization.
+    font: FontRef<'static>,
+    /// rustybuzz face for text shaping.
+    face: rustybuzz::Face<'static>,
 }
 
 /// Result of shaping a text sequence.
@@ -256,6 +293,10 @@ pub struct Renderer {
     font_data: Box<[u8]>,
     /// Primary font for rasterization (borrows font_data)
     primary_font: FontRef<'static>,
+    /// Font style variants: [Regular, Bold, Italic, BoldItalic]
+    /// Each entry is Option because some variants may not be available.
+    /// Index 0 (Regular) is always Some (same as primary_font's data).
+    font_variants: [Option<FontVariant>; 4],
     /// Fallback fonts with their owned data
     fallback_fonts: Vec<(Box<[u8]>, FontRef<'static>)>,
     /// Fontconfig handle for dynamic font discovery (lazy initialized)
@@ -263,9 +304,13 @@ pub struct Renderer {
     /// Set of font paths we've already tried (to avoid reloading)
     tried_font_paths: HashSet<PathBuf>,
     shaping_ctx: ShapingContext,
+    /// OpenType features for shaping (shared across all font variants)
+    shaping_features: Vec<rustybuzz::Feature>,
     char_cache: HashMap<char, GlyphInfo>,    // cache char -> rendered glyph
     ligature_cache: HashMap<String, ShapedGlyphs>, // cache multi-char -> shaped glyphs
-    glyph_cache: HashMap<(usize, u16), GlyphInfo>,   // keyed by (font_index, glyph ID)
+    /// Glyph cache keyed by (font_style, font_index, glyph_id)
+    /// font_style is FontStyle as usize, font_index is 0 for primary, 1+ for fallbacks
+    glyph_cache: HashMap<(usize, usize, u16), GlyphInfo>,
     /// Cache for text run sprites (Kitty-style texture healing).
     /// Keyed by the text string of the run. Value contains UV coords for each cell.
     text_run_cache: HashMap<String, TextRunSprites>,
@@ -385,6 +430,191 @@ fn find_font_for_char(_fc: &Fontconfig, c: char) -> Option<PathBuf> {
 
         font_path
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FONT LOADING HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Try to load a font file and create both ab_glyph and rustybuzz handles.
+/// Returns None if the file doesn't exist or can't be parsed.
+fn load_font_variant(path: &std::path::Path) -> Option<FontVariant> {
+    let data = std::fs::read(path).ok()?.into_boxed_slice();
+    
+    // Parse with ab_glyph
+    let font: FontRef<'static> = {
+        let font = FontRef::try_from_slice(&data).ok()?;
+        // SAFETY: We keep data alive in the FontVariant struct
+        unsafe { std::mem::transmute(font) }
+    };
+    
+    // Parse with rustybuzz
+    let face: rustybuzz::Face<'static> = {
+        let face = rustybuzz::Face::from_slice(&data, 0)?;
+        // SAFETY: We keep data alive in the FontVariant struct
+        unsafe { std::mem::transmute(face) }
+    };
+    
+    Some(FontVariant { data, font, face })
+}
+
+/// Find font files for a font family using fontconfig.
+/// Returns paths for (regular, bold, italic, bold_italic).
+/// Any variant that can't be found will be None.
+fn find_font_family_variants(family: &str) -> [Option<PathBuf>; 4] {
+    use fontconfig_sys as fcsys;
+    use fcsys::*;
+    use fcsys::constants::{FC_FAMILY, FC_WEIGHT, FC_SLANT, FC_FILE};
+    use std::ffi::CString;
+    
+    let mut results: [Option<PathBuf>; 4] = [None, None, None, None];
+    
+    // Style queries: (weight, slant) pairs for each variant
+    // FC_WEIGHT_REGULAR = 80, FC_WEIGHT_BOLD = 200
+    // FC_SLANT_ROMAN = 0, FC_SLANT_ITALIC = 100
+    let styles: [(i32, i32); 4] = [
+        (80, 0),    // Regular
+        (200, 0),   // Bold
+        (80, 100),  // Italic
+        (200, 100), // BoldItalic
+    ];
+    
+    unsafe {
+        let family_cstr = match CString::new(family) {
+            Ok(s) => s,
+            Err(_) => return results,
+        };
+        
+        for (idx, (weight, slant)) in styles.iter().enumerate() {
+            let pat = FcPatternCreate();
+            if pat.is_null() {
+                continue;
+            }
+            
+            // Set family name
+            FcPatternAddString(pat, FC_FAMILY.as_ptr() as *const i8, family_cstr.as_ptr() as *const u8);
+            // Set weight
+            FcPatternAddInteger(pat, FC_WEIGHT.as_ptr() as *const i8, *weight);
+            // Set slant
+            FcPatternAddInteger(pat, FC_SLANT.as_ptr() as *const i8, *slant);
+            
+            FcConfigSubstitute(std::ptr::null_mut(), pat, FcMatchPattern);
+            FcDefaultSubstitute(pat);
+            
+            let mut result: FcResult = FcResultMatch;
+            let matched = FcFontMatch(std::ptr::null_mut(), pat, &mut result);
+            
+            if result == FcResultMatch && !matched.is_null() {
+                let mut file_ptr: *mut u8 = std::ptr::null_mut();
+                if FcPatternGetString(matched, FC_FILE.as_ptr() as *const i8, 0, &mut file_ptr) == FcResultMatch {
+                    if !file_ptr.is_null() {
+                        let path_cstr = std::ffi::CStr::from_ptr(file_ptr as *const i8);
+                        if let Ok(path_str) = path_cstr.to_str() {
+                            results[idx] = Some(PathBuf::from(path_str));
+                        }
+                    }
+                }
+                FcPatternDestroy(matched);
+            }
+            
+            FcPatternDestroy(pat);
+        }
+    }
+    
+    results
+}
+
+/// Load font variants for a font family.
+/// Returns array of font variants, with index 0 being the regular font.
+/// Falls back to hardcoded paths if fontconfig fails.
+fn load_font_family(font_family: Option<&str>) -> (Box<[u8]>, FontRef<'static>, [Option<FontVariant>; 4]) {
+    // Try to use fontconfig to find the font family
+    if let Some(family) = font_family {
+        let paths = find_font_family_variants(family);
+        log::info!("Font family '{}' resolved to:", family);
+        for (i, path) in paths.iter().enumerate() {
+            let style = match i {
+                0 => "Regular",
+                1 => "Bold",
+                2 => "Italic",
+                3 => "BoldItalic",
+                _ => "Unknown",
+            };
+            if let Some(p) = path {
+                log::info!("  {}: {:?}", style, p);
+            }
+        }
+        
+        // Load the regular font (required)
+        if let Some(regular_path) = &paths[0] {
+            if let Some(regular) = load_font_variant(regular_path) {
+                let primary_font = regular.font.clone();
+                let font_data = regular.data.clone();
+                
+                // Load other variants
+                let variants: [Option<FontVariant>; 4] = [
+                    Some(regular),
+                    paths[1].as_ref().and_then(|p| load_font_variant(p)),
+                    paths[2].as_ref().and_then(|p| load_font_variant(p)),
+                    paths[3].as_ref().and_then(|p| load_font_variant(p)),
+                ];
+                
+                return (font_data, primary_font, variants);
+            }
+        }
+        log::warn!("Failed to load font family '{}', falling back to defaults", family);
+    }
+    
+    // Fallback: try hardcoded paths
+    let fallback_fonts = [
+        ("/usr/share/fonts/TTF/0xProtoNerdFont-Regular.ttf", 
+         "/usr/share/fonts/TTF/0xProtoNerdFont-Bold.ttf",
+         "/usr/share/fonts/TTF/0xProtoNerdFont-Italic.ttf",
+         "/usr/share/fonts/TTF/0xProtoNerdFont-BoldItalic.ttf"),
+        ("/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+         "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Bold.ttf",
+         "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Italic.ttf",
+         "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-BoldItalic.ttf"),
+        ("/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
+         "/usr/share/fonts/TTF/JetBrainsMono-Bold.ttf",
+         "/usr/share/fonts/TTF/JetBrainsMono-Italic.ttf",
+         "/usr/share/fonts/TTF/JetBrainsMono-BoldItalic.ttf"),
+    ];
+    
+    for (regular, bold, italic, bold_italic) in fallback_fonts {
+        let regular_path = std::path::Path::new(regular);
+        if let Some(regular_variant) = load_font_variant(regular_path) {
+            let primary_font = regular_variant.font.clone();
+            let font_data = regular_variant.data.clone();
+            
+            let variants: [Option<FontVariant>; 4] = [
+                Some(regular_variant),
+                load_font_variant(std::path::Path::new(bold)),
+                load_font_variant(std::path::Path::new(italic)),
+                load_font_variant(std::path::Path::new(bold_italic)),
+            ];
+            
+            log::info!("Loaded font from fallback paths:");
+            log::info!("  Regular: {}", regular);
+            if variants[1].is_some() { log::info!("  Bold: {}", bold); }
+            if variants[2].is_some() { log::info!("  Italic: {}", italic); }
+            if variants[3].is_some() { log::info!("  BoldItalic: {}", bold_italic); }
+            
+            return (font_data, primary_font, variants);
+        }
+    }
+    
+    // Last resort: try NotoSansMono
+    let noto_regular = std::path::Path::new("/usr/share/fonts/noto/NotoSansMono-Regular.ttf");
+    if let Some(regular_variant) = load_font_variant(noto_regular) {
+        let primary_font = regular_variant.font.clone();
+        let font_data = regular_variant.data.clone();
+        let variants: [Option<FontVariant>; 4] = [Some(regular_variant), None, None, None];
+        log::info!("Loaded NotoSansMono as fallback");
+        return (font_data, primary_font, variants);
+    }
+    
+    panic!("Failed to load any monospace font");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -848,41 +1078,17 @@ impl Renderer {
         };
         surface.configure(&device, &surface_config);
 
-        // Load primary font
-        let font_data: Box<[u8]> = std::fs::read("/usr/share/fonts/TTF/0xProtoNerdFont-Regular.ttf")
-            .or_else(|_| std::fs::read("/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf"))
-            .or_else(|_| std::fs::read("/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf"))
-            .or_else(|_| std::fs::read("/usr/share/fonts/noto/NotoSansMono-Regular.ttf"))
-            .expect("Failed to load any monospace font")
-            .into_boxed_slice();
-
-        // Parse font with ab_glyph for rasterization
-        // SAFETY: We transmute to 'static because font_data lives as long as Renderer.
-        let primary_font: FontRef<'static> = {
-            let font = FontRef::try_from_slice(&font_data)
-                .expect("Failed to parse font with ab_glyph");
-            unsafe { std::mem::transmute(font) }
-        };
+        // Load primary font and font variants (regular, bold, italic, bold-italic)
+        let (font_data, primary_font, font_variants) = load_font_family(config.font_family.as_deref());
 
         // Fontconfig will be initialized lazily on first fallback font lookup
-
         // Start with empty fallback fonts - will be loaded on-demand via fontconfig
         let fallback_fonts: Vec<(Box<[u8]>, FontRef<'static>)> = Vec::new();
         let tried_font_paths: HashSet<PathBuf> = HashSet::new();
 
-        // Create rustybuzz Face for text shaping (ligatures).
-        // SAFETY: We transmute to 'static because font_data lives as long as Renderer.
-        // The Face only borrows the data, so this is safe as long as we don't drop font_data
-        // before dropping the Face, which is guaranteed by struct drop order.
-        let face: rustybuzz::Face<'static> = {
-            let face = rustybuzz::Face::from_slice(&font_data, 0)
-                .expect("Failed to parse font for shaping");
-            unsafe { std::mem::transmute(face) }
-        };
-
         // Enable OpenType features for ligatures and contextual alternates
         // These are the standard features used by coding fonts like Fira Code, JetBrains Mono, etc.
-        let features = vec![
+        let shaping_features = vec![
             // Standard ligatures (fi, fl, etc.)
             rustybuzz::Feature::new(Tag::from_bytes(b"liga"), 1, ..),
             // Contextual alternates (programming ligatures like ->, =>, etc.)
@@ -890,7 +1096,17 @@ impl Renderer {
             // Discretionary ligatures (optional ligatures)
             rustybuzz::Feature::new(Tag::from_bytes(b"dlig"), 1, ..),
         ];
-        let shaping_ctx = ShapingContext { face: face.clone(), features };
+
+        // Create shaping context using the regular font variant's face
+        // The face is borrowed from font_variants[0], which is always Some
+        let shaping_ctx = {
+            let regular_variant = font_variants[0].as_ref()
+                .expect("Regular font variant should always be present");
+            ShapingContext { 
+                face: regular_variant.face.clone(), 
+                features: shaping_features.clone(),
+            }
+        };
 
         // Calculate cell dimensions from font metrics using ab_glyph
         // 
@@ -908,42 +1124,6 @@ impl Renderer {
         // Use font line metrics for cell height
         // ab_glyph's height() = ascent - descent (where descent is negative)
         let cell_height = scaled_font.height().round();
-        
-        // DEBUG: Compare ab_glyph and rustybuzz advance calculations
-        {
-            let units_per_em = face.units_per_em();
-            let height_unscaled = primary_font.height_unscaled();
-            
-            // ab_glyph uses: scale / height_unscaled as the scale factor for h_advance
-            let ab_scale_factor = font_size / height_unscaled;
-            // We were using: scale / units_per_em (WRONG!)
-            let our_wrong_scale = font_size / units_per_em as f32;
-            
-            // Get 'M' glyph advance from rustybuzz's underlying ttf_parser
-            let _m_glyph_rb = face.glyph_index('M').map(|g| g.0).unwrap_or(0);
-            // Let's shape a single 'M' and see what advance we get
-            let mut buffer = rustybuzz::UnicodeBuffer::new();
-            buffer.push_str("M");
-            let glyph_buffer = rustybuzz::shape(&face, &[], buffer);
-            let positions = glyph_buffer.glyph_positions();
-            if !positions.is_empty() {
-                let rb_advance_font_units = positions[0].x_advance;
-                let rb_advance_px_wrong = rb_advance_font_units as f32 * our_wrong_scale;
-                let rb_advance_px_correct = rb_advance_font_units as f32 * ab_scale_factor;
-                let ab_advance_raw = scaled_font.h_advance(m_glyph_id);
-                eprintln!("DEBUG font metrics:");
-                eprintln!("  font_size = {} px", font_size);
-                eprintln!("  units_per_em = {}", units_per_em);
-                eprintln!("  height_unscaled = {} (ascent - descent)", height_unscaled);
-                eprintln!("  ab_glyph scale factor = font_size / height_unscaled = {}", ab_scale_factor);
-                eprintln!("  our WRONG scale factor = font_size / units_per_em = {}", our_wrong_scale);
-                eprintln!("  ab_glyph 'M' h_advance (raw) = {}", ab_advance_raw);
-                eprintln!("  ab_glyph 'M' h_advance (rounded) = {}", cell_width);
-                eprintln!("  rustybuzz 'M' x_advance (font units) = {}", rb_advance_font_units);
-                eprintln!("  rustybuzz 'M' x_advance (WRONG pixels) = {}", rb_advance_px_wrong);
-                eprintln!("  rustybuzz 'M' x_advance (CORRECT pixels) = {}", rb_advance_px_correct);
-            }
-        }
         
         // Calculate the correct scale factor for converting font units to pixels.
         // This matches ab_glyph's calculation: scale / height_unscaled
@@ -1297,10 +1477,12 @@ impl Renderer {
             atlas_dirty: false,
             font_data,
             primary_font,
+            font_variants,
             fallback_fonts,
             fontconfig: OnceCell::new(),
             tried_font_paths,
             shaping_ctx,
+            shaping_features,
             char_cache: HashMap::new(),
             ligature_cache: HashMap::new(),
             glyph_cache: HashMap::new(),
@@ -3010,8 +3192,12 @@ impl Renderer {
 
     /// Get or rasterize a glyph by its glyph ID from the primary font.
     /// Used for ligatures where we have the glyph ID from rustybuzz.
+    /// Note: Kept for potential fallback use. Use get_glyph_by_id_with_style for styled text.
+    #[allow(dead_code)]
     fn get_glyph_by_id(&mut self, glyph_id: u16) -> GlyphInfo {
-        let cache_key = (0usize, glyph_id); // font index 0 = primary font
+        // Cache key: (font_style, font_index, glyph_id)
+        // For now, we use Regular style (0) and primary font index (0)
+        let cache_key = (FontStyle::Regular as usize, 0usize, glyph_id);
         if let Some(info) = self.glyph_cache.get(&cache_key) {
             return *info;
         }
@@ -3093,8 +3279,107 @@ impl Renderer {
         info
     }
 
+    /// Get or rasterize a glyph by its glyph ID from a specific font variant.
+    /// Uses bold/italic font if available, otherwise falls back to regular.
+    fn get_glyph_by_id_with_style(&mut self, glyph_id: u16, style: FontStyle) -> GlyphInfo {
+        // Cache key: (font_style, font_index, glyph_id)
+        // font_index 0 = primary/regular font
+        let cache_key = (style as usize, 0usize, glyph_id);
+        if let Some(info) = self.glyph_cache.get(&cache_key) {
+            return *info;
+        }
+
+        // Get the font for the requested style
+        let font = if style == FontStyle::Regular {
+            self.primary_font.clone()
+        } else if let Some(ref variant) = self.font_variants[style as usize] {
+            variant.font.clone()
+        } else {
+            // Fall back to regular font if variant not available
+            self.primary_font.clone()
+        };
+
+        // Rasterize the glyph by ID using ab_glyph
+        let ab_glyph_id = GlyphId(glyph_id);
+        let raster_result = self.rasterize_glyph_ab(&font, ab_glyph_id);
+
+        let Some((glyph_width, glyph_height, bitmap, offset_x, offset_y)) = raster_result else {
+            // Empty glyph (e.g., space)
+            let info = GlyphInfo {
+                uv: [0.0, 0.0, 0.0, 0.0],
+                offset: [0.0, 0.0],
+                size: [0.0, 0.0],
+            };
+            self.glyph_cache.insert(cache_key, info);
+            return info;
+        };
+
+        if bitmap.is_empty() || glyph_width == 0 || glyph_height == 0 {
+            // Empty glyph (e.g., space)
+            let info = GlyphInfo {
+                uv: [0.0, 0.0, 0.0, 0.0],
+                offset: [0.0, 0.0],
+                size: [0.0, 0.0],
+            };
+            self.glyph_cache.insert(cache_key, info);
+            return info;
+        }
+
+        // Check if we need to move to next row
+        if self.atlas_cursor_x + glyph_width > ATLAS_SIZE {
+            self.atlas_cursor_x = 0;
+            self.atlas_cursor_y += self.atlas_row_height + 1;
+            self.atlas_row_height = 0;
+        }
+
+        // Check if atlas is full
+        if self.atlas_cursor_y + glyph_height > ATLAS_SIZE {
+            log::warn!("Glyph atlas is full!");
+            let info = GlyphInfo {
+                uv: [0.0, 0.0, 0.0, 0.0],
+                offset: [0.0, 0.0],
+                size: [0.0, 0.0],
+            };
+            self.glyph_cache.insert(cache_key, info);
+            return info;
+        }
+
+        // Copy bitmap to atlas
+        for y in 0..glyph_height as usize {
+            for x in 0..glyph_width as usize {
+                let src_idx = y * glyph_width as usize + x;
+                let dst_x = self.atlas_cursor_x + x as u32;
+                let dst_y = self.atlas_cursor_y + y as u32;
+                let dst_idx = (dst_y * ATLAS_SIZE + dst_x) as usize;
+                self.atlas_data[dst_idx] = bitmap[src_idx];
+            }
+        }
+        self.atlas_dirty = true;
+
+        // Calculate UV coordinates
+        let uv_x = self.atlas_cursor_x as f32 / ATLAS_SIZE as f32;
+        let uv_y = self.atlas_cursor_y as f32 / ATLAS_SIZE as f32;
+        let uv_w = glyph_width as f32 / ATLAS_SIZE as f32;
+        let uv_h = glyph_height as f32 / ATLAS_SIZE as f32;
+
+        let info = GlyphInfo {
+            uv: [uv_x, uv_y, uv_w, uv_h],
+            offset: [offset_x, offset_y],
+            size: [glyph_width as f32, glyph_height as f32],
+        };
+
+        // Update atlas cursor
+        self.atlas_cursor_x += glyph_width + 1;
+        self.atlas_row_height = self.atlas_row_height.max(glyph_height);
+
+        self.glyph_cache.insert(cache_key, info);
+        info
+    }
+
     /// Shape a text string using HarfBuzz/rustybuzz.
     /// Returns glyph IDs with advances and offsets for texture healing.
+    /// Note: Kept for potential fallback use. Use shape_text_with_style for styled text.
+    #[allow(dead_code)]
     fn shape_text(&mut self, text: &str) -> ShapedGlyphs {
         // Check cache first
         if let Some(cached) = self.ligature_cache.get(text) {
@@ -3134,6 +3419,53 @@ impl Renderer {
         shaped
     }
 
+    /// Shape a text string using HarfBuzz/rustybuzz with a specific font style.
+    /// Uses the bold/italic font variant if available, otherwise falls back to regular.
+    fn shape_text_with_style(&mut self, text: &str, style: FontStyle) -> ShapedGlyphs {
+        // For now, we'll create a cache key that includes style
+        // TODO: Could optimize by having separate caches per style
+        let cache_key = format!("{}\x00{}", style as usize, text);
+        if let Some(cached) = self.ligature_cache.get(&cache_key) {
+            return cached.clone();
+        }
+
+        let mut buffer = UnicodeBuffer::new();
+        buffer.push_str(text);
+
+        // Get the face for the requested style, falling back to regular if not available
+        let face = if style == FontStyle::Regular {
+            &self.shaping_ctx.face
+        } else if let Some(ref variant) = self.font_variants[style as usize] {
+            &variant.face
+        } else {
+            // Fall back to regular font
+            &self.shaping_ctx.face
+        };
+
+        // Shape with OpenType features enabled (liga, calt, dlig)
+        let glyph_buffer = rustybuzz::shape(face, &self.shaping_features, buffer);
+        let glyph_infos = glyph_buffer.glyph_infos();
+        let glyph_positions = glyph_buffer.glyph_positions();
+
+        let glyphs: Vec<(u16, f32, f32, f32, u32)> = glyph_infos
+            .iter()
+            .zip(glyph_positions.iter())
+            .map(|(info, pos)| {
+                let glyph_id = info.glyph_id as u16;
+                // Note: We don't pre-rasterize here; that happens in render_glyphs_to_canvas_with_style
+                // Convert from font units to pixels using the correct scale factor.
+                let x_advance = pos.x_advance as f32 * self.font_units_to_px;
+                let x_offset = pos.x_offset as f32 * self.font_units_to_px;
+                let y_offset = pos.y_offset as f32 * self.font_units_to_px;
+                (glyph_id, x_advance, x_offset, y_offset, info.cluster)
+            })
+            .collect();
+
+        let shaped = ShapedGlyphs { glyphs };
+        self.ligature_cache.insert(cache_key, shaped.clone());
+        shaped
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // KITTY-STYLE TEXTURE HEALING: CANVAS-BASED TEXT RUN RENDERING
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3170,11 +3502,13 @@ impl Renderer {
 
     /// Render shaped glyphs into the canvas buffer using HarfBuzz positions.
     /// This is the core of Kitty's texture healing approach.
+    /// Note: Kept for potential fallback use. Use render_glyphs_to_canvas_with_style for styled text.
     /// 
     /// Arguments:
     /// - `shaped`: The shaped glyph data from HarfBuzz
     /// - `num_cells`: Number of cells this text run spans
     /// - `baseline_offset`: Offset from top of cell to baseline (typically cell_height * 0.8)
+    #[allow(dead_code)]
     fn render_glyphs_to_canvas(&mut self, shaped: &ShapedGlyphs, num_cells: usize, baseline_offset: f32) {
         let canvas_width = (self.cell_width as usize) * num_cells;
         let canvas_height = self.cell_height as usize;
@@ -3247,6 +3581,79 @@ impl Renderer {
         }
     }
 
+    /// Render shaped glyphs into the canvas buffer using a specific font style.
+    /// This version uses the appropriate font variant for bold/italic text.
+    fn render_glyphs_to_canvas_with_style(&mut self, shaped: &ShapedGlyphs, num_cells: usize, baseline_offset: f32, style: FontStyle) {
+        let canvas_width = (self.cell_width as usize) * num_cells;
+        let canvas_height = self.cell_height as usize;
+        
+        // Track cursor position in canvas coordinates
+        let mut cursor_x: f32 = 0.0;
+        
+        for &(glyph_id, x_advance, x_offset, y_offset, _cluster) in &shaped.glyphs {
+            // Get the rasterized glyph bitmap using the correct font variant
+            let glyph = self.get_glyph_by_id_with_style(glyph_id, style);
+            
+            if glyph.size[0] <= 0.0 || glyph.size[1] <= 0.0 {
+                // Empty glyph (e.g., space) - just advance cursor
+                cursor_x += x_advance;
+                continue;
+            }
+            
+            // Calculate glyph position in canvas:
+            // - cursor_x: accumulated from x_advance
+            // - x_offset: HarfBuzz adjustment for texture healing
+            // - glyph.offset[0]: left bearing from the font
+            let glyph_x = cursor_x + x_offset + glyph.offset[0];
+            
+            // Y position: baseline_offset is from top to baseline
+            // glyph.offset[1] is distance from baseline to glyph bottom (negative = below baseline)
+            // For canvas coords (y=0 at top), we need: baseline_offset - glyph_top
+            // glyph_top = glyph.offset[1] + glyph.size[1] (since offset is to bottom)
+            let glyph_y = baseline_offset + y_offset - glyph.offset[1] - glyph.size[1];
+            
+            // Round to integers for pixel placement
+            let dest_x = glyph_x.round() as i32;
+            let dest_y = glyph_y.round() as i32;
+            
+            // Get glyph bitmap from atlas
+            // The glyph.uv gives us the location in the atlas
+            let atlas_x = (glyph.uv[0] * ATLAS_SIZE as f32) as u32;
+            let atlas_y = (glyph.uv[1] * ATLAS_SIZE as f32) as u32;
+            let glyph_w = glyph.size[0] as u32;
+            let glyph_h = glyph.size[1] as u32;
+            
+            // Copy glyph bitmap from atlas to canvas, with bounds checking
+            for gy in 0..glyph_h {
+                let canvas_y = dest_y + gy as i32;
+                if canvas_y < 0 || canvas_y >= canvas_height as i32 {
+                    continue;
+                }
+                
+                for gx in 0..glyph_w {
+                    let canvas_x = dest_x + gx as i32;
+                    if canvas_x < 0 || canvas_x >= canvas_width as i32 {
+                        continue;
+                    }
+                    
+                    // Source in atlas
+                    let src_idx = ((atlas_y + gy) * ATLAS_SIZE + (atlas_x + gx)) as usize;
+                    // Destination in canvas
+                    let dst_idx = (canvas_y as usize) * canvas_width + (canvas_x as usize);
+                    
+                    // Blend: use max for overlapping glyphs (simple compositing)
+                    let src_alpha = self.atlas_data[src_idx];
+                    let dst_alpha = self.canvas_buffer[dst_idx];
+                    self.canvas_buffer[dst_idx] = src_alpha.max(dst_alpha);
+                }
+            }
+            
+            // Advance cursor by glyph's advance width.
+            // Round the advance to ensure it aligns with cell boundaries for monospace fonts.
+            cursor_x += x_advance.round();
+        }
+    }
+
     /// Extract a single cell from the canvas and upload it to the atlas.
     /// Returns the GlyphInfo for this cell's sprite.
     fn extract_cell_from_canvas(&mut self, cell_index: usize, num_cells: usize) -> [f32; 4] {
@@ -3295,26 +3702,15 @@ impl Renderer {
 
     /// Render a text run using Kitty's canvas-based approach for texture healing.
     /// Returns TextRunSprites containing UV coordinates for each cell.
-    fn render_text_run(&mut self, text: &str, num_cells: usize) -> TextRunSprites {
-        // Check cache first
-        if let Some(cached) = self.text_run_cache.get(text) {
+    fn render_text_run(&mut self, text: &str, num_cells: usize, style: FontStyle) -> TextRunSprites {
+        // Check cache first - include font style in cache key
+        let cache_key = format!("{}\x00{}", style as usize, text);
+        if let Some(cached) = self.text_run_cache.get(&cache_key) {
             return cached.clone();
         }
         
-        // Shape the text
-        let shaped = self.shape_text(text);
-        
-        // DEBUG: Log shaping results
-        if num_cells >= 2 {
-            let total_advance: f32 = shaped.glyphs.iter().map(|g| g.1).sum();
-            let expected_width = self.cell_width * num_cells as f32;
-            eprintln!("DEBUG shape_text: text='{}' num_cells={} num_glyphs={} total_advance={:.2} expected_width={:.2} cell_width={:.2}",
-                text, num_cells, shaped.glyphs.len(), total_advance, expected_width, self.cell_width);
-            for (i, &(glyph_id, x_advance, x_offset, _y_offset, cluster)) in shaped.glyphs.iter().enumerate() {
-                eprintln!("  glyph[{}]: id={} x_advance={:.2} x_offset={:.2} cluster={}", 
-                    i, glyph_id, x_advance, x_offset, cluster);
-            }
-        }
+        // Shape the text using the appropriate font variant
+        let shaped = self.shape_text_with_style(text, style);
         
         // Ensure canvas is big enough
         self.ensure_canvas_size(num_cells);
@@ -3323,8 +3719,8 @@ impl Renderer {
         // Calculate baseline offset (typically ~80% down from top of cell)
         let baseline_offset = self.cell_height * 0.8;
         
-        // Render all glyphs into the canvas
-        self.render_glyphs_to_canvas(&shaped, num_cells, baseline_offset);
+        // Render all glyphs into the canvas using the appropriate font variant
+        self.render_glyphs_to_canvas_with_style(&shaped, num_cells, baseline_offset, style);
         
         // Extract each cell from the canvas
         let mut cells = Vec::with_capacity(num_cells);
@@ -3334,7 +3730,7 @@ impl Renderer {
         }
         
         let sprites = TextRunSprites { cells };
-        self.text_run_cache.insert(text.to_string(), sprites.clone());
+        self.text_run_cache.insert(cache_key, sprites.clone());
         sprites
     }
 
@@ -3491,7 +3887,10 @@ impl Renderer {
                     (color_to_rgba(&cell.fg_color, true), color_to_rgba(&cell.bg_color, false))
                 };
                 
-                // Collect a run of cells with the same fg/bg colors
+                // Track font style for bold/italic rendering
+                let base_style = FontStyle::from_flags(cell.bold, cell.italic);
+                
+                // Collect a run of cells with the same fg/bg colors AND font style
                 let mut run_text = String::new();
                 let mut run_cells: Vec<(usize, char, bool)> = Vec::new(); // (col, char, is_box_drawing)
                 
@@ -3505,8 +3904,11 @@ impl Renderer {
                         (color_to_rgba(&run_cell.fg_color, true), color_to_rgba(&run_cell.bg_color, false))
                     };
                     
-                    if cell_fg != base_fg || cell_bg != base_bg {
-                        break; // Different colors, end this run
+                    // Check if font style (bold/italic) matches
+                    let cell_style = FontStyle::from_flags(run_cell.bold, run_cell.italic);
+                    
+                    if cell_fg != base_fg || cell_bg != base_bg || cell_style != base_style {
+                        break; // Different colors or font style, end this run
                     }
                     
                     let c = run_cell.character;
@@ -3587,12 +3989,7 @@ impl Renderer {
                 // Render the text run using canvas approach if there's text to shape
                 let sprites = if !shape_text.is_empty() && shape_indices.len() == run_cells.len() {
                     // All cells are shapeable text - use canvas rendering
-                    // DEBUG: Log what we're shaping
-                    if run_cells.len() >= 2 {
-                        eprintln!("DEBUG render_text_run: text='{}' num_cells={} shape_text='{}'", 
-                            run_text, run_cells.len(), shape_text);
-                    }
-                    Some(self.render_text_run(&run_text, run_cells.len()))
+                    Some(self.render_text_run(&run_text, run_cells.len(), base_style))
                 } else {
                     None
                 };

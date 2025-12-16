@@ -353,6 +353,10 @@ impl Keybindings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Font family name to use. The terminal will look for Regular, Bold, Italic, and BoldItalic
+    /// variants of this font. If not specified, falls back to system monospace fonts.
+    /// Example: "JetBrainsMono Nerd Font" or "0xProto Nerd Font"
+    pub font_family: Option<String>,
     /// Font size in points.
     pub font_size: f32,
     /// Position of the tab bar: "top", "bottom", or "hidden".
@@ -382,6 +386,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            font_family: None,
             font_size: 16.0,
             tab_bar_position: TabBarPosition::Top,
             background_opacity: 1.0,
