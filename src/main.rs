@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use polling::{Event, Events, Poller};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -54,9 +55,18 @@ struct DoubleBuffer {
 
 impl SharedPtyBuffer {
     fn new() -> Self {
+        // Use with_capacity to avoid zeroing memory - we only need the allocation
+        let mut buf1 = Vec::with_capacity(PTY_BUF_SIZE);
+        let mut buf2 = Vec::with_capacity(PTY_BUF_SIZE);
+        // SAFETY: We're setting length to capacity. The data is uninitialized but
+        // we only read from portions that have been written to (tracked by write_len).
+        unsafe {
+            buf1.set_len(PTY_BUF_SIZE);
+            buf2.set_len(PTY_BUF_SIZE);
+        }
         Self {
             inner: Mutex::new(DoubleBuffer {
-                bufs: [vec![0u8; PTY_BUF_SIZE], vec![0u8; PTY_BUF_SIZE]],
+                bufs: [buf1, buf2],
                 write_idx: 0,
                 write_len: 0,
             }),
@@ -158,8 +168,15 @@ impl Pane {
         let terminal = Terminal::new(cols, rows, scrollback_lines);
         let pty = Pty::spawn(None).map_err(|e| format!("Failed to spawn PTY: {}", e))?;
         
-        // Set terminal size
-        if let Err(e) = pty.resize(cols as u16, rows as u16) {
+        // Set terminal size (use default cell size estimate for initial pixel dimensions)
+        let default_cell_width = 10u16;
+        let default_cell_height = 20u16;
+        if let Err(e) = pty.resize(
+            cols as u16, 
+            rows as u16,
+            cols as u16 * default_cell_width,
+            rows as u16 * default_cell_height,
+        ) {
             log::warn!("Failed to set initial PTY size: {}", e);
         }
         
@@ -180,9 +197,9 @@ impl Pane {
     }
     
     /// Resize the terminal and PTY.
-    fn resize(&mut self, cols: usize, rows: usize) {
+    fn resize(&mut self, cols: usize, rows: usize, width_px: u16, height_px: u16) {
         self.terminal.resize(cols, rows);
-        if let Err(e) = self.pty.resize(cols as u16, rows as u16) {
+        if let Err(e) = self.pty.resize(cols as u16, rows as u16, width_px, height_px) {
             log::warn!("Failed to resize PTY: {}", e);
         }
     }
@@ -588,7 +605,11 @@ impl Tab {
         
         for (pane_id, geom) in geometries {
             if let Some(pane) = self.panes.get_mut(&pane_id) {
-                pane.resize(geom.cols, geom.rows);
+                // Report pixel dimensions as exact cell grid size (cols * cell_width, rows * cell_height)
+                // This ensures applications like kitten icat calculate image placement correctly
+                let pixel_width = (geom.cols as f32 * cell_width) as u16;
+                let pixel_height = (geom.rows as f32 * cell_height) as u16;
+                pane.resize(geom.cols, geom.rows, pixel_width, pixel_height);
             }
         }
     }
@@ -784,6 +805,8 @@ enum UserEvent {
     ShowWindow,
     /// PTY has data available for a specific pane.
     PtyReadable(PaneId),
+    /// Config file was modified and should be reloaded.
+    ConfigReloaded,
 }
 
 /// Main application state.
@@ -816,8 +839,8 @@ struct App {
     last_frame_log: std::time::Instant,
     /// Whether window should be created on next opportunity.
     should_create_window: bool,
-    /// Edge glow animation state (for when navigation fails).
-    edge_glow: Option<EdgeGlow>,
+    /// Edge glow animations (for when navigation fails). Multiple can be active simultaneously.
+    edge_glows: Vec<EdgeGlow>,
 }
 
 const PTY_KEY: usize = 1;
@@ -848,12 +871,56 @@ impl App {
             frame_count: 0,
             last_frame_log: std::time::Instant::now(),
             should_create_window: false,
-            edge_glow: None,
+            edge_glows: Vec::new(),
         }
     }
     
     fn set_event_loop_proxy(&mut self, proxy: EventLoopProxy<UserEvent>) {
         self.event_loop_proxy = Some(proxy);
+    }
+    
+    /// Reload configuration from disk and apply changes.
+    fn reload_config(&mut self) {
+        log::info!("Reloading configuration...");
+        let new_config = Config::load();
+        
+        // Check what changed and apply updates
+        let font_size_changed = (new_config.font_size - self.config.font_size).abs() > 0.01;
+        let opacity_changed = (new_config.background_opacity - self.config.background_opacity).abs() > 0.01;
+        let tab_bar_changed = new_config.tab_bar_position != self.config.tab_bar_position;
+        
+        // Update the config
+        self.config = new_config;
+        
+        // Rebuild action map for keybindings
+        self.action_map = self.config.keybindings.build_action_map();
+        
+        // Apply renderer changes if we have a renderer
+        if let Some(renderer) = &mut self.renderer {
+            if opacity_changed {
+                renderer.set_background_opacity(self.config.background_opacity);
+                log::info!("Updated background opacity to {}", self.config.background_opacity);
+            }
+            
+            if tab_bar_changed {
+                renderer.set_tab_bar_position(self.config.tab_bar_position);
+                log::info!("Updated tab bar position to {:?}", self.config.tab_bar_position);
+            }
+            
+            if font_size_changed {
+                renderer.set_font_size(self.config.font_size);
+                log::info!("Updated font size to {}", self.config.font_size);
+                // Font size change requires resize to recalculate cell dimensions
+                self.resize_all_panes();
+            }
+        }
+        
+        // Request redraw to apply visual changes
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        
+        log::info!("Configuration reloaded successfully");
     }
     
     /// Create a new tab and start its I/O thread.
@@ -1046,6 +1113,11 @@ impl App {
         
         for tab in &mut self.tabs {
             tab.resize(width, height, cell_width, cell_height, border_width);
+            
+            // Update cell size on all terminals (needed for Kitty graphics protocol)
+            for pane in tab.panes.values_mut() {
+                pane.terminal.set_cell_size(cell_width, cell_height);
+            }
         }
     }
     
@@ -1368,6 +1440,13 @@ impl App {
     }
     
     fn focus_pane(&mut self, direction: Direction) {
+        // Get current active pane geometry before attempting navigation
+        let active_pane_geom = if let Some(tab) = self.tabs.get(self.active_tab) {
+            tab.split_root.find_geometry(tab.active_pane)
+        } else {
+            None
+        };
+        
         let navigated = if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             let old_pane = tab.active_pane;
             tab.focus_neighbor(direction);
@@ -1378,7 +1457,16 @@ impl App {
         
         if !navigated {
             // No neighbor in that direction - trigger edge glow animation
-            self.edge_glow = Some(EdgeGlow::new(direction));
+            // Add to existing glows (don't replace) so multiple can be visible
+            if let Some(geom) = active_pane_geom {
+                self.edge_glows.push(EdgeGlow::new(
+                    direction,
+                    geom.x,
+                    geom.y,
+                    geom.width,
+                    geom.height,
+                ));
+            }
         }
         
         if let Some(window) = &self.window {
@@ -1605,9 +1693,11 @@ impl App {
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let start = std::time::Instant::now();
         if self.window.is_none() {
             self.create_window(event_loop);
         }
+        log::info!("App resumed (window creation): {:?}", start.elapsed());
     }
     
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -1632,6 +1722,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if process_time.as_millis() > 5 {
                     log::info!("PTY process took {:?}", process_time);
                 }
+            }
+            UserEvent::ConfigReloaded => {
+                self.reload_config();
             }
         }
     }
@@ -1851,13 +1944,16 @@ impl ApplicationHandler<UserEvent> for App {
                         let geometries = tab.collect_pane_geometries();
                         let active_pane_id = tab.active_pane;
                         
-                        // First pass: calculate dim factors (needs mutable access)
+                        // First pass: sync images and calculate dim factors (needs mutable access)
                         let mut dim_factors: Vec<(PaneId, f32)> = Vec::new();
                         for (pane_id, _) in &geometries {
                             if let Some(pane) = tab.panes.get_mut(pane_id) {
                                 let is_active = *pane_id == active_pane_id;
                                 let dim_factor = pane.calculate_dim_factor(is_active, fade_duration_ms, inactive_dim);
                                 dim_factors.push((*pane_id, dim_factor));
+                                
+                                // Sync terminal images to GPU (Kitty graphics protocol)
+                                renderer.sync_images(&mut pane.terminal.image_storage);
                             }
                         }
                         
@@ -1914,11 +2010,15 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         
-                        // Handle edge glow animation
-                        let edge_glow_ref = self.edge_glow.as_ref();
-                        let glow_in_progress = edge_glow_ref.map(|g| !g.is_finished()).unwrap_or(false);
+                        // Handle edge glow animations
+                        let glow_in_progress = !self.edge_glows.is_empty();
                         
-                        match renderer.render_panes(&pane_render_data, num_tabs, active_tab_idx, edge_glow_ref) {
+                        // Check if any pane has animated images
+                        let image_animation_in_progress = tab.panes.values().any(|pane| {
+                            pane.terminal.image_storage.has_animations()
+                        });
+                        
+                        match renderer.render_panes(&pane_render_data, num_tabs, active_tab_idx, &self.edge_glows, self.config.edge_glow_intensity) {
                             Ok(_) => {}
                             Err(wgpu::SurfaceError::Lost) => {
                                 renderer.resize(renderer.width, renderer.height);
@@ -1932,8 +2032,8 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         
-                        // Request redraw if edge glow is animating
-                        if glow_in_progress {
+                        // Request redraw if edge glow or image animation is in progress
+                        if glow_in_progress || image_animation_in_progress {
                             if let Some(window) = &self.window {
                                 window.request_redraw();
                             }
@@ -1941,10 +2041,8 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 
-                // Clean up finished edge glow animation
-                if self.edge_glow.as_ref().map(|g| g.is_finished()).unwrap_or(false) {
-                    self.edge_glow = None;
-                }
+                // Clean up finished edge glow animations
+                self.edge_glows.retain(|g| !g.is_finished());
                 
                 let render_time = render_start.elapsed();
                 let frame_time = frame_start.elapsed();
@@ -2000,6 +2098,69 @@ impl Drop for App {
     }
 }
 
+/// Set up a file watcher to monitor the config file for changes.
+/// Returns the watcher (must be kept alive for watching to continue).
+fn setup_config_watcher(proxy: EventLoopProxy<UserEvent>) -> Option<RecommendedWatcher> {
+    let config_path = match Config::config_path() {
+        Some(path) => path,
+        None => {
+            log::warn!("Could not determine config path, config hot-reload disabled");
+            return None;
+        }
+    };
+    
+    // Watch the parent directory since the file might be replaced atomically
+    let watch_path = match config_path.parent() {
+        Some(parent) => parent.to_path_buf(),
+        None => {
+            log::warn!("Could not determine config directory, config hot-reload disabled");
+            return None;
+        }
+    };
+    
+    let config_filename = config_path.file_name().map(|s| s.to_os_string());
+    
+    let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        match res {
+            Ok(event) => {
+                // Only trigger on modify/create events for the config file
+                use notify::EventKind;
+                match event.kind {
+                    EventKind::Modify(_) | EventKind::Create(_) => {
+                        // Check if the event is for our config file
+                        let is_config_file = event.paths.iter().any(|p| {
+                            p.file_name().map(|s| s.to_os_string()) == config_filename
+                        });
+                        
+                        if is_config_file {
+                            log::debug!("Config file changed, triggering reload");
+                            let _ = proxy.send_event(UserEvent::ConfigReloaded);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Err(e) => {
+                log::warn!("Config watcher error: {:?}", e);
+            }
+        }
+    }) {
+        Ok(w) => w,
+        Err(e) => {
+            log::warn!("Failed to create config watcher: {:?}", e);
+            return None;
+        }
+    };
+    
+    if let Err(e) = watcher.watch(&watch_path, RecursiveMode::NonRecursive) {
+        log::warn!("Failed to watch config directory {:?}: {:?}", watch_path, e);
+        return None;
+    }
+    
+    log::info!("Config hot-reload enabled, watching {:?}", watch_path);
+    Some(watcher)
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -2035,8 +2196,11 @@ fn main() {
     
     // Store proxy for signal handler (uses the global static defined below)
     unsafe {
-        EVENT_PROXY = Some(proxy);
+        EVENT_PROXY = Some(proxy.clone());
     }
+
+    // Set up config file watcher for hot-reloading
+    let _config_watcher = setup_config_watcher(proxy);
 
     event_loop.run_app(&mut app).expect("Event loop error");
 }

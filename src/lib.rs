@@ -3,6 +3,7 @@
 //! Single-process architecture: one process owns PTY, terminal state, and rendering.
 
 pub mod config;
+pub mod graphics;
 pub mod keyboard;
 pub mod pty;
 pub mod renderer;

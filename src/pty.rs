@@ -150,12 +150,12 @@ impl Pty {
     }
 
     /// Resizes the PTY window.
-    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError> {
+    pub fn resize(&self, cols: u16, rows: u16, xpixel: u16, ypixel: u16) -> Result<(), PtyError> {
         let winsize = libc::winsize {
             ws_row: rows,
             ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: xpixel,
+            ws_ypixel: ypixel,
         };
 
         let fd = std::os::fd::AsRawFd::as_raw_fd(&self.master);

@@ -2,10 +2,12 @@
 //! Uses rustybuzz (HarfBuzz port) for text shaping to support font features.
 
 use crate::config::TabBarPosition;
+use crate::graphics::{ImageData, ImagePlacement, ImageStorage};
 use crate::terminal::{Color, ColorPalette, CursorShape, Direction, Terminal};
-use fontdue::Font as FontdueFont;
+use ab_glyph::{Font, FontRef, GlyphId, ScaleFont};
 use rustybuzz::UnicodeBuffer;
 use ttf_parser::Tag;
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::path::PathBuf;
@@ -47,27 +49,39 @@ pub struct EdgeGlow {
     pub direction: Direction,
     /// When the animation started.
     pub start_time: std::time::Instant,
+    /// Pane bounds - left edge in pixels.
+    pub pane_x: f32,
+    /// Pane bounds - top edge in pixels.
+    pub pane_y: f32,
+    /// Pane bounds - width in pixels.
+    pub pane_width: f32,
+    /// Pane bounds - height in pixels.
+    pub pane_height: f32,
 }
 
 impl EdgeGlow {
     /// Duration of the glow animation in milliseconds.
     pub const DURATION_MS: u64 = 500;
-    
-    /// Create a new edge glow animation.
-    pub fn new(direction: Direction) -> Self {
+
+    /// Create a new edge glow animation constrained to a pane's bounds.
+    pub fn new(direction: Direction, pane_x: f32, pane_y: f32, pane_width: f32, pane_height: f32) -> Self {
         Self {
             direction,
             start_time: std::time::Instant::now(),
+            pane_x,
+            pane_y,
+            pane_width,
+            pane_height,
         }
     }
-    
+
     /// Get the current animation progress (0.0 to 1.0).
     pub fn progress(&self) -> f32 {
         let elapsed = self.start_time.elapsed().as_millis() as f32;
         let duration = Self::DURATION_MS as f32;
         (elapsed / duration).min(1.0)
     }
-    
+
     /// Check if the animation has completed.
     pub fn is_finished(&self) -> bool {
         self.progress() >= 1.0
@@ -99,11 +113,20 @@ struct ShapingContext {
 /// Result of shaping a text sequence.
 #[derive(Clone, Debug)]
 struct ShapedGlyphs {
-    /// Glyph IDs, advances, and cluster indices.
-    /// Each tuple is (glyph_id, advance, cluster).
-    glyphs: Vec<(u16, f32, u32)>,
-    /// Whether this represents a ligature (one visual glyph for multiple characters).
-    is_ligature: bool,
+    /// Glyph IDs, advances, offsets, and cluster indices.
+    /// Each tuple is (glyph_id, x_advance, x_offset, y_offset, cluster).
+    /// x_offset/y_offset are for texture healing - they shift the glyph without affecting advance.
+    glyphs: Vec<(u16, f32, f32, f32, u32)>,
+}
+
+/// Cached cell sprites for a text run.
+/// When we render a text run using Kitty's canvas approach, we get one sprite per cell.
+/// This caches those sprites so we don't re-render the same text runs.
+#[derive(Clone, Debug)]
+struct TextRunSprites {
+    /// UV coordinates and sizes for each cell in the run.
+    /// Each entry is (uv_x, uv_y, uv_w, uv_h) in the atlas, plus cell_width and cell_height.
+    cells: Vec<[f32; 4]>,
 }
 
 /// Vertex for rendering textured quads.
@@ -133,6 +156,29 @@ impl GlyphVertex {
     }
 }
 
+/// Maximum number of simultaneous edge glows.
+const MAX_EDGE_GLOWS: usize = 16;
+
+/// Per-glow instance data (48 bytes, aligned to 16 bytes).
+/// Must match GlowInstance in shader.wgsl exactly.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct GlowInstance {
+    direction: u32,
+    progress: f32,
+    color_r: f32,
+    color_g: f32,
+    color_b: f32,
+    // Pane bounds in pixels
+    pane_x: f32,
+    pane_y: f32,
+    pane_width: f32,
+    pane_height: f32,
+    _padding1: f32,
+    _padding2: f32,
+    _padding3: f32,
+}
+
 /// GPU-compatible edge glow uniform data.
 /// Must match the layout in shader.wgsl exactly.
 #[repr(C)]
@@ -141,15 +187,40 @@ struct EdgeGlowUniforms {
     screen_width: f32,
     screen_height: f32,
     terminal_y_offset: f32,
-    direction: u32,
-    progress: f32,
-    color_r: f32,
-    color_g: f32,
-    color_b: f32,
-    enabled: u32,
-    _padding1: u32,
-    _padding2: u32,
-    _padding3: u32,
+    glow_intensity: f32,
+    glow_count: u32,
+    _padding: [u32; 3], // Pad to 16-byte alignment before array
+    glows: [GlowInstance; MAX_EDGE_GLOWS],
+}
+
+/// GPU-compatible image uniform data.
+/// Must match the layout in image_shader.wgsl exactly.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ImageUniforms {
+    screen_width: f32,
+    screen_height: f32,
+    pos_x: f32,
+    pos_y: f32,
+    display_width: f32,
+    display_height: f32,
+    src_x: f32,
+    src_y: f32,
+    src_width: f32,
+    src_height: f32,
+    _padding1: f32,
+    _padding2: f32,
+}
+
+/// Cached GPU texture for an image.
+#[allow(dead_code)]
+struct GpuImage {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
 }
 
 /// The terminal renderer.
@@ -162,11 +233,18 @@ pub struct Renderer {
     // Glyph rendering pipeline
     glyph_pipeline: wgpu::RenderPipeline,
     glyph_bind_group: wgpu::BindGroup,
-    
+
     // Edge glow rendering pipeline
     edge_glow_pipeline: wgpu::RenderPipeline,
     edge_glow_bind_group: wgpu::BindGroup,
     edge_glow_uniform_buffer: wgpu::Buffer,
+
+    // Image rendering pipeline (Kitty graphics protocol)
+    image_pipeline: wgpu::RenderPipeline,
+    image_bind_group_layout: wgpu::BindGroupLayout,
+    image_sampler: wgpu::Sampler,
+    /// Cached GPU textures for images, keyed by image ID.
+    image_textures: HashMap<u32, GpuImage>,
 
     // Atlas texture
     atlas_texture: wgpu::Texture,
@@ -174,18 +252,28 @@ pub struct Renderer {
     atlas_dirty: bool,
 
     // Font and shaping
-    #[allow(dead_code)] // Kept alive for rustybuzz::Face which borrows it
+    #[allow(dead_code)] // Kept alive for rustybuzz::Face and FontRef which borrow it
     font_data: Box<[u8]>,
-    fontdue_font: FontdueFont,
-    fallback_fonts: Vec<FontdueFont>,
-    /// Fontconfig handle for dynamic font discovery
-    fontconfig: Option<Fontconfig>,
+    /// Primary font for rasterization (borrows font_data)
+    primary_font: FontRef<'static>,
+    /// Fallback fonts with their owned data
+    fallback_fonts: Vec<(Box<[u8]>, FontRef<'static>)>,
+    /// Fontconfig handle for dynamic font discovery (lazy initialized)
+    fontconfig: OnceCell<Option<Fontconfig>>,
     /// Set of font paths we've already tried (to avoid reloading)
     tried_font_paths: HashSet<PathBuf>,
     shaping_ctx: ShapingContext,
     char_cache: HashMap<char, GlyphInfo>,    // cache char -> rendered glyph
     ligature_cache: HashMap<String, ShapedGlyphs>, // cache multi-char -> shaped glyphs
     glyph_cache: HashMap<(usize, u16), GlyphInfo>,   // keyed by (font_index, glyph ID)
+    /// Cache for text run sprites (Kitty-style texture healing).
+    /// Keyed by the text string of the run. Value contains UV coords for each cell.
+    text_run_cache: HashMap<String, TextRunSprites>,
+    /// Reusable canvas buffer for rendering text runs (Kitty-style texture healing).
+    /// This is a temporary buffer we render multiple glyphs into, then slice into cells.
+    canvas_buffer: Vec<u8>,
+    /// Current canvas dimensions (width, height) in pixels.
+    canvas_size: (u32, u32),
     atlas_cursor_x: u32,
     atlas_cursor_y: u32,
     atlas_row_height: u32,
@@ -205,6 +293,9 @@ pub struct Renderer {
     dpi: f64,
     /// Effective font size in pixels (base_font_size * scale_factor).
     pub font_size: f32,
+    /// Scale factor to convert font units to pixels.
+    /// This is font_size / height_unscaled, matching ab_glyph's calculation.
+    font_units_to_px: f32,
     /// Cell dimensions in pixels.
     pub cell_width: f32,
     pub cell_height: f32,
@@ -217,7 +308,7 @@ pub struct Renderer {
     tab_bar_position: TabBarPosition,
     /// Background opacity (0.0 = transparent, 1.0 = opaque).
     background_opacity: f32,
-    
+
     // Reusable vertex/index buffers to avoid per-frame allocations
     bg_vertices: Vec<GlyphVertex>,
     bg_indices: Vec<u32>,
@@ -225,7 +316,7 @@ pub struct Renderer {
     glyph_indices: Vec<u32>,
     overlay_vertices: Vec<GlyphVertex>,
     overlay_indices: Vec<u32>,
-    
+
     /// Current selection range for rendering (start_col, start_row, end_col, end_row).
     /// If set, cells within this range will be rendered with inverted colors.
     selection: Option<(usize, usize, usize, usize)>,
@@ -240,36 +331,36 @@ pub struct Renderer {
 fn find_font_for_char(_fc: &Fontconfig, c: char) -> Option<PathBuf> {
     use fontconfig_sys as fcsys;
     use fcsys::*;
-    
+
     unsafe {
         // Create a pattern
         let pat = FcPatternCreate();
         if pat.is_null() {
             return None;
         }
-        
+
         // Create a charset with the target character
         let charset = FcCharSetCreate();
         if charset.is_null() {
             FcPatternDestroy(pat);
             return None;
         }
-        
+
         // Add the character to the charset
         FcCharSetAddChar(charset, c as u32);
-        
+
         // Add the charset to the pattern
         let fc_charset_cstr = CStr::from_bytes_with_nul(b"charset\0").unwrap();
         FcPatternAddCharSet(pat, fc_charset_cstr.as_ptr(), charset);
-        
+
         // Run substitutions
         FcConfigSubstitute(std::ptr::null_mut(), pat, FcMatchPattern);
         FcDefaultSubstitute(pat);
-        
+
         // Find matching font
         let mut result = FcResultNoMatch;
         let matched = FcFontMatch(std::ptr::null_mut(), pat, &mut result);
-        
+
         let font_path = if !matched.is_null() && result == FcResultMatch {
             // Get the file path from the matched pattern
             let mut file_ptr: *mut FcChar8 = std::ptr::null_mut();
@@ -284,14 +375,14 @@ fn find_font_for_char(_fc: &Fontconfig, c: char) -> Option<PathBuf> {
         } else {
             None
         };
-        
+
         // Cleanup
         if !matched.is_null() {
             FcPatternDestroy(matched);
         }
         FcCharSetDestroy(charset);
         FcPatternDestroy(pat);
-        
+
         font_path
     }
 }
@@ -321,7 +412,7 @@ struct SupersampledCanvas {
 
 impl SupersampledCanvas {
     const FACTOR: usize = 4;
-    
+
     fn new(width: usize, height: usize) -> Self {
         let ss_width = width * Self::FACTOR;
         let ss_height = height * Self::FACTOR;
@@ -333,7 +424,7 @@ impl SupersampledCanvas {
             ss_height,
         }
     }
-    
+
     /// Blend a pixel with alpha compositing
     #[inline]
     fn blend_pixel(&mut self, x: usize, y: usize, alpha: f64) {
@@ -343,7 +434,7 @@ impl SupersampledCanvas {
             self.bitmap[y * self.ss_width + x] = (new_alpha * 255.0) as u8;
         }
     }
-    
+
     /// Draw a thick line along x-axis with y computed by a function
     fn thick_line_h(&mut self, x1: usize, x2: usize, y_at_x: impl Fn(usize) -> f64, thickness: usize) {
         let delta = thickness / 2;
@@ -357,7 +448,7 @@ impl SupersampledCanvas {
             }
         }
     }
-    
+
     /// Draw a thick point (for curve rendering)
     fn thick_point(&mut self, x: f64, y: f64, thickness: f64) {
         let half = thickness / 2.0;
@@ -371,7 +462,7 @@ impl SupersampledCanvas {
             }
         }
     }
-    
+
     /// Fill a corner triangle. Corner specifies which corner of the cell the right angle is in.
     /// inverted=false fills the triangle itself, inverted=true fills everything except the triangle.
     fn fill_corner_triangle(&mut self, corner: Corner, inverted: bool) {
@@ -380,35 +471,35 @@ impl SupersampledCanvas {
         // Use (ss_size - 1) as max coordinate, matching Kitty's approach
         let max_x = (w - 1) as f64;
         let max_y = (h - 1) as f64;
-        
+
         for py in 0..h {
             let y = py as f64;
             for px in 0..w {
                 let x = px as f64;
-                
+
                 // Calculate edge y for this x based on corner
                 // The diagonal goes from one corner to the opposite corner
                 let (edge_y, fill_below) = match corner {
                     // BottomLeft: diagonal from (0, max_y) to (max_x, 0), fill below the line
                     Corner::BottomLeft => (max_y - (max_y / max_x) * x, true),
-                    // TopLeft: diagonal from (0, 0) to (max_x, max_y), fill above the line  
+                    // TopLeft: diagonal from (0, 0) to (max_x, max_y), fill above the line
                     Corner::TopLeft => ((max_y / max_x) * x, false),
                     // BottomRight: diagonal from (0, 0) to (max_x, max_y), fill below the line
                     Corner::BottomRight => ((max_y / max_x) * x, true),
                     // TopRight: diagonal from (0, max_y) to (max_x, 0), fill above the line
                     Corner::TopRight => (max_y - (max_y / max_x) * x, false),
                 };
-                
+
                 let in_triangle = if fill_below { y >= edge_y } else { y <= edge_y };
                 let should_fill = if inverted { !in_triangle } else { in_triangle };
-                
+
                 if should_fill {
                     self.bitmap[py * w + px] = 255;
                 }
             }
         }
     }
-    
+
     /// Fill a powerline arrow triangle pointing left or right.
     /// Uses Kitty's approach: define line equations and fill based on y_limits.
     fn fill_powerline_arrow(&mut self, left: bool, inverted: bool) {
@@ -418,12 +509,12 @@ impl SupersampledCanvas {
         let max_x = (w - 1) as f64;
         let max_y = (h - 1) as f64;
         let mid_y = max_y / 2.0;
-        
+
         for py in 0..h {
             let y = py as f64;
             for px in 0..w {
                 let x = px as f64;
-                
+
                 let (upper_y, lower_y) = if left {
                     // Left-pointing: tip at (0, mid), base from (max_x, 0) to (max_x, max_y)
                     // Upper line: from (max_x, 0) to (0, mid_y) -> y = mid_y/max_x * (max_x - x)
@@ -439,17 +530,17 @@ impl SupersampledCanvas {
                     let lower = max_y - (mid_y / max_x) * x;
                     (upper, lower)
                 };
-                
+
                 let in_shape = y >= upper_y && y <= lower_y;
                 let should_fill = if inverted { !in_shape } else { in_shape };
-                
+
                 if should_fill {
                     self.bitmap[py * w + px] = 255;
                 }
             }
         }
     }
-    
+
     /// Draw powerline arrow outline (chevron shape - two diagonal lines meeting at a point)
     fn stroke_powerline_arrow(&mut self, left: bool, thickness: usize) {
         let w = self.ss_width;
@@ -458,7 +549,7 @@ impl SupersampledCanvas {
         let max_x = (w - 1) as f64;
         let max_y = (h - 1) as f64;
         let mid_y = max_y / 2.0;
-        
+
         if left {
             // Left-pointing chevron <: lines meeting at (0, mid_y)
             self.thick_line_h(0, w, |x| (mid_y / max_x) * (max_x - x as f64), thickness);
@@ -469,7 +560,7 @@ impl SupersampledCanvas {
             self.thick_line_h(0, w, |x| max_y - (mid_y / max_x) * x as f64, thickness);
         }
     }
-    
+
     /// Fill region using a Bezier curve (for "D" shaped powerline semicircles).
     /// The curve goes from top-left to bottom-left, bulging to the right.
     /// Bezier: P0=(0,0), P1=(cx,0), P2=(cx,h), P3=(0,h)
@@ -480,25 +571,25 @@ impl SupersampledCanvas {
         // Use (ss_size - 1) as max coordinate, matching Kitty's approach
         let max_x = (w - 1) as f64;
         let max_y = (h - 1) as f64;
-        
+
         // Control point X: determines how far the curve bulges
         // At t=0.5, bezier_x = 0.75 * cx, so cx = max_x / 0.75 to reach max_x
         let cx = max_x / 0.75;
-        
+
         for py in 0..h {
             let target_y = py as f64;
-            
+
             // Find t where y(t) = target_y
             // y(t) = max_y * t^2 * (3 - 2t)
             let t = Self::find_t_for_bezier_y(max_y, target_y);
-            
+
             // Calculate x at this t
             let u = 1.0 - t;
             let bx = 3.0 * cx * t * u;
-            
+
             // Clamp to cell width
             let x_extent = (bx.round() as usize).min(w - 1);
-            
+
             if left {
                 // Left semicircle: fill from (w - 1 - x_extent) to (w - 1)
                 let start_x = (w - 1).saturating_sub(x_extent);
@@ -513,27 +604,27 @@ impl SupersampledCanvas {
             }
         }
     }
-    
+
     /// Binary search for t where bezier_y(t) ≈ target_y
     /// y(t) = h * t^2 * (3 - 2t), monotonically increasing from 0 to h
     fn find_t_for_bezier_y(h: f64, target_y: f64) -> f64 {
         let mut t_low = 0.0;
         let mut t_high = 1.0;
-        
+
         for _ in 0..20 {
             let t_mid = (t_low + t_high) / 2.0;
             let y = h * t_mid * t_mid * (3.0 - 2.0 * t_mid);
-            
+
             if y < target_y {
                 t_low = t_mid;
             } else {
                 t_high = t_mid;
             }
         }
-        
+
         (t_low + t_high) / 2.0
     }
-    
+
     /// Draw Bezier curve outline (for outline powerline semicircles)
     fn stroke_bezier_d(&mut self, left: bool, thickness: f64) {
         let w = self.ss_width;
@@ -542,28 +633,28 @@ impl SupersampledCanvas {
         let max_x = (w - 1) as f64;
         let max_y = (h - 1) as f64;
         let cx = max_x / 0.75;
-        
+
         let steps = (h * 2) as usize;
         for i in 0..=steps {
             let t = i as f64 / steps as f64;
             let u = 1.0 - t;
             let bx = 3.0 * cx * t * u;
             let by = max_y * t * t * (3.0 - 2.0 * t);
-            
+
             // Clamp bx to cell width
             let bx_clamped = bx.min(max_x);
             let x = if left { max_x - bx_clamped } else { bx_clamped };
             self.thick_point(x, by, thickness);
         }
     }
-    
+
     /// Fill a circle centered in the cell
     fn fill_circle(&mut self, radius_factor: f64) {
         let cx = self.ss_width as f64 / 2.0;
         let cy = self.ss_height as f64 / 2.0;
         let radius = (cx.min(cy) - 0.5) * radius_factor;
         let limit = radius * radius;
-        
+
         for py in 0..self.ss_height {
             for px in 0..self.ss_width {
                 let dx = px as f64 - cx;
@@ -574,13 +665,13 @@ impl SupersampledCanvas {
             }
         }
     }
-    
+
     /// Fill a circle with a specific radius
     fn fill_circle_radius(&mut self, radius: f64) {
         let cx = self.ss_width as f64 / 2.0;
         let cy = self.ss_height as f64 / 2.0;
         let limit = radius * radius;
-        
+
         for py in 0..self.ss_height {
             for px in 0..self.ss_width {
                 let dx = px as f64 - cx;
@@ -591,57 +682,57 @@ impl SupersampledCanvas {
             }
         }
     }
-    
+
     /// Stroke a circle outline with anti-aliasing
     fn stroke_circle(&mut self, radius: f64, line_width: f64) {
         let cx = self.ss_width as f64 / 2.0;
         let cy = self.ss_height as f64 / 2.0;
         let half_thickness = line_width / 2.0;
-        
+
         for py in 0..self.ss_height {
             for px in 0..self.ss_width {
                 let pixel_x = px as f64 + 0.5;
                 let pixel_y = py as f64 + 0.5;
-                
+
                 let dx = pixel_x - cx;
                 let dy = pixel_y - cy;
                 let dist_to_center = (dx * dx + dy * dy).sqrt();
                 let distance = (dist_to_center - radius).abs();
-                
+
                 let alpha = (half_thickness - distance + 0.5).clamp(0.0, 1.0);
                 self.blend_pixel(px, py, alpha);
             }
         }
     }
-    
+
     /// Stroke an arc (partial circle) with anti-aliasing
     fn stroke_arc(&mut self, radius: f64, line_width: f64, start_angle: f64, end_angle: f64) {
         let cx = self.ss_width as f64 / 2.0;
         let cy = self.ss_height as f64 / 2.0;
         let half_thickness = line_width / 2.0;
-        
+
         // Sample points along the arc
         let num_samples = (self.ss_width.max(self.ss_height) * 2) as usize;
         let angle_range = end_angle - start_angle;
-        
+
         for i in 0..=num_samples {
             let t = i as f64 / num_samples as f64;
             let angle = start_angle + angle_range * t;
             let arc_x = cx + radius * angle.cos();
             let arc_y = cy + radius * angle.sin();
-            
+
             // Draw anti-aliased point at this position
             self.stroke_point_aa(arc_x, arc_y, half_thickness);
         }
     }
-    
+
     /// Draw an anti-aliased point
     fn stroke_point_aa(&mut self, x: f64, y: f64, half_thickness: f64) {
         let x_start = ((x - half_thickness - 1.0).max(0.0)) as usize;
         let x_end = ((x + half_thickness + 2.0) as usize).min(self.ss_width);
         let y_start = ((y - half_thickness - 1.0).max(0.0)) as usize;
         let y_end = ((y + half_thickness + 2.0) as usize).min(self.ss_height);
-        
+
         for py in y_start..y_end {
             for px in x_start..x_end {
                 let pixel_x = px as f64 + 0.5;
@@ -649,13 +740,13 @@ impl SupersampledCanvas {
                 let dx = pixel_x - x;
                 let dy = pixel_y - y;
                 let distance = (dx * dx + dy * dy).sqrt();
-                
+
                 let alpha = (half_thickness - distance + 0.5).clamp(0.0, 1.0);
                 self.blend_pixel(px, py, alpha);
             }
         }
     }
-    
+
     /// Downsample to final resolution
     fn downsample(&self, output: &mut [u8]) {
         for y in 0..self.height {
@@ -681,7 +772,7 @@ impl Renderer {
     pub async fn new(window: Arc<winit::window::Window>, config: &Config) -> Self {
         let size = window.inner_size();
         let scale_factor = window.scale_factor();
-        
+
         // Calculate DPI from scale factor
         // Standard assumption: scale_factor 1.0 = 96 DPI (Windows/Linux default)
         // macOS uses 72 as base DPI, but winit normalizes this
@@ -765,20 +856,18 @@ impl Renderer {
             .expect("Failed to load any monospace font")
             .into_boxed_slice();
 
-        let fontdue_font = FontdueFont::from_bytes(
-            &font_data[..],
-            fontdue::FontSettings::default(),
-        )
-        .expect("Failed to parse font with fontdue");
+        // Parse font with ab_glyph for rasterization
+        // SAFETY: We transmute to 'static because font_data lives as long as Renderer.
+        let primary_font: FontRef<'static> = {
+            let font = FontRef::try_from_slice(&font_data)
+                .expect("Failed to parse font with ab_glyph");
+            unsafe { std::mem::transmute(font) }
+        };
 
-        // Initialize fontconfig for dynamic font fallback
-        let fontconfig = Fontconfig::new();
-        if fontconfig.is_none() {
-            log::warn!("Failed to initialize fontconfig - Unicode fallback may not work");
-        }
-        
+        // Fontconfig will be initialized lazily on first fallback font lookup
+
         // Start with empty fallback fonts - will be loaded on-demand via fontconfig
-        let fallback_fonts: Vec<FontdueFont> = Vec::new();
+        let fallback_fonts: Vec<(Box<[u8]>, FontRef<'static>)> = Vec::new();
         let tried_font_paths: HashSet<PathBuf> = HashSet::new();
 
         // Create rustybuzz Face for text shaping (ligatures).
@@ -790,7 +879,7 @@ impl Renderer {
                 .expect("Failed to parse font for shaping");
             unsafe { std::mem::transmute(face) }
         };
-        
+
         // Enable OpenType features for ligatures and contextual alternates
         // These are the standard features used by coding fonts like Fira Code, JetBrains Mono, etc.
         let features = vec![
@@ -801,27 +890,65 @@ impl Renderer {
             // Discretionary ligatures (optional ligatures)
             rustybuzz::Feature::new(Tag::from_bytes(b"dlig"), 1, ..),
         ];
-        let shaping_ctx = ShapingContext { face, features };
+        let shaping_ctx = ShapingContext { face: face.clone(), features };
 
-        // Calculate cell dimensions from font metrics
-        // Scale font size by the display scale factor for crisp rendering
+        // Calculate cell dimensions from font metrics using ab_glyph
+        // 
+        // The config font_size is in pixels. Scale by display scale factor for HiDPI.
+        // Round to integer for pixel-perfect glyph rendering.
         let base_font_size = config.font_size;
-        let font_size = base_font_size * scale_factor as f32;
-        let metrics = fontdue_font.metrics('M', font_size);
-        let cell_width = metrics.advance_width.ceil();
+        let font_size = (base_font_size * scale_factor as f32).round();
         
-        // Use actual font line metrics for cell height (matching Kitty's approach)
-        // Kitty uses the font's "height" metric which is: ascent - descent + line_gap
-        // In fontdue, this is provided as "new_line_size"
-        let cell_height = if let Some(line_metrics) = fontdue_font.horizontal_line_metrics(font_size) {
-            line_metrics.new_line_size
-        } else {
-            // Fallback if no line metrics available
-            font_size * 1.2
-        };
+        let scaled_font = primary_font.as_scaled(font_size);
+        
+        // Get advance width for 'M' (em width)
+        let m_glyph_id = primary_font.glyph_id('M');
+        let cell_width = scaled_font.h_advance(m_glyph_id).round();
 
-        log::info!("Scale factor: {}, font size: {}pt -> {}px, cell: {}x{}", 
-                   scale_factor, base_font_size, font_size, cell_width, cell_height);
+        // Use font line metrics for cell height
+        // ab_glyph's height() = ascent - descent (where descent is negative)
+        let cell_height = scaled_font.height().round();
+        
+        // DEBUG: Compare ab_glyph and rustybuzz advance calculations
+        {
+            let units_per_em = face.units_per_em();
+            let height_unscaled = primary_font.height_unscaled();
+            
+            // ab_glyph uses: scale / height_unscaled as the scale factor for h_advance
+            let ab_scale_factor = font_size / height_unscaled;
+            // We were using: scale / units_per_em (WRONG!)
+            let our_wrong_scale = font_size / units_per_em as f32;
+            
+            // Get 'M' glyph advance from rustybuzz's underlying ttf_parser
+            let _m_glyph_rb = face.glyph_index('M').map(|g| g.0).unwrap_or(0);
+            // Let's shape a single 'M' and see what advance we get
+            let mut buffer = rustybuzz::UnicodeBuffer::new();
+            buffer.push_str("M");
+            let glyph_buffer = rustybuzz::shape(&face, &[], buffer);
+            let positions = glyph_buffer.glyph_positions();
+            if !positions.is_empty() {
+                let rb_advance_font_units = positions[0].x_advance;
+                let rb_advance_px_wrong = rb_advance_font_units as f32 * our_wrong_scale;
+                let rb_advance_px_correct = rb_advance_font_units as f32 * ab_scale_factor;
+                let ab_advance_raw = scaled_font.h_advance(m_glyph_id);
+                eprintln!("DEBUG font metrics:");
+                eprintln!("  font_size = {} px", font_size);
+                eprintln!("  units_per_em = {}", units_per_em);
+                eprintln!("  height_unscaled = {} (ascent - descent)", height_unscaled);
+                eprintln!("  ab_glyph scale factor = font_size / height_unscaled = {}", ab_scale_factor);
+                eprintln!("  our WRONG scale factor = font_size / units_per_em = {}", our_wrong_scale);
+                eprintln!("  ab_glyph 'M' h_advance (raw) = {}", ab_advance_raw);
+                eprintln!("  ab_glyph 'M' h_advance (rounded) = {}", cell_width);
+                eprintln!("  rustybuzz 'M' x_advance (font units) = {}", rb_advance_font_units);
+                eprintln!("  rustybuzz 'M' x_advance (WRONG pixels) = {}", rb_advance_px_wrong);
+                eprintln!("  rustybuzz 'M' x_advance (CORRECT pixels) = {}", rb_advance_px_correct);
+            }
+        }
+        
+        // Calculate the correct scale factor for converting font units to pixels.
+        // This matches ab_glyph's calculation: scale / height_unscaled
+        // where height_unscaled = ascent - descent (the font's natural line height).
+        let font_units_to_px = font_size / primary_font.height_unscaled();
 
         // Create atlas texture
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -937,13 +1064,13 @@ impl Renderer {
         // ═══════════════════════════════════════════════════════════════════════════════
         // EDGE GLOW PIPELINE SETUP
         // ═══════════════════════════════════════════════════════════════════════════════
-        
+
         // Create edge glow shader
         let edge_glow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Edge Glow Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
-        
+
         // Create uniform buffer for edge glow parameters
         let edge_glow_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Edge Glow Uniform Buffer"),
@@ -951,7 +1078,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        
+
         // Create bind group layout for edge glow
         let edge_glow_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Edge Glow Bind Group Layout"),
@@ -968,7 +1095,7 @@ impl Renderer {
                 },
             ],
         });
-        
+
         // Create bind group for edge glow
         let edge_glow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Edge Glow Bind Group"),
@@ -980,14 +1107,14 @@ impl Renderer {
                 },
             ],
         });
-        
+
         // Create pipeline layout for edge glow
         let edge_glow_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Edge Glow Pipeline Layout"),
             bind_group_layouts: &[&edge_glow_bind_group_layout],
             push_constant_ranges: &[],
         });
-        
+
         // Create edge glow render pipeline
         let edge_glow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Edge Glow Pipeline"),
@@ -1011,6 +1138,115 @@ impl Renderer {
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // IMAGE PIPELINE SETUP (Kitty Graphics Protocol)
+        // ═══════════════════════════════════════════════════════════════════════════════
+
+        // Create image shader
+        let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Image Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("image_shader.wgsl").into()),
+        });
+
+        // Create sampler for images (linear filtering for smooth scaling)
+        let image_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Image Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // Create bind group layout for images
+        let image_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Image Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        // Create pipeline layout for images
+        let image_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Image Pipeline Layout"),
+            bind_group_layouts: &[&image_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        // Create image render pipeline
+        let image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Image Pipeline"),
+            layout: Some(&image_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &image_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[], // Quad generated in shader
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &image_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_config.format,
+                    // Premultiplied alpha blending (shader outputs premultiplied)
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: None,
@@ -1052,18 +1288,26 @@ impl Renderer {
             edge_glow_pipeline,
             edge_glow_bind_group,
             edge_glow_uniform_buffer,
+            image_pipeline,
+            image_bind_group_layout,
+            image_sampler,
+            image_textures: HashMap::new(),
             atlas_texture,
             atlas_data: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE) as usize],
             atlas_dirty: false,
             font_data,
-            fontdue_font,
+            primary_font,
             fallback_fonts,
-            fontconfig,
+            fontconfig: OnceCell::new(),
             tried_font_paths,
             shaping_ctx,
             char_cache: HashMap::new(),
             ligature_cache: HashMap::new(),
             glyph_cache: HashMap::new(),
+            text_run_cache: HashMap::new(),
+            // Initial canvas size - will be resized as needed
+            canvas_buffer: vec![0u8; (cell_width as usize * 16) * cell_height as usize],
+            canvas_size: (cell_width as u32 * 16, cell_height as u32),
             atlas_cursor_x: 0,
             atlas_cursor_y: 0,
             atlas_row_height: 0,
@@ -1075,6 +1319,7 @@ impl Renderer {
             scale_factor,
             dpi,
             font_size,
+            font_units_to_px,
             cell_width,
             cell_height,
             width: size.width,
@@ -1108,7 +1353,7 @@ impl Renderer {
             _ => 0.0,
         }
     }
-    
+
     /// Sets the current selection range for highlighting.
     /// Pass None to clear the selection.
     /// The selection is specified as (start_col, start_row, end_col, end_row) in normalized order.
@@ -1134,14 +1379,14 @@ impl Renderer {
         let rows = (available_height / self.cell_height).floor() as usize;
         (cols.max(1), rows.max(1))
     }
-    
+
     /// Converts a pixel position to a terminal cell position.
     /// Returns None if the position is outside the terminal area (e.g., in the tab bar).
     pub fn pixel_to_cell(&self, x: f64, y: f64) -> Option<(usize, usize)> {
         let terminal_y_offset = self.terminal_y_offset();
         let tab_bar_height = self.tab_bar_height();
         let height = self.height as f32;
-        
+
         // Check if position is in the tab bar area (which could be at top or bottom)
         match self.tab_bar_position {
             TabBarPosition::Top => {
@@ -1156,21 +1401,21 @@ impl Renderer {
             }
             TabBarPosition::Hidden => {}
         }
-        
+
         // Adjust y to be relative to terminal area
         let terminal_y = y as f32 - terminal_y_offset;
-        
+
         // Calculate cell position
         let col = (x as f32 / self.cell_width).floor() as usize;
         let row = (terminal_y / self.cell_height).floor() as usize;
-        
+
         // Get terminal dimensions to clamp
         let (max_cols, max_rows) = self.terminal_size();
-        
+
         // Clamp to valid range
         let col = col.min(max_cols.saturating_sub(1));
         let row = row.min(max_rows.saturating_sub(1));
-        
+
         Some((col, row))
     }
 
@@ -1185,19 +1430,22 @@ impl Renderer {
         let old_cell_height = self.cell_height;
 
         self.scale_factor = new_scale;
-        self.font_size = self.base_font_size * new_scale as f32;
+        self.dpi = 96.0 * new_scale;
+        
+        // Font size in pixels, rounded for pixel-perfect rendering
+        self.font_size = (self.base_font_size * new_scale as f32).round();
 
-        // Recalculate cell dimensions
-        let metrics = self.fontdue_font.metrics('M', self.font_size);
-        self.cell_width = metrics.advance_width.ceil();
-        self.cell_height = if let Some(line_metrics) = self.fontdue_font.horizontal_line_metrics(self.font_size) {
-            line_metrics.new_line_size
-        } else {
-            self.font_size * 1.2
-        };
+        // Recalculate cell dimensions using ab_glyph
+        let scaled_font = self.primary_font.as_scaled(self.font_size);
+        let m_glyph_id = self.primary_font.glyph_id('M');
+        self.cell_width = scaled_font.h_advance(m_glyph_id).round();
+        self.cell_height = scaled_font.height().round();
+        
+        // Update the font units to pixels scale factor
+        self.font_units_to_px = self.font_size / self.primary_font.height_unscaled();
 
         log::info!(
-            "Scale factor changed to {}: font {}pt -> {}px, cell: {}x{}",
+            "Scale factor changed to {}: font {}px -> {}px, cell: {}x{}",
             new_scale, self.base_font_size, self.font_size, self.cell_width, self.cell_height
         );
 
@@ -1205,6 +1453,64 @@ impl Renderer {
         self.char_cache.clear();
         self.ligature_cache.clear();
         self.glyph_cache.clear();
+        self.text_run_cache.clear();
+
+        // Reset atlas
+        self.atlas_cursor_x = 0;
+        self.atlas_cursor_y = 0;
+        self.atlas_row_height = 0;
+        self.atlas_data.fill(0);
+        self.atlas_dirty = true;
+
+        // Return true if cell dimensions changed
+        (self.cell_width - old_cell_width).abs() > 0.01
+            || (self.cell_height - old_cell_height).abs() > 0.01
+    }
+
+    /// Set the background opacity for transparent terminal rendering.
+    pub fn set_background_opacity(&mut self, opacity: f32) {
+        self.background_opacity = opacity.clamp(0.0, 1.0);
+    }
+
+    /// Set the tab bar position.
+    pub fn set_tab_bar_position(&mut self, position: TabBarPosition) {
+        self.tab_bar_position = position;
+    }
+
+    /// Set the base font size and recalculate cell dimensions.
+    /// Returns true if the cell dimensions changed (terminal needs resize).
+    pub fn set_font_size(&mut self, size: f32) -> bool {
+        if (self.base_font_size - size).abs() < 0.01 {
+            return false;
+        }
+
+        let old_cell_width = self.cell_width;
+        let old_cell_height = self.cell_height;
+
+        self.base_font_size = size;
+        
+        // Font size in pixels, rounded for pixel-perfect rendering
+        self.font_size = (size * self.scale_factor as f32).round();
+
+        // Recalculate cell dimensions using ab_glyph
+        let scaled_font = self.primary_font.as_scaled(self.font_size);
+        let m_glyph_id = self.primary_font.glyph_id('M');
+        self.cell_width = scaled_font.h_advance(m_glyph_id).round();
+        self.cell_height = scaled_font.height().round();
+        
+        // Update the font units to pixels scale factor
+        self.font_units_to_px = self.font_size / self.primary_font.height_unscaled();
+
+        log::info!(
+            "Font size changed to {}px -> {}px, cell: {}x{}",
+            size, self.font_size, self.cell_width, self.cell_height
+        );
+
+        // Clear all glyph caches - they were rendered at the old size
+        self.char_cache.clear();
+        self.ligature_cache.clear();
+        self.glyph_cache.clear();
+        self.text_run_cache.clear();
 
         // Reset atlas
         self.atlas_cursor_x = 0;
@@ -1221,7 +1527,7 @@ impl Renderer {
     // ═══════════════════════════════════════════════════════════════════════════
     // BOX DRAWING HELPER FUNCTIONS
     // ═══════════════════════════════════════════════════════════════════════════
-    
+
     /// Calculate line thickness based on DPI and scale, similar to Kitty's thickness_as_float.
     /// Level 0 = hairline, 1 = light, 2 = medium, 3 = heavy
     fn box_thickness(&self, level: usize) -> f64 {
@@ -1240,7 +1546,7 @@ impl Renderer {
         // Geometric Shapes (subset): U+25A0-U+25FF (circles, arcs, triangles)
         // Braille Patterns: U+2800-U+28FF
         // Powerline Symbols: U+E0B0-U+E0BF
-        (0x2500..=0x257F).contains(&cp) 
+        (0x2500..=0x257F).contains(&cp)
             || (0x2580..=0x259F).contains(&cp)
             || (0x25A0..=0x25FF).contains(&cp)
             || (0x2800..=0x28FF).contains(&cp)
@@ -1254,12 +1560,12 @@ impl Renderer {
         let h = self.cell_height.ceil() as usize;
         let mut bitmap = vec![0u8; w * h];
         let mut supersampled = false;
-        
+
         let mid_x = w / 2;
         let mid_y = h / 2;
         let light = 2.max((self.font_size / 8.0).round() as usize);  // 2px minimum, scales with font
         let heavy = light * 2;  // 4px minimum
-        
+
         // For double lines
         let double_gap = light + 2;
         let double_off = double_gap / 2;
@@ -1299,11 +1605,11 @@ impl Renderer {
             // ═══════════════════════════════════════════════════════════════
             // LIGHT BOX DRAWING (single lines)
             // ═══════════════════════════════════════════════════════════════
-            
+
             // Horizontal and vertical lines
             '─' => hline(&mut bitmap, 0, w, mid_y, light),
             '│' => vline(&mut bitmap, 0, h, mid_x, light),
-            
+
             // Light corners
             '┌' => {
                 hline(&mut bitmap, mid_x, w, mid_y, light);
@@ -1321,7 +1627,7 @@ impl Renderer {
                 hline(&mut bitmap, 0, mid_x + 1, mid_y, light);
                 vline(&mut bitmap, 0, mid_y + 1, mid_x, light);
             }
-            
+
             // Light T-junctions
             '├' => {
                 vline(&mut bitmap, 0, h, mid_x, light);
@@ -1339,7 +1645,7 @@ impl Renderer {
                 hline(&mut bitmap, 0, w, mid_y, light);
                 vline(&mut bitmap, 0, mid_y + 1, mid_x, light);
             }
-            
+
             // Light cross
             '┼' => {
                 hline(&mut bitmap, 0, w, mid_y, light);
@@ -1349,10 +1655,10 @@ impl Renderer {
             // ═══════════════════════════════════════════════════════════════
             // HEAVY BOX DRAWING (bold lines)
             // ═══════════════════════════════════════════════════════════════
-            
+
             '━' => hline(&mut bitmap, 0, w, mid_y, heavy),
             '┃' => vline(&mut bitmap, 0, h, mid_x, heavy),
-            
+
             // Heavy corners
             '┏' => {
                 hline(&mut bitmap, mid_x, w, mid_y, heavy);
@@ -1370,7 +1676,7 @@ impl Renderer {
                 hline(&mut bitmap, 0, mid_x + 1, mid_y, heavy);
                 vline(&mut bitmap, 0, mid_y + 1, mid_x, heavy);
             }
-            
+
             // Heavy T-junctions
             '┣' => {
                 vline(&mut bitmap, 0, h, mid_x, heavy);
@@ -1388,7 +1694,7 @@ impl Renderer {
                 hline(&mut bitmap, 0, w, mid_y, heavy);
                 vline(&mut bitmap, 0, mid_y + 1, mid_x, heavy);
             }
-            
+
             // Heavy cross
             '╋' => {
                 hline(&mut bitmap, 0, w, mid_y, heavy);
@@ -1398,7 +1704,7 @@ impl Renderer {
             // ═══════════════════════════════════════════════════════════════
             // MIXED LIGHT/HEAVY
             // ═══════════════════════════════════════════════════════════════
-            
+
             // Light horizontal, heavy vertical corners
             '┎' => {
                 hline(&mut bitmap, mid_x, w, mid_y, light);
@@ -1416,7 +1722,7 @@ impl Renderer {
                 hline(&mut bitmap, 0, mid_x + 1, mid_y, light);
                 vline(&mut bitmap, 0, mid_y + 1, mid_x, heavy);
             }
-            
+
             // Heavy horizontal, light vertical corners
             '┍' => {
                 hline(&mut bitmap, mid_x, w, mid_y, heavy);
@@ -1616,7 +1922,7 @@ impl Renderer {
             // ═══════════════════════════════════════════════════════════════
             // DOUBLE LINES
             // ═══════════════════════════════════════════════════════════════
-            
+
             '═' => {
                 hline(&mut bitmap, 0, w, mid_y.saturating_sub(double_off), light);
                 hline(&mut bitmap, 0, w, mid_y + double_off, light);
@@ -1625,7 +1931,7 @@ impl Renderer {
                 vline(&mut bitmap, 0, h, mid_x.saturating_sub(double_off), light);
                 vline(&mut bitmap, 0, h, mid_x + double_off, light);
             }
-            
+
             // Double corners
             '╔' => {
                 hline(&mut bitmap, mid_x, w, mid_y.saturating_sub(double_off), light);
@@ -1651,7 +1957,7 @@ impl Renderer {
                 vline(&mut bitmap, 0, mid_y + 1, mid_x + double_off, light);
                 vline(&mut bitmap, 0, mid_y + double_off + 1, mid_x.saturating_sub(double_off), light);
             }
-            
+
             // Double T-junctions
             '╠' => {
                 vline(&mut bitmap, 0, h, mid_x.saturating_sub(double_off), light);
@@ -1681,7 +1987,7 @@ impl Renderer {
                 vline(&mut bitmap, 0, mid_y.saturating_sub(double_off) + 1, mid_x.saturating_sub(double_off), light);
                 vline(&mut bitmap, 0, mid_y.saturating_sub(double_off) + 1, mid_x + double_off, light);
             }
-            
+
             // Double cross
             '╬' => {
                 vline(&mut bitmap, 0, mid_y.saturating_sub(double_off) + 1, mid_x.saturating_sub(double_off), light);
@@ -1697,7 +2003,7 @@ impl Renderer {
             // ═══════════════════════════════════════════════════════════════
             // SINGLE/DOUBLE MIXED
             // ═══════════════════════════════════════════════════════════════
-            
+
             // Single horizontal, double vertical corners
             '╒' => {
                 hline(&mut bitmap, mid_x + double_off, w, mid_y, light);
@@ -1735,7 +2041,7 @@ impl Renderer {
                 hline(&mut bitmap, 0, mid_x + 1, mid_y, light);
                 vline(&mut bitmap, 0, mid_y + 1, mid_x, light);
             }
-            
+
             // Mixed T-junctions
             '╞' => {
                 vline(&mut bitmap, 0, h, mid_x.saturating_sub(double_off), light);
@@ -1777,7 +2083,7 @@ impl Renderer {
                 vline(&mut bitmap, 0, mid_y + 1, mid_x.saturating_sub(double_off), light);
                 vline(&mut bitmap, 0, mid_y + 1, mid_x + double_off, light);
             }
-            
+
             // Mixed crosses
             '╪' => {
                 hline(&mut bitmap, 0, w, mid_y.saturating_sub(double_off), light);
@@ -1795,39 +2101,39 @@ impl Renderer {
             // ═══════════════════════════════════════════════════════════════
             // ROUNDED CORNERS (using SDF like Kitty, with anti-aliasing)
             // ═══════════════════════════════════════════════════════════════
-            
+
             '╭' | '╮' | '╯' | '╰' => {
                 // Kitty-style rounded corner using signed distance field
                 // Translated directly from kitty/decorations.c rounded_corner()
-                
+
                 // hline_limits: for a horizontal line at y with thickness t,
                 // returns range [y - t/2, y - t/2 + t]
                 let hori_line_start = mid_y.saturating_sub(light / 2);
                 let hori_line_end = (hori_line_start + light).min(h);
                 let hori_line_height = hori_line_end - hori_line_start;
-                
+
                 // vline_limits: for a vertical line at x with thickness t,
                 // returns range [x - t/2, x - t/2 + t]
                 let vert_line_start = mid_x.saturating_sub(light / 2);
                 let vert_line_end = (vert_line_start + light).min(w);
                 let vert_line_width = vert_line_end - vert_line_start;
-                
+
                 // adjusted_Hx/Hy: center of the line in each direction
                 let adjusted_hx = vert_line_start as f64 + vert_line_width as f64 / 2.0;
                 let adjusted_hy = hori_line_start as f64 + hori_line_height as f64 / 2.0;
-                
+
                 let stroke = (hori_line_height.max(vert_line_width)) as f64;
                 let corner_radius = adjusted_hx.min(adjusted_hy);
                 let bx = adjusted_hx - corner_radius;
                 let by = adjusted_hy - corner_radius;
-                
+
                 let aa_corner = 0.5;  // anti-aliasing amount (kitty uses supersample_factor * 0.5)
                 let half_stroke = 0.5 * stroke;
-                
+
                 // Determine shifts based on corner type (matching Kitty's Edge flags)
                 // RIGHT_EDGE = 4, TOP_EDGE = 2
                 // ╭ = TOP_LEFT (top-left corner, line goes right and down)
-                // ╮ = TOP_RIGHT (top-right corner, line goes left and down)  
+                // ╮ = TOP_RIGHT (top-right corner, line goes left and down)
                 // ╰ = BOTTOM_LEFT (bottom-left corner, line goes right and up)
                 // ╯ = BOTTOM_RIGHT (bottom-right corner, line goes left and up)
                 let (is_right, is_top) = match c {
@@ -1837,10 +2143,10 @@ impl Renderer {
                     '╯' => (true, false),   // BOTTOM_RIGHT
                     _ => unreachable!(),
                 };
-                
+
                 let x_shift = if is_right { adjusted_hx } else { -adjusted_hx };
                 let y_shift = if is_top { -adjusted_hy } else { adjusted_hy };
-                
+
                 // Smoothstep for anti-aliasing
                 let smoothstep = |edge0: f64, edge1: f64, x: f64| -> f64 {
                     if edge0 == edge1 {
@@ -1849,26 +2155,26 @@ impl Renderer {
                     let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
                     t * t * (3.0 - 2.0 * t)
                 };
-                
+
                 for py in 0..h {
                     let sample_y = py as f64 + y_shift + 0.5;
                     let pos_y = sample_y - adjusted_hy;
-                    
+
                     for px in 0..w {
                         let sample_x = px as f64 + x_shift + 0.5;
                         let pos_x = sample_x - adjusted_hx;
-                        
+
                         let qx = pos_x.abs() - bx;
                         let qy = pos_y.abs() - by;
                         let dx = if qx > 0.0 { qx } else { 0.0 };
                         let dy = if qy > 0.0 { qy } else { 0.0 };
                         let dist = (dx * dx + dy * dy).sqrt() + qx.max(qy).min(0.0) - corner_radius;
-                        
+
                         let aa = if qx > 1e-7 && qy > 1e-7 { aa_corner } else { 0.0 };
                         let outer = half_stroke - dist;
                         let inner = -half_stroke - dist;
                         let alpha = smoothstep(-aa, aa, outer) - smoothstep(-aa, aa, inner);
-                        
+
                         if alpha <= 0.0 {
                             continue;
                         }
@@ -1884,7 +2190,7 @@ impl Renderer {
             // ═══════════════════════════════════════════════════════════════
             // DASHED/DOTTED LINES
             // ═══════════════════════════════════════════════════════════════
-            
+
             '┄' => {
                 let seg = w / 8;
                 for i in 0..4 {
@@ -1949,7 +2255,7 @@ impl Renderer {
                     vline(&mut bitmap, y1, y2, mid_x, heavy);
                 }
             }
-            
+
             // Double dashed
             '╌' => {
                 let seg = w / 4;
@@ -1975,7 +2281,7 @@ impl Renderer {
             // ═══════════════════════════════════════════════════════════════
             // HALF LINES (line to edge)
             // ═══════════════════════════════════════════════════════════════
-            
+
             '╴' => hline(&mut bitmap, 0, mid_x + 1, mid_y, light),
             '╵' => vline(&mut bitmap, 0, mid_y + 1, mid_x, light),
             '╶' => hline(&mut bitmap, mid_x, w, mid_y, light),
@@ -1984,7 +2290,7 @@ impl Renderer {
             '╹' => vline(&mut bitmap, 0, mid_y + 1, mid_x, heavy),
             '╺' => hline(&mut bitmap, mid_x, w, mid_y, heavy),
             '╻' => vline(&mut bitmap, mid_y, h, mid_x, heavy),
-            
+
             // Mixed half lines
             '╼' => {
                 hline(&mut bitmap, 0, mid_x + 1, mid_y, light);
@@ -2006,7 +2312,7 @@ impl Renderer {
             // ═══════════════════════════════════════════════════════════════
             // DIAGONAL LINES
             // ═══════════════════════════════════════════════════════════════
-            
+
             '╱' => {
                 for i in 0..w.max(h) {
                     let x = w.saturating_sub(1).saturating_sub(i * w / h.max(1));
@@ -2047,7 +2353,7 @@ impl Renderer {
             // ═══════════════════════════════════════════════════════════════
             // BLOCK ELEMENTS (U+2580-U+259F)
             // ═══════════════════════════════════════════════════════════════
-            
+
             '▀' => fill_rect(&mut bitmap, 0, 0, w, h / 2),
             '▁' => fill_rect(&mut bitmap, 0, h * 7 / 8, w, h),
             '▂' => fill_rect(&mut bitmap, 0, h * 3 / 4, w, h),
@@ -2065,7 +2371,7 @@ impl Renderer {
             '▎' => fill_rect(&mut bitmap, 0, 0, w / 4, h),
             '▏' => fill_rect(&mut bitmap, 0, 0, w / 8, h),
             '▐' => fill_rect(&mut bitmap, w / 2, 0, w, h),
-            
+
             // Shades
             '░' => {
                 for y in 0..h {
@@ -2088,11 +2394,11 @@ impl Renderer {
                     }
                 }
             }
-            
+
             // Right half blocks and upper eighth
             '▕' => fill_rect(&mut bitmap, w * 7 / 8, 0, w, h),
             '▔' => fill_rect(&mut bitmap, 0, 0, w, h / 8), // Upper one eighth block
-            
+
             // Quadrants
             '▖' => fill_rect(&mut bitmap, 0, h / 2, w / 2, h),
             '▗' => fill_rect(&mut bitmap, w / 2, h / 2, w, h),
@@ -2127,7 +2433,7 @@ impl Renderer {
             // BRAILLE PATTERNS (U+2800-U+28FF)
             // Uses Kitty's distribute_dots algorithm for proper spacing
             // ═══════════════════════════════════════════════════════════════
-            
+
             c if (0x2800..=0x28FF).contains(&(c as u32)) => {
                 let which = (c as u32 - 0x2800) as u8;
                 if which != 0 {
@@ -2136,7 +2442,7 @@ impl Renderer {
                     // For vertical: 4 dots down height
                     let num_x_dots = 2usize;
                     let num_y_dots = 4usize;
-                    
+
                     // distribute_dots for x (2 dots)
                     let dot_width = 1.max(w / (2 * num_x_dots));
                     let mut x_gaps = [dot_width; 2];
@@ -2149,7 +2455,7 @@ impl Renderer {
                     }
                     x_gaps[0] /= 2;
                     let x_summed: [usize; 2] = [x_gaps[0], x_gaps[0] + x_gaps[1]];
-                    
+
                     // distribute_dots for y (4 dots)
                     let dot_height = 1.max(h / (2 * num_y_dots));
                     let mut y_gaps = [dot_height; 4];
@@ -2167,7 +2473,7 @@ impl Renderer {
                         y_gaps[0] + y_gaps[1] + y_gaps[2],
                         y_gaps[0] + y_gaps[1] + y_gaps[2] + y_gaps[3],
                     ];
-                    
+
                     // Draw braille dots as rectangles (matching Kitty)
                     // Bit mapping: 0=dot1, 1=dot2, 2=dot3, 3=dot4, 4=dot5, 5=dot6, 6=dot7, 7=dot8
                     // Layout:  col 0  col 1
@@ -2188,10 +2494,10 @@ impl Renderer {
                                 3 | 6 => 2,
                                 _ => 3,
                             };
-                            
+
                             let x_start = x_summed[col] + col * dot_width;
                             let y_start = y_summed[row] + row * dot_height;
-                            
+
                             if y_start < h && x_start < w {
                                 let x_end = (x_start + dot_width).min(w);
                                 let y_end = (y_start + dot_height).min(h);
@@ -2217,7 +2523,7 @@ impl Renderer {
                 canvas.fill_powerline_arrow(false, false);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // E0B1: Right-pointing chevron (outline)
             '\u{E0B1}' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
@@ -2225,14 +2531,14 @@ impl Renderer {
                 canvas.stroke_powerline_arrow(false, thickness);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // E0B2: Left-pointing solid triangle
             '\u{E0B2}' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
                 canvas.fill_powerline_arrow(true, false);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // E0B3: Left-pointing chevron (outline)
             '\u{E0B3}' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
@@ -2240,14 +2546,14 @@ impl Renderer {
                 canvas.stroke_powerline_arrow(true, thickness);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // E0B4: Right semicircle (filled)
             '\u{E0B4}' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
                 canvas.fill_bezier_d(false);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // E0B5: Right semicircle (outline)
             '\u{E0B5}' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
@@ -2255,14 +2561,14 @@ impl Renderer {
                 canvas.stroke_bezier_d(false, thickness);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // E0B6: Left semicircle (filled)
             '\u{E0B6}' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
                 canvas.fill_bezier_d(true);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // E0B7: Left semicircle (outline)
             '\u{E0B7}' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
@@ -2270,7 +2576,7 @@ impl Renderer {
                 canvas.stroke_bezier_d(true, thickness);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // E0B8-E0BF: Corner triangles
             '\u{E0B8}' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
@@ -2316,14 +2622,14 @@ impl Renderer {
             // ═══════════════════════════════════════════════════════════════
             // GEOMETRIC SHAPES - Circles, Arcs, and Triangles (U+25A0-U+25FF)
             // ═══════════════════════════════════════════════════════════════
-            
+
             // ● U+25CF: Black circle (filled)
             '●' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
                 canvas.fill_circle(1.0);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // ○ U+25CB: White circle (outline)
             '○' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
@@ -2335,7 +2641,7 @@ impl Renderer {
                 canvas.stroke_circle(radius, line_width);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // ◉ U+25C9: Fisheye (filled center + circle outline)
             '◉' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
@@ -2343,18 +2649,18 @@ impl Renderer {
                 let cy = canvas.ss_height as f64 / 2.0;
                 let radius = cx.min(cy);
                 let central_radius = (2.0 / 3.0) * radius;
-                
+
                 // Fill central circle
                 canvas.fill_circle_radius(central_radius);
-                
+
                 // Draw outer ring
                 let line_width = (SupersampledCanvas::FACTOR as f64).max((radius - central_radius) / 2.5);
                 let outer_radius = 0.0_f64.max(cx.min(cy) - line_width / 2.0);
                 canvas.stroke_circle(outer_radius, line_width);
-                
+
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // ◜ U+25DC: Upper left quadrant circular arc (180° to 270°)
             '◜' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
@@ -2366,7 +2672,7 @@ impl Renderer {
                 canvas.stroke_arc(radius, line_width, std::f64::consts::PI, 3.0 * std::f64::consts::PI / 2.0);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // ◝ U+25DD: Upper right quadrant circular arc (270° to 360°)
             '◝' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
@@ -2378,7 +2684,7 @@ impl Renderer {
                 canvas.stroke_arc(radius, line_width, 3.0 * std::f64::consts::PI / 2.0, 2.0 * std::f64::consts::PI);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // ◞ U+25DE: Lower right quadrant circular arc (0° to 90°)
             '◞' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
@@ -2390,7 +2696,7 @@ impl Renderer {
                 canvas.stroke_arc(radius, line_width, 0.0, std::f64::consts::PI / 2.0);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // ◟ U+25DF: Lower left quadrant circular arc (90° to 180°)
             '◟' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
@@ -2402,7 +2708,7 @@ impl Renderer {
                 canvas.stroke_arc(radius, line_width, std::f64::consts::PI / 2.0, std::f64::consts::PI);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // ◠ U+25E0: Upper half arc (180° to 360°)
             '◠' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
@@ -2414,7 +2720,7 @@ impl Renderer {
                 canvas.stroke_arc(radius, line_width, std::f64::consts::PI, 2.0 * std::f64::consts::PI);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // ◡ U+25E1: Lower half arc (0° to 180°)
             '◡' => {
                 let mut canvas = SupersampledCanvas::new(w, h);
@@ -2426,7 +2732,7 @@ impl Renderer {
                 canvas.stroke_arc(radius, line_width, 0.0, std::f64::consts::PI);
                 canvas.downsample(&mut bitmap); supersampled = true;
             }
-            
+
             // Fall through for unimplemented characters
             _ => return None,
         }
@@ -2508,60 +2814,77 @@ impl Renderer {
             }
         }
 
-        // Try primary font first, then fallbacks
-        let (metrics, bitmap) = {
-            // Check if primary font has this glyph
-            let glyph_idx = self.fontdue_font.lookup_glyph_index(c);
-            if glyph_idx != 0 {
-                self.fontdue_font.rasterize(c, self.font_size)
-            } else {
-                // Try already-loaded fallback fonts first
-                let mut result = None;
-                for fallback in &self.fallback_fonts {
-                    let fb_glyph_idx = fallback.lookup_glyph_index(c);
-                    if fb_glyph_idx != 0 {
-                        result = Some(fallback.rasterize(c, self.font_size));
-                        break;
-                    }
+        // Try primary font first, then fallbacks using ab_glyph
+        let glyph_id = self.primary_font.glyph_id(c);
+        
+        // Rasterize glyph data: (width, height, bitmap, offset_x, offset_y)
+        let raster_result: Option<(u32, u32, Vec<u8>, f32, f32)> = if glyph_id.0 != 0 {
+            // Primary font has this glyph
+            self.rasterize_glyph_ab(&self.primary_font.clone(), glyph_id)
+        } else {
+            // Try already-loaded fallback fonts first
+            let mut result = None;
+            for (_, fallback_font) in &self.fallback_fonts {
+                let fb_glyph_id = fallback_font.glyph_id(c);
+                if fb_glyph_id.0 != 0 {
+                    result = self.rasterize_glyph_ab(&fallback_font.clone(), fb_glyph_id);
+                    break;
                 }
-                
-                // If no cached fallback has the glyph, use fontconfig to find one
-                if result.is_none() {
-                    if let Some(ref fc) = self.fontconfig {
-                        // Query fontconfig for a font that has this character
-                        if let Some(path) = find_font_for_char(fc, c) {
-                            // Only load if we haven't tried this path before
-                            if !self.tried_font_paths.contains(&path) {
-                                self.tried_font_paths.insert(path.clone());
-                                
-                                if let Ok(data) = std::fs::read(&path) {
-                                    if let Ok(font) = FontdueFont::from_bytes(
-                                        data.as_slice(),
-                                        fontdue::FontSettings::default(),
-                                    ) {
-                                        log::debug!("Loaded fallback font via fontconfig: {}", path.display());
-                                        
-                                        // Check if this font actually has the glyph
-                                        let fb_glyph_idx = font.lookup_glyph_index(c);
-                                        if fb_glyph_idx != 0 {
-                                            result = Some(font.rasterize(c, self.font_size));
-                                        }
-                                        
-                                        // Cache the font for future use
-                                        self.fallback_fonts.push(font);
+            }
+
+            // If no cached fallback has the glyph, use fontconfig to find one
+            if result.is_none() {
+                // Lazy-initialize fontconfig on first use
+                let fc = self.fontconfig.get_or_init(|| {
+                    log::debug!("Initializing fontconfig for fallback font lookup");
+                    Fontconfig::new()
+                });
+                if let Some(fc) = fc {
+                    // Query fontconfig for a font that has this character
+                    if let Some(path) = find_font_for_char(fc, c) {
+                        // Only load if we haven't tried this path before
+                        if !self.tried_font_paths.contains(&path) {
+                            self.tried_font_paths.insert(path.clone());
+
+                            if let Ok(data) = std::fs::read(&path) {
+                                let data: Box<[u8]> = data.into_boxed_slice();
+                                if let Ok(font) = FontRef::try_from_slice(&data) {
+                                    log::debug!("Loaded fallback font via fontconfig: {}", path.display());
+
+                                    // Check if this font actually has the glyph
+                                    let fb_glyph_id = font.glyph_id(c);
+                                    if fb_glyph_id.0 != 0 {
+                                        result = self.rasterize_glyph_ab(&font, fb_glyph_id);
                                     }
+
+                                    // Cache the font for future use
+                                    // SAFETY: We're storing data alongside the FontRef that borrows it
+                                    let font_static: FontRef<'static> = unsafe { std::mem::transmute(font) };
+                                    self.fallback_fonts.push((data, font_static));
                                 }
                             }
                         }
                     }
                 }
-                
-                // Use primary font's .notdef if no fallback has the glyph
-                result.unwrap_or_else(|| self.fontdue_font.rasterize(c, self.font_size))
             }
+
+            // Use primary font's .notdef if no fallback has the glyph
+            result.or_else(|| self.rasterize_glyph_ab(&self.primary_font.clone(), glyph_id))
         };
 
-        if bitmap.is_empty() || metrics.width == 0 || metrics.height == 0 {
+        // Handle rasterization result
+        let Some((glyph_width, glyph_height, bitmap, offset_x, offset_y)) = raster_result else {
+            // Empty glyph (e.g., space)
+            let info = GlyphInfo {
+                uv: [0.0, 0.0, 0.0, 0.0],
+                offset: [0.0, 0.0],
+                size: [0.0, 0.0],
+            };
+            self.char_cache.insert(c, info);
+            return info;
+        };
+
+        if bitmap.is_empty() || glyph_width == 0 || glyph_height == 0 {
             // Empty glyph (e.g., space)
             let info = GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
@@ -2571,9 +2894,6 @@ impl Renderer {
             self.char_cache.insert(c, info);
             return info;
         }
-
-        let glyph_width = metrics.width as u32;
-        let glyph_height = metrics.height as u32;
 
         // Check if we need to move to next row
         if self.atlas_cursor_x + glyph_width > ATLAS_SIZE {
@@ -2595,9 +2915,9 @@ impl Renderer {
         }
 
         // Copy bitmap to atlas
-        for y in 0..metrics.height {
-            for x in 0..metrics.width {
-                let src_idx = y * metrics.width + x;
+        for y in 0..glyph_height as usize {
+            for x in 0..glyph_width as usize {
+                let src_idx = y * glyph_width as usize + x;
                 let dst_x = self.atlas_cursor_x + x as u32;
                 let dst_y = self.atlas_cursor_y + y as u32;
                 let dst_idx = (dst_y * ATLAS_SIZE + dst_x) as usize;
@@ -2614,7 +2934,7 @@ impl Renderer {
 
         let info = GlyphInfo {
             uv: [uv_x, uv_y, uv_w, uv_h],
-            offset: [metrics.xmin as f32, metrics.ymin as f32],
+            offset: [offset_x, offset_y],
             size: [glyph_width as f32, glyph_height as f32],
         };
 
@@ -2625,6 +2945,68 @@ impl Renderer {
         self.char_cache.insert(c, info);
         info
     }
+    
+    /// Rasterize a glyph using ab_glyph with pixel-perfect alignment.
+    /// Returns (width, height, bitmap, offset_x, offset_y) or None if glyph has no outline.
+    /// offset_x is the left bearing (horizontal offset from cursor), snapped to integer pixels
+    /// offset_y is compatible with fontdue's ymin (distance from baseline to glyph bottom, negative for descenders)
+    fn rasterize_glyph_ab(&self, font: &FontRef<'_>, glyph_id: GlyphId) -> Option<(u32, u32, Vec<u8>, f32, f32)> {
+        // First, get the unpositioned glyph bounds to determine pixel-aligned position
+        let unpositioned = glyph_id.with_scale_and_position(self.font_size, ab_glyph::point(0.0, 0.0));
+        let outlined_check = font.outline_glyph(unpositioned)?;
+        let raw_bounds = outlined_check.px_bounds();
+        
+        // Snap to integer pixel boundaries for crisp rendering.
+        // Floor the min coordinates to ensure the glyph bitmap starts at an integer pixel.
+        // This prevents antialiasing artifacts where horizontal/vertical lines appear
+        // to have uneven thickness due to fractional pixel positioning.
+        let snapped_min_x = raw_bounds.min.x.floor();
+        let snapped_min_y = raw_bounds.min.y.floor();
+        
+        // Position the glyph so its bounds start at integer pixels.
+        // We offset by the fractional part to align to pixel grid.
+        let offset_to_snap_x = snapped_min_x - raw_bounds.min.x;
+        let offset_to_snap_y = snapped_min_y - raw_bounds.min.y;
+        let snapped_glyph = glyph_id.with_scale_and_position(
+            self.font_size,
+            ab_glyph::point(offset_to_snap_x, offset_to_snap_y),
+        );
+        
+        let outlined = font.outline_glyph(snapped_glyph)?;
+        let bounds = outlined.px_bounds();
+        
+        // Now bounds.min.x and bounds.min.y should be very close to integers
+        let width = bounds.width().ceil() as u32;
+        let height = bounds.height().ceil() as u32;
+        
+        if width == 0 || height == 0 {
+            return None;
+        }
+        
+        let mut bitmap = vec![0u8; (width * height) as usize];
+        
+        outlined.draw(|x, y, coverage| {
+            let x = x as u32;
+            let y = y as u32;
+            if x < width && y < height {
+                let idx = (y * width + x) as usize;
+                bitmap[idx] = (coverage * 255.0) as u8;
+            }
+        });
+        
+        // Use the snapped (integer) offsets for positioning.
+        // offset_x = left bearing, snapped to integer pixels
+        // offset_y = distance from baseline to glyph BOTTOM (fontdue's ymin convention)
+        //
+        // ab_glyph's bounds.min.y is the TOP of the glyph (negative = above baseline)
+        // ab_glyph's bounds.max.y is the BOTTOM of the glyph (positive = below baseline)
+        // 
+        // We use the snapped bounds which are now at integer pixel positions.
+        let offset_x = snapped_min_x;
+        let offset_y = -(raw_bounds.max.y + offset_to_snap_y);  // Snap the bottom too
+        
+        Some((width, height, bitmap, offset_x, offset_y))
+    }
 
     /// Get or rasterize a glyph by its glyph ID from the primary font.
     /// Used for ligatures where we have the glyph ID from rustybuzz.
@@ -2634,10 +3016,22 @@ impl Renderer {
             return *info;
         }
 
-        // Rasterize the glyph by ID from primary font
-        let (metrics, bitmap) = self.fontdue_font.rasterize_indexed(glyph_id, self.font_size);
+        // Rasterize the glyph by ID from primary font using ab_glyph
+        let ab_glyph_id = GlyphId(glyph_id);
+        let raster_result = self.rasterize_glyph_ab(&self.primary_font.clone(), ab_glyph_id);
 
-        if bitmap.is_empty() || metrics.width == 0 || metrics.height == 0 {
+        let Some((glyph_width, glyph_height, bitmap, offset_x, offset_y)) = raster_result else {
+            // Empty glyph (e.g., space)
+            let info = GlyphInfo {
+                uv: [0.0, 0.0, 0.0, 0.0],
+                offset: [0.0, 0.0],
+                size: [0.0, 0.0],
+            };
+            self.glyph_cache.insert(cache_key, info);
+            return info;
+        };
+
+        if bitmap.is_empty() || glyph_width == 0 || glyph_height == 0 {
             // Empty glyph (e.g., space)
             let info = GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
@@ -2647,9 +3041,6 @@ impl Renderer {
             self.glyph_cache.insert(cache_key, info);
             return info;
         }
-
-        let glyph_width = metrics.width as u32;
-        let glyph_height = metrics.height as u32;
 
         // Check if we need to move to next row
         if self.atlas_cursor_x + glyph_width > ATLAS_SIZE {
@@ -2671,9 +3062,9 @@ impl Renderer {
         }
 
         // Copy bitmap to atlas
-        for y in 0..metrics.height {
-            for x in 0..metrics.width {
-                let src_idx = y * metrics.width + x;
+        for y in 0..glyph_height as usize {
+            for x in 0..glyph_width as usize {
+                let src_idx = y * glyph_width as usize + x;
                 let dst_x = self.atlas_cursor_x + x as u32;
                 let dst_y = self.atlas_cursor_y + y as u32;
                 let dst_idx = (dst_y * ATLAS_SIZE + dst_x) as usize;
@@ -2690,7 +3081,7 @@ impl Renderer {
 
         let info = GlyphInfo {
             uv: [uv_x, uv_y, uv_w, uv_h],
-            offset: [metrics.xmin as f32, metrics.ymin as f32],
+            offset: [offset_x, offset_y],
             size: [glyph_width as f32, glyph_height as f32],
         };
 
@@ -2702,32 +3093,16 @@ impl Renderer {
         info
     }
 
-    /// Shape a single character to get its default glyph ID.
-    /// Used for ligature detection by comparing combined vs individual shaping.
-    fn shape_single_char(&self, c: char) -> u16 {
-        let mut buffer = UnicodeBuffer::new();
-        buffer.push_str(&c.to_string());
-        let glyph_buffer = rustybuzz::shape(&self.shaping_ctx.face, &[], buffer);
-        let infos = glyph_buffer.glyph_infos();
-        if infos.is_empty() {
-            0
-        } else {
-            infos[0].glyph_id as u16
-        }
-    }
-
-    /// Shape a multi-character text string (for ligatures).
-    /// Detects if the font produces a ligature by comparing glyph IDs
-    /// when shaped together vs shaped individually.
+    /// Shape a text string using HarfBuzz/rustybuzz.
+    /// Returns glyph IDs with advances and offsets for texture healing.
     fn shape_text(&mut self, text: &str) -> ShapedGlyphs {
         // Check cache first
         if let Some(cached) = self.ligature_cache.get(text) {
             return cached.clone();
         }
 
-        let chars: Vec<char> = text.chars().collect();
-        let char_count = chars.len();
-        
+        let _chars: Vec<char> = text.chars().collect();
+
         let mut buffer = UnicodeBuffer::new();
         buffer.push_str(text);
 
@@ -2736,54 +3111,231 @@ impl Renderer {
         let glyph_infos = glyph_buffer.glyph_infos();
         let glyph_positions = glyph_buffer.glyph_positions();
 
-        let glyphs: Vec<(u16, f32, u32)> = glyph_infos
+        let glyphs: Vec<(u16, f32, f32, f32, u32)> = glyph_infos
             .iter()
             .zip(glyph_positions.iter())
             .map(|(info, pos)| {
                 let glyph_id = info.glyph_id as u16;
                 // Ensure glyph is rasterized
                 self.get_glyph_by_id(glyph_id);
-                // Convert advance from font units to pixels
-                let advance = pos.x_advance as f32 * self.font_size / self.shaping_ctx.face.units_per_em() as f32;
-                (glyph_id, advance, info.cluster)
+                // Convert from font units to pixels using the correct scale factor.
+                // This matches ab_glyph's calculation: font_size / height_unscaled
+                let x_advance = pos.x_advance as f32 * self.font_units_to_px;
+                let x_offset = pos.x_offset as f32 * self.font_units_to_px;
+                let y_offset = pos.y_offset as f32 * self.font_units_to_px;
+                (glyph_id, x_advance, x_offset, y_offset, info.cluster)
             })
             .collect();
 
-        // Get individual glyph IDs for comparison
-        let individual_glyphs: Vec<u16> = chars.iter().map(|&c| self.shape_single_char(c)).collect();
-
-        // Detect ligature by comparing combined vs individual shaping
-        // A ligature occurred if:
-        // 1. Fewer glyphs than input characters, OR
-        // 2. Any glyph ID differs from the individual character's glyph ID
-        let fewer_glyphs = glyphs.len() < char_count;
-        
-        let has_substitution = if glyphs.len() == char_count {
-            glyphs.iter().zip(individual_glyphs.iter())
-                .any(|((combined_id, _, _), &individual_id)| *combined_id != individual_id)
-        } else {
-            true // If glyph count differs, it's definitely a substitution
-        };
-        
-        let is_ligature = fewer_glyphs || has_substitution;
-
-        // Debug: log shaping results for ligature patterns
-        log::debug!(
-            "shape_text: '{}' ({} chars) -> {} glyphs, is_ligature={}, combined={:?}, individual={:?}",
-            text,
-            char_count,
-            glyphs.len(),
-            is_ligature,
-            glyphs.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
-            individual_glyphs
-        );
-
-        let shaped = ShapedGlyphs { 
-            glyphs, 
-            is_ligature,
+        let shaped = ShapedGlyphs {
+            glyphs,
         };
         self.ligature_cache.insert(text.to_string(), shaped.clone());
         shaped
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // KITTY-STYLE TEXTURE HEALING: CANVAS-BASED TEXT RUN RENDERING
+    // ═══════════════════════════════════════════════════════════════════════════
+    //
+    // This implements Kitty's approach to texture healing:
+    // 1. Render all glyphs in a text run into a single multi-cell canvas
+    // 2. Use HarfBuzz x_offset and x_advance for glyph positioning
+    // 3. Extract individual cell-sized sprites from the canvas
+    // 4. Upload each cell sprite to the atlas
+    //
+    // This allows narrow characters (like 'i') to leave space for adjacent
+    // wider characters (like 'm'), creating more balanced text appearance.
+
+    /// Ensure the canvas buffer is large enough for the given number of cells.
+    fn ensure_canvas_size(&mut self, num_cells: usize) {
+        let required_width = (self.cell_width as usize) * num_cells;
+        let required_height = self.cell_height as usize;
+        let required_size = required_width * required_height;
+        
+        if self.canvas_buffer.len() < required_size {
+            self.canvas_buffer.resize(required_size, 0);
+        }
+        self.canvas_size = (required_width as u32, required_height as u32);
+    }
+
+    /// Clear the canvas buffer to transparent.
+    fn clear_canvas(&mut self, num_cells: usize) {
+        let canvas_width = (self.cell_width as usize) * num_cells;
+        let canvas_height = self.cell_height as usize;
+        let size = canvas_width * canvas_height;
+        // Only clear the portion we're using
+        self.canvas_buffer[..size].fill(0);
+    }
+
+    /// Render shaped glyphs into the canvas buffer using HarfBuzz positions.
+    /// This is the core of Kitty's texture healing approach.
+    /// 
+    /// Arguments:
+    /// - `shaped`: The shaped glyph data from HarfBuzz
+    /// - `num_cells`: Number of cells this text run spans
+    /// - `baseline_offset`: Offset from top of cell to baseline (typically cell_height * 0.8)
+    fn render_glyphs_to_canvas(&mut self, shaped: &ShapedGlyphs, num_cells: usize, baseline_offset: f32) {
+        let canvas_width = (self.cell_width as usize) * num_cells;
+        let canvas_height = self.cell_height as usize;
+        
+        // Track cursor position in canvas coordinates
+        let mut cursor_x: f32 = 0.0;
+        
+        for &(glyph_id, x_advance, x_offset, y_offset, _cluster) in &shaped.glyphs {
+            // Get the rasterized glyph bitmap
+            let glyph = self.get_glyph_by_id(glyph_id);
+            
+            if glyph.size[0] <= 0.0 || glyph.size[1] <= 0.0 {
+                // Empty glyph (e.g., space) - just advance cursor
+                cursor_x += x_advance;
+                continue;
+            }
+            
+            // Calculate glyph position in canvas:
+            // - cursor_x: accumulated from x_advance
+            // - x_offset: HarfBuzz adjustment for texture healing
+            // - glyph.offset[0]: left bearing from the font
+            let glyph_x = cursor_x + x_offset + glyph.offset[0];
+            
+            // Y position: baseline_offset is from top to baseline
+            // glyph.offset[1] is distance from baseline to glyph bottom (negative = below baseline)
+            // For canvas coords (y=0 at top), we need: baseline_offset - glyph_top
+            // glyph_top = glyph.offset[1] + glyph.size[1] (since offset is to bottom)
+            let glyph_y = baseline_offset + y_offset - glyph.offset[1] - glyph.size[1];
+            
+            // Round to integers for pixel placement
+            let dest_x = glyph_x.round() as i32;
+            let dest_y = glyph_y.round() as i32;
+            
+            // Get glyph bitmap from atlas
+            // The glyph.uv gives us the location in the atlas
+            let atlas_x = (glyph.uv[0] * ATLAS_SIZE as f32) as u32;
+            let atlas_y = (glyph.uv[1] * ATLAS_SIZE as f32) as u32;
+            let glyph_w = glyph.size[0] as u32;
+            let glyph_h = glyph.size[1] as u32;
+            
+            // Copy glyph bitmap from atlas to canvas, with bounds checking
+            for gy in 0..glyph_h {
+                let canvas_y = dest_y + gy as i32;
+                if canvas_y < 0 || canvas_y >= canvas_height as i32 {
+                    continue;
+                }
+                
+                for gx in 0..glyph_w {
+                    let canvas_x = dest_x + gx as i32;
+                    if canvas_x < 0 || canvas_x >= canvas_width as i32 {
+                        continue;
+                    }
+                    
+                    // Source in atlas
+                    let src_idx = ((atlas_y + gy) * ATLAS_SIZE + (atlas_x + gx)) as usize;
+                    // Destination in canvas
+                    let dst_idx = (canvas_y as usize) * canvas_width + (canvas_x as usize);
+                    
+                    // Blend: use max for overlapping glyphs (simple compositing)
+                    let src_alpha = self.atlas_data[src_idx];
+                    let dst_alpha = self.canvas_buffer[dst_idx];
+                    self.canvas_buffer[dst_idx] = src_alpha.max(dst_alpha);
+                }
+            }
+            
+            // Advance cursor by glyph's advance width.
+            // Round the advance to ensure it aligns with cell boundaries for monospace fonts.
+            // This matches Kitty's approach: x += roundf(x_advance)
+            cursor_x += x_advance.round();
+        }
+    }
+
+    /// Extract a single cell from the canvas and upload it to the atlas.
+    /// Returns the GlyphInfo for this cell's sprite.
+    fn extract_cell_from_canvas(&mut self, cell_index: usize, num_cells: usize) -> [f32; 4] {
+        let cell_width = self.cell_width as u32;
+        let cell_height = self.cell_height as u32;
+        let canvas_width = cell_width * num_cells as u32;
+        
+        // Check if we need to move to next row in atlas
+        if self.atlas_cursor_x + cell_width > ATLAS_SIZE {
+            self.atlas_cursor_x = 0;
+            self.atlas_cursor_y += self.atlas_row_height + 1;
+            self.atlas_row_height = 0;
+        }
+        
+        // Check if atlas is full
+        if self.atlas_cursor_y + cell_height > ATLAS_SIZE {
+            log::warn!("Glyph atlas is full during text run rendering!");
+            return [0.0, 0.0, 0.0, 0.0];
+        }
+        
+        // Copy cell region from canvas to atlas
+        let src_x_start = cell_index as u32 * cell_width;
+        for y in 0..cell_height {
+            for x in 0..cell_width {
+                let src_idx = (y * canvas_width + src_x_start + x) as usize;
+                let dst_x = self.atlas_cursor_x + x;
+                let dst_y = self.atlas_cursor_y + y;
+                let dst_idx = (dst_y * ATLAS_SIZE + dst_x) as usize;
+                self.atlas_data[dst_idx] = self.canvas_buffer[src_idx];
+            }
+        }
+        self.atlas_dirty = true;
+        
+        // Calculate UV coordinates
+        let uv_x = self.atlas_cursor_x as f32 / ATLAS_SIZE as f32;
+        let uv_y = self.atlas_cursor_y as f32 / ATLAS_SIZE as f32;
+        let uv_w = cell_width as f32 / ATLAS_SIZE as f32;
+        let uv_h = cell_height as f32 / ATLAS_SIZE as f32;
+        
+        // Update atlas cursor
+        self.atlas_cursor_x += cell_width + 1;
+        self.atlas_row_height = self.atlas_row_height.max(cell_height);
+        
+        [uv_x, uv_y, uv_w, uv_h]
+    }
+
+    /// Render a text run using Kitty's canvas-based approach for texture healing.
+    /// Returns TextRunSprites containing UV coordinates for each cell.
+    fn render_text_run(&mut self, text: &str, num_cells: usize) -> TextRunSprites {
+        // Check cache first
+        if let Some(cached) = self.text_run_cache.get(text) {
+            return cached.clone();
+        }
+        
+        // Shape the text
+        let shaped = self.shape_text(text);
+        
+        // DEBUG: Log shaping results
+        if num_cells >= 2 {
+            let total_advance: f32 = shaped.glyphs.iter().map(|g| g.1).sum();
+            let expected_width = self.cell_width * num_cells as f32;
+            eprintln!("DEBUG shape_text: text='{}' num_cells={} num_glyphs={} total_advance={:.2} expected_width={:.2} cell_width={:.2}",
+                text, num_cells, shaped.glyphs.len(), total_advance, expected_width, self.cell_width);
+            for (i, &(glyph_id, x_advance, x_offset, _y_offset, cluster)) in shaped.glyphs.iter().enumerate() {
+                eprintln!("  glyph[{}]: id={} x_advance={:.2} x_offset={:.2} cluster={}", 
+                    i, glyph_id, x_advance, x_offset, cluster);
+            }
+        }
+        
+        // Ensure canvas is big enough
+        self.ensure_canvas_size(num_cells);
+        self.clear_canvas(num_cells);
+        
+        // Calculate baseline offset (typically ~80% down from top of cell)
+        let baseline_offset = self.cell_height * 0.8;
+        
+        // Render all glyphs into the canvas
+        self.render_glyphs_to_canvas(&shaped, num_cells, baseline_offset);
+        
+        // Extract each cell from the canvas
+        let mut cells = Vec::with_capacity(num_cells);
+        for i in 0..num_cells {
+            let uv = self.extract_cell_from_canvas(i, num_cells);
+            cells.push(uv);
+        }
+        
+        let sprites = TextRunSprites { cells };
+        self.text_run_cache.insert(text.to_string(), sprites.clone());
+        sprites
     }
 
     /// Convert sRGB component (0.0-1.0) to linear RGB.
@@ -2810,14 +3362,14 @@ impl Renderer {
         let snapped = pixel.round();
         1.0 - (snapped / screen_height) * 2.0
     }
-    
+
     /// Render a single pane's terminal content at a given position.
     /// This is a helper method for multi-pane rendering.
-    /// 
+    ///
     /// Arguments:
     /// - `terminal`: The terminal state for this pane
     /// - `pane_x`: Left edge of pane in pixels
-    /// - `pane_y`: Top edge of pane in pixels  
+    /// - `pane_y`: Top edge of pane in pixels
     /// - `pane_width`: Width of pane in pixels
     /// - `pane_height`: Height of pane in pixels
     /// - `is_active`: Whether this is the active pane (for cursor rendering)
@@ -2836,15 +3388,15 @@ impl Renderer {
     ) {
         let width = self.width as f32;
         let height = self.height as f32;
-        
+
         // Calculate pane's terminal dimensions
         let cols = (pane_width / self.cell_width).floor() as usize;
         let rows = (pane_height / self.cell_height).floor() as usize;
-        
+
         // Cache palette values
         let palette_default_fg = self.palette.default_fg;
         let palette_colors = self.palette.colors;
-        
+
         // Helper to convert Color to linear RGBA
         let color_to_rgba = |color: &Color, is_foreground: bool| -> [f32; 4] {
             match color {
@@ -2878,7 +3430,7 @@ impl Renderer {
                 }
             }
         };
-        
+
         // Helper to check if a cell is selected
         let is_cell_selected = |col: usize, row: usize| -> bool {
             let Some((start_col, start_row, end_col, end_row)) = selection else {
@@ -2898,173 +3450,198 @@ impl Renderer {
                 return true;
             }
         };
-        
+
         // Get visible rows (accounts for scroll offset)
         let visible_rows = terminal.visible_rows();
-        
-        // Common programming ligatures to check (longest first for greedy matching)
-        const LIGATURE_PATTERNS: &[&str] = &[
-            // 3-char
-            "===", "!==", ">>>", "<<<", "||=", "&&=", "??=", "...", "-->", "<--", "<->",
-            "www",
-            // 2-char  
-            "=>", "->", "<-", ">=", "<=", "==", "!=", "::", "&&", "||", "??", "..", "++",
-            "--", "<<", ">>", "|>", "<|", "/*", "*/", "//", "##", ":=", "~=", "<>",
-        ];
-        
+
         // Render each row
         for (row_idx, row) in visible_rows.iter().enumerate() {
             if row_idx >= rows {
                 break;
             }
-            
+
             // Find the last non-empty cell for selection clipping
+            // Note: U+10EEEE is Kitty graphics placeholder, treat as empty
+            const KITTY_PLACEHOLDER_CHAR: char = '\u{10EEEE}';
             let last_content_col = row.iter()
                 .enumerate()
                 .rev()
-                .find(|(_, cell)| cell.character != ' ' && cell.character != '\0')
+                .find(|(_, cell)| cell.character != ' ' && cell.character != '\0' && cell.character != KITTY_PLACEHOLDER_CHAR)
                 .map(|(idx, _)| idx)
                 .unwrap_or(0);
+
+            // ═══════════════════════════════════════════════════════════════════════════
+            // TEXT RUN SHAPING FOR TEXTURE HEALING
+            // ═══════════════════════════════════════════════════════════════════════════
+            // Instead of rendering character-by-character, we group consecutive cells
+            // with the same styling into "text runs" and shape them together. This allows
+            // the font's calt (contextual alternates) feature to apply texture healing,
+            // which adjusts character positions based on their neighbors.
+            
+            let cell_y = pane_y + row_idx as f32 * self.cell_height;
             
             let mut col_idx = 0;
             while col_idx < row.len() && col_idx < cols {
                 let cell = &row[col_idx];
-                let cell_x = pane_x + col_idx as f32 * self.cell_width;
-                let cell_y = pane_y + row_idx as f32 * self.cell_height;
                 
-                let mut fg_color = color_to_rgba(&cell.fg_color, true);
-                let mut bg_color = color_to_rgba(&cell.bg_color, false);
+                // Determine colors for this cell (with selection override)
+                let (base_fg, base_bg) = if is_cell_selected(col_idx, row_idx) && col_idx <= last_content_col {
+                    ([0.0f32, 0.0, 0.0, 1.0], [1.0f32, 1.0, 1.0, 1.0])
+                } else {
+                    (color_to_rgba(&cell.fg_color, true), color_to_rgba(&cell.bg_color, false))
+                };
                 
-                // Handle selection
-                if is_cell_selected(col_idx, row_idx) && col_idx <= last_content_col {
-                    fg_color = [0.0, 0.0, 0.0, 1.0];
-                    bg_color = [1.0, 1.0, 1.0, 1.0];
-                }
+                // Collect a run of cells with the same fg/bg colors
+                let mut run_text = String::new();
+                let mut run_cells: Vec<(usize, char, bool)> = Vec::new(); // (col, char, is_box_drawing)
                 
-                // Check for ligatures by looking ahead
-                let mut ligature_len = 0;
-                let mut ligature_shaped: Option<ShapedGlyphs> = None;
-                
-                for pattern in LIGATURE_PATTERNS {
-                    let pat_len = pattern.len();
-                    if col_idx + pat_len <= row.len() {
-                        // Build the candidate string from consecutive cells
-                        let candidate: String = row[col_idx..col_idx + pat_len]
-                            .iter()
-                            .map(|c| c.character)
-                            .collect();
-                        
-                        if candidate == *pattern {
-                            // Only form ligatures from cells with matching foreground colors.
-                            // This prevents ghost/completion text (which typically has a
-                            // different color) from being combined with typed text.
-                            let first_fg = &row[col_idx].fg_color;
-                            let all_same_color = row[col_idx..col_idx + pat_len]
-                                .iter()
-                                .all(|c| &c.fg_color == first_fg);
-                            
-                            if !all_same_color {
-                                continue;
-                            }
-                            
-                            // Check if font actually produces a ligature
-                            let shaped = self.shape_text(&candidate);
-                            // Use our improved ligature detection
-                            if shaped.is_ligature {
-                                ligature_shaped = Some(shaped);
-                                ligature_len = pat_len;
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                if let Some(shaped) = ligature_shaped {
-                    // Render ligature spanning multiple cells
-                    // Add background for all cells in the ligature
-                    for i in 0..ligature_len {
-                        let bg_cell_x = pane_x + (col_idx + i) as f32 * self.cell_width;
-                        let cell_left = Self::pixel_to_ndc_x(bg_cell_x, width);
-                        let cell_right = Self::pixel_to_ndc_x(bg_cell_x + self.cell_width, width);
-                        let cell_top = Self::pixel_to_ndc_y(cell_y, height);
-                        let cell_bottom = Self::pixel_to_ndc_y(cell_y + self.cell_height, height);
-
-                        let base_idx = self.bg_vertices.len() as u32;
-                        self.bg_vertices.push(GlyphVertex {
-                            position: [cell_left, cell_top],
-                            uv: [0.0, 0.0],
-                            color: fg_color,
-                            bg_color,
-                        });
-                        self.bg_vertices.push(GlyphVertex {
-                            position: [cell_right, cell_top],
-                            uv: [0.0, 0.0],
-                            color: fg_color,
-                            bg_color,
-                        });
-                        self.bg_vertices.push(GlyphVertex {
-                            position: [cell_right, cell_bottom],
-                            uv: [0.0, 0.0],
-                            color: fg_color,
-                            bg_color,
-                        });
-                        self.bg_vertices.push(GlyphVertex {
-                            position: [cell_left, cell_bottom],
-                            uv: [0.0, 0.0],
-                            color: fg_color,
-                            bg_color,
-                        });
-                        self.bg_indices.extend_from_slice(&[
-                            base_idx, base_idx + 1, base_idx + 2,
-                            base_idx, base_idx + 2, base_idx + 3,
-                        ]);
-                    }
-
-                    // Render all glyphs from the shaped output with their proper advances.
-                    // For ligatures like "->", the font produces:
-                    // - Glyph 0: spacer (0x0 invisible), advance = cell_width
-                    // - Glyph 1: ligature glyph with negative xmin to extend back into cell 0
-                    let baseline_y = (cell_y + self.cell_height * 0.8).round();
-                    let mut cursor_x = cell_x;
+                while col_idx < row.len() && col_idx < cols {
+                    let run_cell = &row[col_idx];
                     
-                    for &(glyph_id, advance, _cluster) in &shaped.glyphs {
-                        let glyph = self.get_glyph_by_id(glyph_id);
-                        
-                        // Only render if glyph has content (spacers are 0x0)
+                    // Check if this cell has the same colors
+                    let (cell_fg, cell_bg) = if is_cell_selected(col_idx, row_idx) && col_idx <= last_content_col {
+                        ([0.0f32, 0.0, 0.0, 1.0], [1.0f32, 1.0, 1.0, 1.0])
+                    } else {
+                        (color_to_rgba(&run_cell.fg_color, true), color_to_rgba(&run_cell.bg_color, false))
+                    };
+                    
+                    if cell_fg != base_fg || cell_bg != base_bg {
+                        break; // Different colors, end this run
+                    }
+                    
+                    let c = run_cell.character;
+                    const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
+                    let is_renderable = c != ' ' && c != '\0' && c != KITTY_PLACEHOLDER;
+                    let is_box = Self::is_box_drawing(c);
+                    
+                    run_cells.push((col_idx, c, is_box));
+                    if is_renderable && !is_box {
+                        run_text.push(c);
+                    } else {
+                        // Use a placeholder that won't affect shaping
+                        run_text.push(' ');
+                    }
+                    
+                    col_idx += 1;
+                }
+                
+                // Render backgrounds for all cells in the run
+                for &(cell_col, _, _) in &run_cells {
+                    let cell_x = pane_x + cell_col as f32 * self.cell_width;
+                    let cell_left = Self::pixel_to_ndc_x(cell_x, width);
+                    let cell_right = Self::pixel_to_ndc_x(cell_x + self.cell_width, width);
+                    let cell_top = Self::pixel_to_ndc_y(cell_y, height);
+                    let cell_bottom = Self::pixel_to_ndc_y(cell_y + self.cell_height, height);
+                    
+                    let base_idx = self.bg_vertices.len() as u32;
+                    self.bg_vertices.push(GlyphVertex {
+                        position: [cell_left, cell_top],
+                        uv: [0.0, 0.0],
+                        color: base_fg,
+                        bg_color: base_bg,
+                    });
+                    self.bg_vertices.push(GlyphVertex {
+                        position: [cell_right, cell_top],
+                        uv: [0.0, 0.0],
+                        color: base_fg,
+                        bg_color: base_bg,
+                    });
+                    self.bg_vertices.push(GlyphVertex {
+                        position: [cell_right, cell_bottom],
+                        uv: [0.0, 0.0],
+                        color: base_fg,
+                        bg_color: base_bg,
+                    });
+                    self.bg_vertices.push(GlyphVertex {
+                        position: [cell_left, cell_bottom],
+                        uv: [0.0, 0.0],
+                        color: base_fg,
+                        bg_color: base_bg,
+                    });
+                    self.bg_indices.extend_from_slice(&[
+                        base_idx, base_idx + 1, base_idx + 2,
+                        base_idx, base_idx + 2, base_idx + 3,
+                    ]);
+                }
+                
+                // ═══════════════════════════════════════════════════════════════
+                // RENDER TEXT RUN USING KITTY'S CANVAS-BASED APPROACH
+                // ═══════════════════════════════════════════════════════════════
+                // Use canvas-based rendering for texture healing:
+                // 1. Render all glyphs into a multi-cell canvas using HarfBuzz positions
+                // 2. Extract each cell's portion as a sprite
+                // 3. Render sprites at cell positions
+                
+                // First, collect renderable (non-box-drawing) characters for shaping
+                let mut shape_text = String::new();
+                let mut shape_indices: Vec<usize> = Vec::new(); // Maps shape_text position to run_cells index
+                
+                for (i, &(_, c, is_box)) in run_cells.iter().enumerate() {
+                    const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
+                    if c != ' ' && c != '\0' && c != KITTY_PLACEHOLDER && !is_box {
+                        shape_text.push(c);
+                        shape_indices.push(i);
+                    }
+                }
+                
+                // Render the text run using canvas approach if there's text to shape
+                let sprites = if !shape_text.is_empty() && shape_indices.len() == run_cells.len() {
+                    // All cells are shapeable text - use canvas rendering
+                    // DEBUG: Log what we're shaping
+                    if run_cells.len() >= 2 {
+                        eprintln!("DEBUG render_text_run: text='{}' num_cells={} shape_text='{}'", 
+                            run_text, run_cells.len(), shape_text);
+                    }
+                    Some(self.render_text_run(&run_text, run_cells.len()))
+                } else {
+                    None
+                };
+                
+                // Render each cell
+                for (run_idx, &(cell_col, c, is_box)) in run_cells.iter().enumerate() {
+                    let cell_x = pane_x + cell_col as f32 * self.cell_width;
+                    
+                    const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
+                    if c == ' ' || c == '\0' || c == KITTY_PLACEHOLDER {
+                        // Empty cell - nothing to render
+                        continue;
+                    }
+                    
+                    if is_box {
+                        // Box drawing - render without shaping/canvas
+                        let glyph = self.rasterize_char(c);
                         if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
-                            // Use the glyph's horizontal offset (xmin) - this allows
-                            // ligature glyphs with negative xmin to extend backwards
-                            let glyph_x = (cursor_x + glyph.offset[0]).round();
-                            let glyph_y = (baseline_y - glyph.offset[1] - glyph.size[1]).round();
-
+                            let glyph_x = cell_x;
+                            let glyph_y = cell_y;
+                            
                             let left = Self::pixel_to_ndc_x(glyph_x, width);
                             let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
                             let top = Self::pixel_to_ndc_y(glyph_y, height);
                             let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
-
+                            
                             let base_idx = self.glyph_vertices.len() as u32;
                             self.glyph_vertices.push(GlyphVertex {
                                 position: [left, top],
                                 uv: [glyph.uv[0], glyph.uv[1]],
-                                color: fg_color,
+                                color: base_fg,
                                 bg_color: [0.0, 0.0, 0.0, 0.0],
                             });
                             self.glyph_vertices.push(GlyphVertex {
                                 position: [right, top],
                                 uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
-                                color: fg_color,
+                                color: base_fg,
                                 bg_color: [0.0, 0.0, 0.0, 0.0],
                             });
                             self.glyph_vertices.push(GlyphVertex {
                                 position: [right, bottom],
                                 uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
-                                color: fg_color,
+                                color: base_fg,
                                 bg_color: [0.0, 0.0, 0.0, 0.0],
                             });
                             self.glyph_vertices.push(GlyphVertex {
                                 position: [left, bottom],
                                 uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
-                                color: fg_color,
+                                color: base_fg,
                                 bg_color: [0.0, 0.0, 0.0, 0.0],
                             });
                             self.glyph_indices.extend_from_slice(&[
@@ -3072,110 +3649,94 @@ impl Renderer {
                                 base_idx, base_idx + 2, base_idx + 3,
                             ]);
                         }
-                        
-                        // Advance cursor for next glyph
-                        cursor_x += advance;
-                    }
-                    
-                    // Skip the cells consumed by the ligature
-                    col_idx += ligature_len;
-                    continue;
-                }
-                
-                // No ligature - render single cell
-                
-                // Cell bounds
-                let cell_left = Self::pixel_to_ndc_x(cell_x, width);
-                let cell_right = Self::pixel_to_ndc_x(cell_x + self.cell_width, width);
-                let cell_top = Self::pixel_to_ndc_y(cell_y, height);
-                let cell_bottom = Self::pixel_to_ndc_y(cell_y + self.cell_height, height);
-                
-                // Add background quad
-                let base_idx = self.bg_vertices.len() as u32;
-                self.bg_vertices.push(GlyphVertex {
-                    position: [cell_left, cell_top],
-                    uv: [0.0, 0.0],
-                    color: fg_color,
-                    bg_color,
-                });
-                self.bg_vertices.push(GlyphVertex {
-                    position: [cell_right, cell_top],
-                    uv: [0.0, 0.0],
-                    color: fg_color,
-                    bg_color,
-                });
-                self.bg_vertices.push(GlyphVertex {
-                    position: [cell_right, cell_bottom],
-                    uv: [0.0, 0.0],
-                    color: fg_color,
-                    bg_color,
-                });
-                self.bg_vertices.push(GlyphVertex {
-                    position: [cell_left, cell_bottom],
-                    uv: [0.0, 0.0],
-                    color: fg_color,
-                    bg_color,
-                });
-                self.bg_indices.extend_from_slice(&[
-                    base_idx, base_idx + 1, base_idx + 2,
-                    base_idx, base_idx + 2, base_idx + 3,
-                ]);
-                
-                // Add glyph if it has content
-                let c = cell.character;
-                if c != ' ' && c != '\0' {
-                    let glyph = self.rasterize_char(c);
-                    if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
-                        let (glyph_x, glyph_y) = if Self::is_box_drawing(c) {
-                            (cell_x, cell_y)
-                        } else {
-                            let baseline_y = (cell_y + self.cell_height * 0.8).round();
-                            let gx = (cell_x + glyph.offset[0]).round();
-                            let gy = (baseline_y - glyph.offset[1] - glyph.size[1]).round();
-                            (gx, gy)
-                        };
-                        
-                        let left = Self::pixel_to_ndc_x(glyph_x, width);
-                        let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
-                        let top = Self::pixel_to_ndc_y(glyph_y, height);
-                        let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
-                        
-                        let base_idx = self.glyph_vertices.len() as u32;
-                        self.glyph_vertices.push(GlyphVertex {
-                            position: [left, top],
-                            uv: [glyph.uv[0], glyph.uv[1]],
-                            color: fg_color,
-                            bg_color: [0.0, 0.0, 0.0, 0.0],
-                        });
-                        self.glyph_vertices.push(GlyphVertex {
-                            position: [right, top],
-                            uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
-                            color: fg_color,
-                            bg_color: [0.0, 0.0, 0.0, 0.0],
-                        });
-                        self.glyph_vertices.push(GlyphVertex {
-                            position: [right, bottom],
-                            uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
-                            color: fg_color,
-                            bg_color: [0.0, 0.0, 0.0, 0.0],
-                        });
-                        self.glyph_vertices.push(GlyphVertex {
-                            position: [left, bottom],
-                            uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
-                            color: fg_color,
-                            bg_color: [0.0, 0.0, 0.0, 0.0],
-                        });
-                        self.glyph_indices.extend_from_slice(&[
-                            base_idx, base_idx + 1, base_idx + 2,
-                            base_idx, base_idx + 2, base_idx + 3,
-                        ]);
+                    } else if let Some(ref run_sprites) = sprites {
+                        // Use pre-rendered sprite from canvas
+                        if run_idx < run_sprites.cells.len() {
+                            let uv = run_sprites.cells[run_idx];
+                            if uv[2] > 0.0 && uv[3] > 0.0 {
+                                let left = Self::pixel_to_ndc_x(cell_x, width);
+                                let right = Self::pixel_to_ndc_x(cell_x + self.cell_width, width);
+                                let top = Self::pixel_to_ndc_y(cell_y, height);
+                                let bottom = Self::pixel_to_ndc_y(cell_y + self.cell_height, height);
+                                
+                                let base_idx = self.glyph_vertices.len() as u32;
+                                self.glyph_vertices.push(GlyphVertex {
+                                    position: [left, top],
+                                    uv: [uv[0], uv[1]],
+                                    color: base_fg,
+                                    bg_color: [0.0, 0.0, 0.0, 0.0],
+                                });
+                                self.glyph_vertices.push(GlyphVertex {
+                                    position: [right, top],
+                                    uv: [uv[0] + uv[2], uv[1]],
+                                    color: base_fg,
+                                    bg_color: [0.0, 0.0, 0.0, 0.0],
+                                });
+                                self.glyph_vertices.push(GlyphVertex {
+                                    position: [right, bottom],
+                                    uv: [uv[0] + uv[2], uv[1] + uv[3]],
+                                    color: base_fg,
+                                    bg_color: [0.0, 0.0, 0.0, 0.0],
+                                });
+                                self.glyph_vertices.push(GlyphVertex {
+                                    position: [left, bottom],
+                                    uv: [uv[0], uv[1] + uv[3]],
+                                    color: base_fg,
+                                    bg_color: [0.0, 0.0, 0.0, 0.0],
+                                });
+                                self.glyph_indices.extend_from_slice(&[
+                                    base_idx, base_idx + 1, base_idx + 2,
+                                    base_idx, base_idx + 2, base_idx + 3,
+                                ]);
+                            }
+                        }
+                    } else {
+                        // Fallback: render character individually
+                        let glyph = self.rasterize_char(c);
+                        if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
+                            let glyph_x = (cell_x + glyph.offset[0]).round();
+                            let glyph_y = (cell_y + self.cell_height * 0.8 - glyph.offset[1] - glyph.size[1]).round();
+                            
+                            let left = Self::pixel_to_ndc_x(glyph_x, width);
+                            let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
+                            let top = Self::pixel_to_ndc_y(glyph_y, height);
+                            let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
+                            
+                            let base_idx = self.glyph_vertices.len() as u32;
+                            self.glyph_vertices.push(GlyphVertex {
+                                position: [left, top],
+                                uv: [glyph.uv[0], glyph.uv[1]],
+                                color: base_fg,
+                                bg_color: [0.0, 0.0, 0.0, 0.0],
+                            });
+                            self.glyph_vertices.push(GlyphVertex {
+                                position: [right, top],
+                                uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
+                                color: base_fg,
+                                bg_color: [0.0, 0.0, 0.0, 0.0],
+                            });
+                            self.glyph_vertices.push(GlyphVertex {
+                                position: [right, bottom],
+                                uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
+                                color: base_fg,
+                                bg_color: [0.0, 0.0, 0.0, 0.0],
+                            });
+                            self.glyph_vertices.push(GlyphVertex {
+                                position: [left, bottom],
+                                uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
+                                color: base_fg,
+                                bg_color: [0.0, 0.0, 0.0, 0.0],
+                            });
+                            self.glyph_indices.extend_from_slice(&[
+                                base_idx, base_idx + 1, base_idx + 2,
+                                base_idx, base_idx + 2, base_idx + 3,
+                            ]);
+                        }
                     }
                 }
-                
-                col_idx += 1;
             }
         }
-        
+
         // Render cursor only for active pane
         if is_active && terminal.cursor_visible && terminal.scroll_offset == 0
            && terminal.cursor_row < rows && terminal.cursor_col < cols {
@@ -3183,10 +3744,10 @@ impl Renderer {
             let cursor_row = terminal.cursor_row;
             let cursor_x = pane_x + cursor_col as f32 * self.cell_width;
             let cursor_y = pane_y + cursor_row as f32 * self.cell_height;
-            
+
             // Get cell under cursor
             let cursor_cell = visible_rows.get(cursor_row).and_then(|row| row.get(cursor_col));
-            
+
             let (cell_fg, cell_bg, cell_char) = if let Some(cell) = cursor_cell {
                 let fg = color_to_rgba(&cell.fg_color, true);
                 let bg = color_to_rgba(&cell.bg_color, false);
@@ -3203,9 +3764,11 @@ impl Renderer {
                 };
                 (fg, [0.0, 0.0, 0.0, 0.0], ' ')
             };
-            
-            let has_character = cell_char != ' ' && cell_char != '\0';
-            
+
+            // Kitty graphics Unicode placeholder should be treated as empty
+            const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
+            let has_character = cell_char != ' ' && cell_char != '\0' && cell_char != KITTY_PLACEHOLDER;
+
             let cursor_bg_color = if has_character {
                 [cell_fg[0], cell_fg[1], cell_fg[2], 1.0]
             } else {
@@ -3216,13 +3779,13 @@ impl Renderer {
                     [1.0 - cell_bg[0], 1.0 - cell_bg[1], 1.0 - cell_bg[2], 1.0]
                 }
             };
-            
+
             let cursor_style = match terminal.cursor_shape {
                 CursorShape::BlinkingBlock | CursorShape::SteadyBlock => 0,
                 CursorShape::BlinkingUnderline | CursorShape::SteadyUnderline => 1,
                 CursorShape::BlinkingBar | CursorShape::SteadyBar => 2,
             };
-            
+
             let (left, right, top, bottom) = match cursor_style {
                 0 => (
                     cursor_x,
@@ -3249,12 +3812,12 @@ impl Renderer {
                     )
                 }
             };
-            
+
             let cursor_left = Self::pixel_to_ndc_x(left, width);
             let cursor_right = Self::pixel_to_ndc_x(right, width);
             let cursor_top = Self::pixel_to_ndc_y(top, height);
             let cursor_bottom = Self::pixel_to_ndc_y(bottom, height);
-            
+
             let base_idx = self.glyph_vertices.len() as u32;
             self.glyph_vertices.push(GlyphVertex {
                 position: [cursor_left, cursor_top],
@@ -3284,7 +3847,7 @@ impl Renderer {
                 base_idx, base_idx + 1, base_idx + 2,
                 base_idx, base_idx + 2, base_idx + 3,
             ]);
-            
+
             // If block cursor with character, render it inverted
             if cursor_style == 0 && has_character {
                 let char_color = if cell_bg[3] < 0.01 {
@@ -3292,7 +3855,7 @@ impl Renderer {
                 } else {
                     [cell_bg[0], cell_bg[1], cell_bg[2], 1.0]
                 };
-                
+
                 let glyph = self.rasterize_char(cell_char);
                 if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
                     let (glyph_x, glyph_y) = if Self::is_box_drawing(cell_char) {
@@ -3303,12 +3866,12 @@ impl Renderer {
                         let gy = (baseline_y - glyph.offset[1] - glyph.size[1]).round();
                         (gx, gy)
                     };
-                    
+
                     let g_left = Self::pixel_to_ndc_x(glyph_x, width);
                     let g_right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
                     let g_top = Self::pixel_to_ndc_y(glyph_y, height);
                     let g_bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
-                    
+
                     let base_idx = self.glyph_vertices.len() as u32;
                     self.glyph_vertices.push(GlyphVertex {
                         position: [g_left, g_top],
@@ -3342,17 +3905,17 @@ impl Renderer {
             }
         }
     }
-    
+
     /// Draw a filled rectangle.
     fn render_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
         let width = self.width as f32;
         let height = self.height as f32;
-        
+
         let left = Self::pixel_to_ndc_x(x, width);
         let right = Self::pixel_to_ndc_x(x + w, width);
         let top = Self::pixel_to_ndc_y(y, height);
         let bottom = Self::pixel_to_ndc_y(y + h, height);
-        
+
         let base_idx = self.bg_vertices.len() as u32;
         self.bg_vertices.push(GlyphVertex {
             position: [left, top],
@@ -3383,17 +3946,17 @@ impl Renderer {
             base_idx, base_idx + 2, base_idx + 3,
         ]);
     }
-    
+
     /// Draw a filled rectangle to the overlay layer (rendered on top of everything).
     fn render_overlay_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
         let width = self.width as f32;
         let height = self.height as f32;
-        
+
         let left = Self::pixel_to_ndc_x(x, width);
         let right = Self::pixel_to_ndc_x(x + w, width);
         let top = Self::pixel_to_ndc_y(y, height);
         let bottom = Self::pixel_to_ndc_y(y + h, height);
-        
+
         let base_idx = self.overlay_vertices.len() as u32;
         self.overlay_vertices.push(GlyphVertex {
             position: [left, top],
@@ -3424,63 +3987,95 @@ impl Renderer {
             base_idx, base_idx + 2, base_idx + 3,
         ]);
     }
-    
+
     /// Prepare edge glow uniform data for shader-based rendering.
     /// Returns the uniform data to be uploaded to the GPU.
-    fn prepare_edge_glow_uniforms(&self, glow: &EdgeGlow, terminal_y_offset: f32) -> EdgeGlowUniforms {
+    /// Prepare combined edge glow uniform data for all active glows.
+    fn prepare_edge_glow_uniforms(&self, glows: &[EdgeGlow], terminal_y_offset: f32, intensity: f32) -> EdgeGlowUniforms {
         // Use the same color as the active pane border (palette color 4 - typically blue)
         let [r, g, b] = self.palette.colors[4];
         let color_r = Self::srgb_to_linear(r as f32 / 255.0);
         let color_g = Self::srgb_to_linear(g as f32 / 255.0);
         let color_b = Self::srgb_to_linear(b as f32 / 255.0);
-        
-        let direction = match glow.direction {
-            Direction::Up => 0,
-            Direction::Down => 1,
-            Direction::Left => 2,
-            Direction::Right => 3,
-        };
-        
+
+        let mut glow_instances = [GlowInstance {
+            direction: 0,
+            progress: 0.0,
+            color_r: 0.0,
+            color_g: 0.0,
+            color_b: 0.0,
+            pane_x: 0.0,
+            pane_y: 0.0,
+            pane_width: 0.0,
+            pane_height: 0.0,
+            _padding1: 0.0,
+            _padding2: 0.0,
+            _padding3: 0.0,
+        }; MAX_EDGE_GLOWS];
+
+        let glow_count = glows.len().min(MAX_EDGE_GLOWS);
+
+        for (i, glow) in glows.iter().take(MAX_EDGE_GLOWS).enumerate() {
+            let direction = match glow.direction {
+                Direction::Up => 0,
+                Direction::Down => 1,
+                Direction::Left => 2,
+                Direction::Right => 3,
+            };
+
+            glow_instances[i] = GlowInstance {
+                direction,
+                progress: glow.progress(),
+                color_r,
+                color_g,
+                color_b,
+                pane_x: glow.pane_x,
+                pane_y: glow.pane_y,
+                pane_width: glow.pane_width,
+                pane_height: glow.pane_height,
+                _padding1: 0.0,
+                _padding2: 0.0,
+                _padding3: 0.0,
+            };
+        }
+
         EdgeGlowUniforms {
             screen_width: self.width as f32,
             screen_height: self.height as f32,
             terminal_y_offset,
-            direction,
-            progress: glow.progress(),
-            color_r,
-            color_g,
-            color_b,
-            enabled: 1,
-            _padding1: 0,
-            _padding2: 0,
-            _padding3: 0,
+            glow_intensity: intensity,
+            glow_count: glow_count as u32,
+            _padding: [0; 3],
+            glows: glow_instances,
         }
     }
-    
+
     /// Render multiple panes with borders.
-    /// 
+    ///
     /// Arguments:
     /// - `panes`: List of (terminal, pane_info, selection) tuples
     /// - `num_tabs`: Number of tabs for the tab bar
     /// - `active_tab`: Index of the active tab
-    /// - `edge_glow`: Optional edge glow animation for visual feedback
+    /// - `edge_glows`: Active edge glow animations for visual feedback
+    /// - `edge_glow_intensity`: Intensity of edge glow effect (0.0 = disabled, 1.0 = full)
     pub fn render_panes(
         &mut self,
         panes: &[(&Terminal, PaneRenderInfo, Option<(usize, usize, usize, usize)>)],
         num_tabs: usize,
         active_tab: usize,
-        edge_glow: Option<&EdgeGlow>,
+        edge_glows: &[EdgeGlow],
+        edge_glow_intensity: f32,
     ) -> Result<(), wgpu::SurfaceError> {
         // Sync palette from first terminal
         if let Some((terminal, _, _)) = panes.first() {
             self.palette = terminal.palette.clone();
         }
-        
+
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        
+
         // Clear buffers
         self.bg_vertices.clear();
         self.bg_indices.clear();
@@ -3488,12 +4083,12 @@ impl Renderer {
         self.glyph_indices.clear();
         self.overlay_vertices.clear();
         self.overlay_indices.clear();
-        
+
         let width = self.width as f32;
         let height = self.height as f32;
         let tab_bar_height = self.tab_bar_height();
         let terminal_y_offset = self.terminal_y_offset();
-        
+
         // ═══════════════════════════════════════════════════════════════════
         // RENDER TAB BAR (same as render_from_terminal)
         // ═══════════════════════════════════════════════════════════════════
@@ -3503,7 +4098,7 @@ impl Renderer {
                 TabBarPosition::Bottom => height - tab_bar_height,
                 TabBarPosition::Hidden => unreachable!(),
             };
-            
+
             let tab_bar_bg = {
                 let [r, g, b] = self.palette.default_bg;
                 let factor = 0.85_f32;
@@ -3514,21 +4109,21 @@ impl Renderer {
                     1.0,
                 ]
             };
-            
+
             // Draw tab bar background
             self.render_rect(0.0, tab_bar_y, width, tab_bar_height, tab_bar_bg);
-            
+
             // Render each tab
             let mut tab_x = 4.0_f32;
             let tab_padding = 8.0_f32;
             let min_tab_width = self.cell_width * 8.0;
-            
+
             for idx in 0..num_tabs {
                 let is_active = idx == active_tab;
                 let title = format!(" {} ", idx + 1);
                 let title_width = title.chars().count() as f32 * self.cell_width;
                 let tab_width = title_width.max(min_tab_width);
-                
+
                 let tab_bg = if is_active {
                     let [r, g, b] = self.palette.default_bg;
                     [
@@ -3540,7 +4135,7 @@ impl Renderer {
                 } else {
                     tab_bar_bg
                 };
-                
+
                 let tab_fg = {
                     let [r, g, b] = self.palette.default_fg;
                     let alpha = if is_active { 1.0 } else { 0.6 };
@@ -3551,14 +4146,14 @@ impl Renderer {
                         alpha,
                     ]
                 };
-                
+
                 // Draw tab background
                 self.render_rect(tab_x, tab_bar_y + 2.0, tab_width, tab_bar_height - 4.0, tab_bg);
-                
+
                 // Render tab title text
                 let text_y = tab_bar_y + (tab_bar_height - self.cell_height) / 2.0;
                 let text_x = tab_x + (tab_width - title_width) / 2.0;
-                
+
                 for (char_idx, c) in title.chars().enumerate() {
                     if c == ' ' {
                         continue;
@@ -3569,12 +4164,12 @@ impl Renderer {
                         let baseline_y = (text_y + self.cell_height * 0.8).round();
                         let glyph_x = (char_x + glyph.offset[0]).round();
                         let glyph_y = (baseline_y - glyph.offset[1] - glyph.size[1]).round();
-                        
+
                         let left = Self::pixel_to_ndc_x(glyph_x, width);
                         let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
                         let top = Self::pixel_to_ndc_y(glyph_y, height);
                         let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
-                        
+
                         let base_idx = self.glyph_vertices.len() as u32;
                         self.glyph_vertices.push(GlyphVertex {
                             position: [left, top],
@@ -3606,11 +4201,11 @@ impl Renderer {
                         ]);
                     }
                 }
-                
+
                 tab_x += tab_width + tab_padding;
             }
         }
-        
+
         // ═══════════════════════════════════════════════════════════════════
         // RENDER PANE BORDERS (only between adjacent panes)
         // ═══════════════════════════════════════════════════════════════════
@@ -3636,37 +4231,37 @@ impl Renderer {
                 1.0,
             ]
         };
-        
+
         // Only draw borders if there's more than one pane
         // The layout leaves a gap between panes, so we look for gaps and draw borders there
         if panes.len() > 1 {
             // Maximum gap size to consider as "adjacent" (layout uses border_width gap)
             let max_gap = 20.0;
-            
+
             // Check each pair of panes to find adjacent ones with gaps
             for i in 0..panes.len() {
                 for j in (i + 1)..panes.len() {
                     let (_, info_a, _) = &panes[i];
                     let (_, info_b, _) = &panes[j];
-                    
+
                     // Use active border color if either pane is active
                     let border_color = if info_a.is_active || info_b.is_active {
                         active_border_color
                     } else {
                         inactive_border_color
                     };
-                    
+
                     // Calculate absolute positions (with terminal_y_offset)
                     let a_x = info_a.x;
                     let a_y = terminal_y_offset + info_a.y;
                     let a_right = a_x + info_a.width;
                     let a_bottom = a_y + info_a.height;
-                    
+
                     let b_x = info_b.x;
                     let b_y = terminal_y_offset + info_b.y;
                     let b_right = b_x + info_b.width;
                     let b_bottom = b_y + info_b.height;
-                    
+
                     // Check for vertical adjacency (horizontal gap between panes)
                     // Pane A is to the left of pane B
                     let h_gap_ab = b_x - a_right;
@@ -3690,7 +4285,7 @@ impl Renderer {
                             self.render_rect(border_x, top, border_thickness, bottom - top, border_color);
                         }
                     }
-                    
+
                     // Check for horizontal adjacency (vertical gap between panes)
                     // Pane A is above pane B
                     let v_gap_ab = b_y - a_bottom;
@@ -3717,7 +4312,7 @@ impl Renderer {
                 }
             }
         }
-        
+
         // ═══════════════════════════════════════════════════════════════════
         // RENDER EACH PANE'S CONTENT
         // ═══════════════════════════════════════════════════════════════════
@@ -3727,7 +4322,7 @@ impl Renderer {
             let pane_y = terminal_y_offset + info.y;
             let pane_width = info.width;
             let pane_height = info.height;
-            
+
             self.render_pane_content(
                 terminal,
                 pane_x,
@@ -3738,7 +4333,7 @@ impl Renderer {
                 *selection,
                 info.dim_factor,
             );
-            
+
             // Draw dimming overlay for inactive panes
             // dim_factor of 1.0 = no dimming, dim_factor of 0.6 = 40% dark overlay
             if info.dim_factor < 1.0 {
@@ -3747,16 +4342,39 @@ impl Renderer {
                 self.render_overlay_rect(pane_x, pane_y, pane_width, pane_height, overlay_color);
             }
         }
-        
+
         // ═══════════════════════════════════════════════════════════════════
-        // PREPARE EDGE GLOW UNIFORMS (if navigation failed)
+        // PREPARE IMAGE RENDERS (Kitty Graphics Protocol)
         // ═══════════════════════════════════════════════════════════════════
-        let edge_glow_uniforms = if let Some(glow) = edge_glow {
-            Some(self.prepare_edge_glow_uniforms(glow, terminal_y_offset))
+        let mut image_renders: Vec<(u32, ImageUniforms)> = Vec::new();
+        for (terminal, info, _) in panes {
+            let pane_x = info.x;
+            let pane_y = terminal_y_offset + info.y;
+
+            let renders = self.prepare_image_renders(
+                terminal.image_storage.placements(),
+                pane_x,
+                pane_y,
+                self.cell_width,
+                self.cell_height,
+                width,
+                height,
+                terminal.scrollback.len(),
+                terminal.scroll_offset,
+                info.rows,
+            );
+            image_renders.extend(renders);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // PREPARE EDGE GLOW UNIFORMS (combined for all active glows)
+        // ═══════════════════════════════════════════════════════════════════
+        let edge_glow_uniforms = if !edge_glows.is_empty() && edge_glow_intensity > 0.0 {
+            Some(self.prepare_edge_glow_uniforms(edge_glows, terminal_y_offset, edge_glow_intensity))
         } else {
             None
         };
-        
+
         // ═══════════════════════════════════════════════════════════════════
         // SUBMIT TO GPU
         // ═══════════════════════════════════════════════════════════════════
@@ -3765,7 +4383,7 @@ impl Renderer {
         let overlay_vertex_count = self.overlay_vertices.len();
         let total_vertex_count = bg_vertex_count + glyph_vertex_count + overlay_vertex_count;
         let total_index_count = self.bg_indices.len() + self.glyph_indices.len() + self.overlay_indices.len();
-        
+
         // Resize buffers if needed
         if total_vertex_count > self.vertex_capacity {
             self.vertex_capacity = total_vertex_count * 2;
@@ -3776,7 +4394,7 @@ impl Renderer {
                 mapped_at_creation: false,
             });
         }
-        
+
         if total_index_count > self.index_capacity {
             self.index_capacity = total_index_count * 2;
             self.index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -3856,12 +4474,12 @@ impl Renderer {
             );
             self.atlas_dirty = false;
         }
-        
+
         // Create command encoder and render
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
         });
-        
+
         {
             let [bg_r, bg_g, bg_b] = self.palette.default_bg;
             let bg_r_linear = Self::srgb_to_linear(bg_r as f32 / 255.0) as f64;
@@ -3887,26 +4505,63 @@ impl Renderer {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            
+
             render_pass.set_pipeline(&self.glyph_pipeline);
             render_pass.set_bind_group(0, &self.glyph_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..total_index_count as u32, 0, 0..1);
         }
-        
+
+        // ═══════════════════════════════════════════════════════════════════
+        // IMAGE PASS (Kitty Graphics Protocol images, after glyph rendering)
+        // Each image is rendered with its own draw call using separate bind groups
+        // ═══════════════════════════════════════════════════════════════════
+        for (image_id, uniforms) in &image_renders {
+            // Check if we have the GPU texture for this image
+            if let Some(gpu_image) = self.image_textures.get(image_id) {
+                // Upload uniforms to this image's dedicated uniform buffer
+                self.queue.write_buffer(
+                    &gpu_image.uniform_buffer,
+                    0,
+                    bytemuck::cast_slice(&[*uniforms]),
+                );
+
+                // Create a render pass for this image (load existing content)
+                let mut image_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Image Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load, // Preserve existing content
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
+
+                image_pass.set_pipeline(&self.image_pipeline);
+                image_pass.set_bind_group(0, &gpu_image.bind_group, &[]);
+                image_pass.draw(0..4, 0..1); // Triangle strip quad
+            }
+        }
+
         // ═══════════════════════════════════════════════════════════════════
         // EDGE GLOW PASS (shader-based, after main rendering)
+        // All active glows are rendered in a single pass via uniform array
         // ═══════════════════════════════════════════════════════════════════
-        if let Some(uniforms) = edge_glow_uniforms {
+        if let Some(uniforms) = &edge_glow_uniforms {
             // Upload uniforms
             self.queue.write_buffer(
                 &self.edge_glow_uniform_buffer,
                 0,
-                bytemuck::cast_slice(&[uniforms]),
+                bytemuck::cast_slice(&[*uniforms]),
             );
-            
-            // Second render pass for edge glow (load existing content)
+
+            // Render pass for this edge glow (load existing content)
             let mut glow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Edge Glow Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3921,16 +4576,261 @@ impl Renderer {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            
+
             glow_pass.set_pipeline(&self.edge_glow_pipeline);
             glow_pass.set_bind_group(0, &self.edge_glow_bind_group, &[]);
             glow_pass.draw(0..3, 0..1); // Fullscreen triangle
         }
-        
+
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
-        
+
         Ok(())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // IMAGE RENDERING (Kitty Graphics Protocol)
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// Upload an image to the GPU, creating or updating its texture.
+    pub fn upload_image(&mut self, image: &ImageData) {
+        // Check if we already have this image
+        if let Some(existing) = self.image_textures.get(&image.id) {
+            if existing.width == image.width && existing.height == image.height {
+                // Same dimensions, just update the data
+                self.queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &existing.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &image.data,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(image.width * 4),
+                        rows_per_image: Some(image.height),
+                    },
+                    wgpu::Extent3d {
+                        width: image.width,
+                        height: image.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                return;
+            }
+            // Different dimensions, need to recreate
+        }
+
+        // Create new texture
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&format!("Image {}", image.id)),
+            size: wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        // Upload the data
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &image.data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(image.width * 4),
+                rows_per_image: Some(image.height),
+            },
+            wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Create per-image uniform buffer
+        let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("Image {} Uniform Buffer", image.id)),
+            size: std::mem::size_of::<ImageUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Create bind group for this image with its own uniform buffer
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("Image {} Bind Group", image.id)),
+            layout: &self.image_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.image_sampler),
+                },
+            ],
+        });
+
+        self.image_textures.insert(image.id, GpuImage {
+            texture,
+            view,
+            uniform_buffer,
+            bind_group,
+            width: image.width,
+            height: image.height,
+        });
+
+        log::debug!(
+            "Uploaded image {} ({}x{}) to GPU",
+            image.id,
+            image.width,
+            image.height
+        );
+    }
+
+    /// Remove an image from the GPU.
+    pub fn remove_image(&mut self, image_id: u32) {
+        if self.image_textures.remove(&image_id).is_some() {
+            log::debug!("Removed image {} from GPU", image_id);
+        }
+    }
+
+    /// Sync images from terminal's image storage to GPU.
+    /// Uploads new/changed images and removes deleted ones.
+    /// Also updates animation frames.
+    pub fn sync_images(&mut self, storage: &mut ImageStorage) {
+        // Update animations and get list of changed image IDs
+        let changed_ids = storage.update_animations();
+
+        // Re-upload frames that changed due to animation
+        for id in &changed_ids {
+            if let Some(image) = storage.get_image(*id) {
+                self.upload_image(image);
+            }
+        }
+
+        if !storage.dirty && changed_ids.is_empty() {
+            return;
+        }
+
+        // Upload all images (upload_image handles deduplication)
+        for image in storage.images().values() {
+            self.upload_image(image);
+        }
+
+        // Remove textures for deleted images
+        let current_ids: std::collections::HashSet<u32> = storage.images().keys().copied().collect();
+        let gpu_ids: Vec<u32> = self.image_textures.keys().copied().collect();
+        for id in gpu_ids {
+            if !current_ids.contains(&id) {
+                self.remove_image(id);
+            }
+        }
+
+        storage.clear_dirty();
+    }
+
+    /// Render images for a pane. Called from render_pane_content.
+    /// Returns a Vec of (image_id, uniforms) for deferred rendering.
+    fn prepare_image_renders(
+        &self,
+        placements: &[ImagePlacement],
+        pane_x: f32,
+        pane_y: f32,
+        cell_width: f32,
+        cell_height: f32,
+        screen_width: f32,
+        screen_height: f32,
+        scrollback_len: usize,
+        scroll_offset: usize,
+        visible_rows: usize,
+    ) -> Vec<(u32, ImageUniforms)> {
+        let mut renders = Vec::new();
+
+        for placement in placements {
+            // Check if we have the GPU texture for this image
+            let gpu_image = match self.image_textures.get(&placement.image_id) {
+                Some(img) => img,
+                None => continue, // Skip if not uploaded yet
+            };
+
+            // Convert absolute row to visible screen row
+            // placement.row is absolute (scrollback_len_at_placement + cursor_row)
+            // visible_row = absolute_row - scrollback_len + scroll_offset
+            let absolute_row = placement.row as isize;
+            let visible_row = absolute_row - scrollback_len as isize + scroll_offset as isize;
+
+            // Check if image is visible on screen
+            // Image spans from visible_row to visible_row + placement.rows
+            let image_bottom = visible_row + placement.rows as isize;
+            if image_bottom < 0 || visible_row >= visible_rows as isize {
+                continue; // Image is completely off-screen
+            }
+
+            // Calculate display position in pixels
+            let pos_x = pane_x + (placement.col as f32 * cell_width) + placement.x_offset as f32;
+            let pos_y = pane_y + (visible_row as f32 * cell_height) + placement.y_offset as f32;
+
+            log::debug!(
+                "Image render: pane_x={} col={} cell_width={} x_offset={} => pos_x={}",
+                pane_x, placement.col, cell_width, placement.x_offset, pos_x
+            );
+
+            // Calculate display size in pixels
+            let display_width = placement.cols as f32 * cell_width;
+            let display_height = placement.rows as f32 * cell_height;
+
+            // Calculate source rectangle in normalized coordinates
+            let src_x = placement.src_x as f32 / gpu_image.width as f32;
+            let src_y = placement.src_y as f32 / gpu_image.height as f32;
+            let src_width = if placement.src_width == 0 {
+                1.0 - src_x
+            } else {
+                placement.src_width as f32 / gpu_image.width as f32
+            };
+            let src_height = if placement.src_height == 0 {
+                1.0 - src_y
+            } else {
+                placement.src_height as f32 / gpu_image.height as f32
+            };
+
+            let uniforms = ImageUniforms {
+                screen_width,
+                screen_height,
+                pos_x,
+                pos_y,
+                display_width,
+                display_height,
+                src_x,
+                src_y,
+                src_width,
+                src_height,
+                _padding1: 0.0,
+                _padding2: 0.0,
+            };
+
+            renders.push((placement.image_id, uniforms));
+        }
+
+        renders
     }
 
 }

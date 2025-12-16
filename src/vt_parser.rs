@@ -558,7 +558,7 @@ impl Parser {
                             self.csi.primary = ch;
                             self.csi.state = CsiState::Body;
                         }
-                        b' ' | b'\'' | b'"' | b'!' | b'$' => {
+                        b' ' | b'\'' | b'"' | b'!' | b'$' | b'#' | b'*' => {
                             self.csi.secondary = ch;
                             self.csi.state = CsiState::PostSecondary;
                         }

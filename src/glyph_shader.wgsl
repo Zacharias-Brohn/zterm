@@ -1,5 +1,63 @@
 // Glyph rendering shader for terminal emulator
 // Supports both legacy quad-based rendering and new instanced cell rendering
+// Uses Kitty-style "legacy" gamma-incorrect text blending for crisp rendering
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GAMMA CONVERSION FUNCTIONS (for legacy text rendering)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Luminance weights for perceived brightness (ITU-R BT.709)
+const Y: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
+
+// Convert linear RGB to sRGB
+fn linear2srgb(x: f32) -> f32 {
+    if x <= 0.0031308 {
+        return 12.92 * x;
+    } else {
+        return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+    }
+}
+
+// Convert sRGB to linear RGB
+fn srgb2linear(x: f32) -> f32 {
+    if x <= 0.04045 {
+        return x / 12.92;
+    } else {
+        return pow((x + 0.055) / 1.055, 2.4);
+    }
+}
+
+// Kitty's legacy gamma-incorrect text blending
+// This simulates how text was blended before gamma-correct rendering became standard.
+// It makes dark text on light backgrounds appear thicker and light text on dark
+// backgrounds appear thinner, which many users prefer for readability.
+//
+// The input colors are in sRGB space. We convert to linear for the luminance
+// calculation, then simulate gamma-incorrect blending.
+fn foreground_contrast_legacy(over_srgb: vec3<f32>, over_alpha: f32, under_srgb: vec3<f32>) -> f32 {
+    // Convert sRGB colors to linear for luminance calculation
+    let over_linear = vec3<f32>(srgb2linear(over_srgb.r), srgb2linear(over_srgb.g), srgb2linear(over_srgb.b));
+    let under_linear = vec3<f32>(srgb2linear(under_srgb.r), srgb2linear(under_srgb.g), srgb2linear(under_srgb.b));
+    
+    let under_luminance = dot(under_linear, Y);
+    let over_luminance = dot(over_linear, Y);
+    
+    // Avoid division by zero when luminances are equal
+    let luminance_diff = over_luminance - under_luminance;
+    if abs(luminance_diff) < 0.001 {
+        return over_alpha;
+    }
+    
+    // Kitty's formula: simulate gamma-incorrect blending
+    // This is the solution to:
+    // linear2srgb(over * alpha2 + under * (1 - alpha2)) = linear2srgb(over) * alpha + linear2srgb(under) * (1 - alpha)
+    // ^ gamma correct blending with new alpha              ^ gamma incorrect blending with old alpha
+    let blended_srgb = linear2srgb(over_luminance) * over_alpha + linear2srgb(under_luminance) * (1.0 - over_alpha);
+    let blended_linear = srgb2linear(blended_srgb);
+    let new_alpha = (blended_linear - under_luminance) / luminance_diff;
+    
+    return clamp(new_alpha, 0.0, 1.0);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // LEGACY QUAD-BASED RENDERING (for backwards compatibility)
@@ -47,9 +105,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Sample the glyph alpha from the atlas
     let glyph_alpha = textureSample(atlas_texture, atlas_sampler, in.uv).r;
     
-    // Output foreground color with glyph alpha for blending
-    // The background was already rendered, so we just blend the glyph on top
-    return vec4<f32>(in.color.rgb, in.color.a * glyph_alpha);
+    // Apply legacy gamma-incorrect blending for crisp text
+    let adjusted_alpha = foreground_contrast_legacy(in.color.rgb, glyph_alpha, in.bg_color.rgb);
+    
+    // Output foreground color with adjusted alpha for blending
+    return vec4<f32>(in.color.rgb, in.color.a * adjusted_alpha);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -232,9 +292,7 @@ fn vs_cell_bg(
         bg = tmp;
     }
     
-    // Convert to linear for sRGB surface
-    fg = vec4<f32>(srgb_to_linear(fg.r), srgb_to_linear(fg.g), srgb_to_linear(fg.b), fg.a);
-    bg = vec4<f32>(srgb_to_linear(bg.r), srgb_to_linear(bg.g), srgb_to_linear(bg.b), bg.a);
+    // Keep colors in sRGB space for legacy blending
     
     var out: CellVertexOutput;
     out.clip_position = vec4<f32>(ndc_pos, 0.0, 1.0);
@@ -324,14 +382,13 @@ fn vs_cell_glyph(
         bg = tmp;
     }
     
-    // Convert to linear
-    fg = vec4<f32>(srgb_to_linear(fg.r), srgb_to_linear(fg.g), srgb_to_linear(fg.b), fg.a);
+    // Keep colors in sRGB space for legacy blending (conversion happens in fragment shader)
     
     var out: CellVertexOutput;
     out.clip_position = vec4<f32>(ndc_pos, 0.0, 1.0);
     out.uv = uvs[vertex_index];
     out.fg_color = fg;
-    out.bg_color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    out.bg_color = bg;  // Pass background for legacy gamma blending
     out.is_background = 0u;
     out.is_colored_glyph = select(0u, 1u, is_colored);
     
@@ -356,6 +413,9 @@ fn fs_cell(in: CellVertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(in.fg_color.rgb, glyph_alpha);
     }
     
-    // Normal glyph - tint with foreground color
-    return vec4<f32>(in.fg_color.rgb, in.fg_color.a * glyph_alpha);
+    // Apply legacy gamma-incorrect blending for crisp text
+    let adjusted_alpha = foreground_contrast_legacy(in.fg_color.rgb, glyph_alpha, in.bg_color.rgb);
+    
+    // Normal glyph - tint with foreground color using adjusted alpha
+    return vec4<f32>(in.fg_color.rgb, in.fg_color.a * adjusted_alpha);
 }

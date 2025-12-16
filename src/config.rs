@@ -367,6 +367,9 @@ pub struct Config {
     pub inactive_pane_fade_ms: u64,
     /// Dim factor for inactive panes (0.0 = fully dimmed/black, 1.0 = no dimming).
     pub inactive_pane_dim: f32,
+    /// Intensity of the edge glow effect when pane navigation fails (0.0 = disabled, 1.0 = full intensity).
+    /// The edge glow provides visual feedback when you try to navigate to a pane that doesn't exist.
+    pub edge_glow_intensity: f32,
     /// Process names that should receive pane navigation keys instead of zterm handling them.
     /// When the foreground process matches one of these names, Alt+Arrow keys are passed
     /// to the application (e.g., for Neovim buffer navigation) instead of switching panes.
@@ -385,6 +388,7 @@ impl Default for Config {
             scrollback_lines: 50_000,
             inactive_pane_fade_ms: 150,
             inactive_pane_dim: 0.6,
+            edge_glow_intensity: 1.0,
             pass_keys_to_programs: vec!["nvim".to_string(), "vim".to_string()],
             keybindings: Keybindings::default(),
         }

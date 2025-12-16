@@ -1,5 +1,6 @@
 //! Terminal state management and escape sequence handling.
 
+use crate::graphics::{GraphicsCommand, ImageStorage};
 use crate::keyboard::{query_response, KeyboardState};
 use crate::vt_parser::{CsiParams, Handler, Parser};
 
@@ -320,15 +321,12 @@ pub struct ScrollbackBuffer {
 }
 
 impl ScrollbackBuffer {
-    /// Creates a new scrollback buffer with the given capacity and column width.
-    /// All lines are pre-allocated to avoid any allocation during scrolling.
-    pub fn new(capacity: usize, cols: usize) -> Self {
-        // Pre-allocate all lines upfront
-        let lines = if capacity > 0 {
-            (0..capacity).map(|_| vec![Cell::default(); cols]).collect()
-        } else {
-            Vec::new()
-        };
+    /// Creates a new scrollback buffer with the given capacity.
+    /// Lines are allocated lazily as needed to avoid slow startup.
+    pub fn new(capacity: usize) -> Self {
+        // Don't pre-allocate lines - allocate them lazily as content is added
+        // This avoids allocating and zeroing potentially 20MB+ of memory at startup
+        let lines = Vec::with_capacity(capacity.min(1024)); // Start with reasonable capacity
         
         Self {
             lines,
@@ -361,9 +359,9 @@ impl ScrollbackBuffer {
     /// If the buffer is full, the oldest line is overwritten and its slot is returned
     /// for reuse (the caller can swap content into it).
     /// 
-    /// This is the key operation - it's O(1) with just modulo arithmetic, no allocation.
+    /// Lines are allocated lazily on first use to avoid slow startup.
     #[inline]
-    pub fn push(&mut self) -> &mut Vec<Cell> {
+    pub fn push(&mut self, cols: usize) -> &mut Vec<Cell> {
         if self.capacity == 0 {
             // Shouldn't happen in normal use, but handle gracefully
             panic!("Cannot push to zero-capacity scrollback buffer");
@@ -379,7 +377,11 @@ impl ScrollbackBuffer {
             self.start = (self.start + 1) % self.capacity;
             // count stays the same
         } else {
-            // Buffer not full yet - just increment count
+            // Buffer not full yet - allocate new line if needed
+            if idx >= self.lines.len() {
+                // Grow the lines vector and allocate the new line
+                self.lines.push(vec![Cell::default(); cols]);
+            }
             self.count += 1;
         }
         
@@ -488,6 +490,12 @@ pub struct Terminal {
     /// Command queue for terminal-to-application communication.
     /// Commands are added by OSC handlers and consumed by the application.
     command_queue: Vec<TerminalCommand>,
+    /// Image storage for Kitty graphics protocol.
+    pub image_storage: ImageStorage,
+    /// Cell width in pixels (for image sizing).
+    pub cell_width: f32,
+    /// Cell height in pixels (for image sizing).
+    pub cell_height: f32,
 }
 
 impl Terminal {
@@ -529,7 +537,7 @@ impl Terminal {
             keyboard: KeyboardState::new(),
             response_queue: Vec::new(),
             palette: ColorPalette::default(),
-            scrollback: ScrollbackBuffer::new(scrollback_limit, cols),
+            scrollback: ScrollbackBuffer::new(scrollback_limit),
             scroll_offset: 0,
             mouse_tracking: MouseTrackingMode::default(),
             mouse_encoding: MouseEncoding::default(),
@@ -545,6 +553,9 @@ impl Terminal {
             parser: Some(Parser::new()),
             stats: ProcessingStats::default(),
             command_queue: Vec::new(),
+            image_storage: ImageStorage::new(),
+            cell_width: 10.0,  // Default, will be set by renderer
+            cell_height: 20.0, // Default, will be set by renderer
         }
     }
     
@@ -808,7 +819,8 @@ impl Terminal {
             if self.scroll_top == 0 && !self.using_alternate_screen && self.scrollback.capacity > 0 {
                 // Get a slot in the ring buffer - this is O(1) with just modulo arithmetic
                 // If buffer is full, this overwrites the oldest line (perfect for our swap)
-                let dest = self.scrollback.push();
+                let cols = self.cols;
+                let dest = self.scrollback.push(cols);
                 // Swap grid row content into scrollback slot
                 // The scrollback slot's old content (if any) moves to the grid row
                 std::mem::swap(&mut self.grid[recycled_grid_row], dest);
@@ -1184,7 +1196,8 @@ impl Terminal {
             for visual_row in 0..self.rows {
                 let grid_row = self.line_map[visual_row];
                 // Get a slot in the ring buffer and swap content into it
-                let dest = self.scrollback.push();
+                let cols = self.cols;
+                let dest = self.scrollback.push(cols);
                 std::mem::swap(&mut self.grid[grid_row], dest);
             }
         }
@@ -1403,6 +1416,12 @@ impl Handler for Terminal {
         }
     }
 
+    /// Handle an APC (Application Program Command) sequence.
+    /// Used for Kitty graphics protocol.
+    fn apc(&mut self, data: &[u8]) {
+        self.handle_apc(data);
+    }
+
     /// Handle a complete CSI sequence.
     fn csi(&mut self, params: &CsiParams) {
         let action = params.final_char as char;
@@ -1619,10 +1638,32 @@ impl Handler for Terminal {
                 self.cursor_row = 0;
                 self.cursor_col = 0;
             }
-            // Window manipulation (CSI Ps t)
+            // Window manipulation (CSI Ps t) - XTWINOPS
             't' => {
                 let ps = params.get(0, 0);
                 match ps {
+                    14 => {
+                        // Report text area size in pixels: CSI 4 ; height ; width t
+                        let pixel_height = (self.rows as f32 * self.cell_height) as u32;
+                        let pixel_width = (self.cols as f32 * self.cell_width) as u32;
+                        let response = format!("\x1b[4;{};{}t", pixel_height, pixel_width);
+                        self.response_queue.extend_from_slice(response.as_bytes());
+                        log::debug!("XTWINOPS 14: Reported text area size {}x{} pixels", pixel_width, pixel_height);
+                    }
+                    16 => {
+                        // Report cell size in pixels: CSI 6 ; height ; width t
+                        let cell_h = self.cell_height as u32;
+                        let cell_w = self.cell_width as u32;
+                        let response = format!("\x1b[6;{};{}t", cell_h, cell_w);
+                        self.response_queue.extend_from_slice(response.as_bytes());
+                        log::debug!("XTWINOPS 16: Reported cell size {}x{} pixels", cell_w, cell_h);
+                    }
+                    18 => {
+                        // Report text area size in characters: CSI 8 ; rows ; cols t
+                        let response = format!("\x1b[8;{};{}t", self.rows, self.cols);
+                        self.response_queue.extend_from_slice(response.as_bytes());
+                        log::debug!("XTWINOPS 18: Reported text area size {}x{} chars", self.cols, self.rows);
+                    }
                     22 | 23 => {
                         // Save/restore window title - ignore
                     }
@@ -2076,6 +2117,75 @@ impl Terminal {
                     log::trace!("Synchronized output disabled");
                 }
                 _ => log::debug!("Unhandled DEC private mode reset: {}", params.params[i]),
+            }
+        }
+    }
+
+    /// Set cell dimensions (called by renderer after font metrics are calculated).
+    pub fn set_cell_size(&mut self, width: f32, height: f32) {
+        self.cell_width = width;
+        self.cell_height = height;
+    }
+
+    /// Handle an APC (Application Program Command) sequence.
+    /// This is used for the Kitty graphics protocol.
+    fn handle_apc(&mut self, data: &[u8]) {
+        // Kitty graphics protocol: APC starts with 'G'
+        if let Some(cmd) = GraphicsCommand::parse(data) {
+            log::debug!(
+                "Graphics command: action={:?} format={:?} id={:?} size={}x{:?} C={} U={}",
+                cmd.action,
+                cmd.format,
+                cmd.image_id,
+                cmd.width.unwrap_or(0),
+                cmd.height,
+                cmd.cursor_movement,
+                cmd.unicode_placeholder
+            );
+
+            // Convert cursor_row to absolute row (accounting for scrollback)
+            // This allows images to scroll with terminal content
+            let absolute_row = self.scrollback.len() + self.cursor_row;
+
+            // Process the command
+            let (response, placement_result) = self.image_storage.process_command(
+                cmd,
+                self.cursor_col,
+                absolute_row,
+                self.cell_width,
+                self.cell_height,
+            );
+            
+            // Queue the response to send back to the application
+            if let Some(resp) = response {
+                self.response_queue.extend_from_slice(resp.as_bytes());
+            }
+            
+            // Move cursor after image placement per Kitty protocol spec:
+            // "After placing an image on the screen the cursor must be moved to the 
+            // right by the number of cols in the image placement rectangle and down 
+            // by the number of rows in the image placement rectangle."
+            // However, if C=1 was specified, don't move the cursor.
+            if let Some(placement) = placement_result {
+                if !placement.suppress_cursor_move && !placement.virtual_placement {
+                    // Move cursor down by (rows - 1) since we're already on the first row
+                    // Then set cursor to the column after the image
+                    let new_row = self.cursor_row + placement.rows.saturating_sub(1);
+                    if new_row >= self.rows {
+                        // Need to scroll
+                        let scroll_amount = new_row - self.rows + 1;
+                        self.scroll_up(scroll_amount);
+                        self.cursor_row = self.rows - 1;
+                    } else {
+                        self.cursor_row = new_row;
+                    }
+                    // Move cursor to after the image (or stay at column 0 of next line)
+                    // Per protocol, cursor ends at the last row of the image
+                    log::debug!(
+                        "Cursor moved after image placement: row={} (moved {} rows)",
+                        self.cursor_row, placement.rows.saturating_sub(1)
+                    );
+                }
             }
         }
     }
