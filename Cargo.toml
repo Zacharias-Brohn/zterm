@@ -55,6 +55,9 @@ memmap2 = "0.9"
 # Fast byte searching
 memchr = "2"
 
+# Base64 decoding for OSC statusline
+base64 = "0.22"
+
 # Image processing (Kitty graphics protocol)
 image = { version = "0.25", default-features = false, features = ["png", "gif"] }
 flate2 = "1"

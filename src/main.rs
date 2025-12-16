@@ -6,7 +6,7 @@
 use zterm::config::{Action, Config};
 use zterm::keyboard::{FunctionalKey, KeyEncoder, KeyEventType, KeyboardState, Modifiers};
 use zterm::pty::Pty;
-use zterm::renderer::{EdgeGlow, PaneRenderInfo, Renderer, StatuslineComponent, StatuslineSection};
+use zterm::renderer::{EdgeGlow, PaneRenderInfo, Renderer, StatuslineComponent, StatuslineContent, StatuslineSection};
 use zterm::terminal::{Direction, Terminal, TerminalCommand, MouseTrackingMode};
 
 use std::collections::HashMap;
@@ -160,6 +160,10 @@ struct Pane {
     focus_animation_start: std::time::Instant,
     /// Whether this pane was focused before the current animation.
     was_focused: bool,
+    /// Custom statusline content set by applications (e.g., neovim).
+    /// Contains raw ANSI escape sequences for colors.
+    /// When Some, this overrides the default CWD/git statusline.
+    custom_statusline: Option<String>,
 }
 
 impl Pane {
@@ -193,6 +197,7 @@ impl Pane {
             last_scrollback_len: 0,
             focus_animation_start: std::time::Instant::now(),
             was_focused: true, // New panes start as focused
+            custom_statusline: None,
         })
     }
     
@@ -1409,7 +1414,7 @@ impl App {
         let cell_width = renderer.cell_width;
         let cell_height = renderer.cell_height;
         let width = renderer.width as f32;
-        let height = renderer.height as f32 - renderer.tab_bar_height();
+        let height = renderer.height as f32 - renderer.tab_bar_height() - renderer.statusline_height();
         let border_width = 2.0; // Border width in pixels
         
         for tab in &mut self.tabs {
@@ -1458,18 +1463,28 @@ impl App {
         
         // Handle commands outside the borrow
         for cmd in commands {
-            self.handle_terminal_command(cmd);
+            self.handle_terminal_command(pane_id, cmd);
         }
         
         processed
     }
     
     /// Handle a command from the terminal (triggered by OSC sequences).
-    fn handle_terminal_command(&mut self, cmd: TerminalCommand) {
+    fn handle_terminal_command(&mut self, pane_id: PaneId, cmd: TerminalCommand) {
         match cmd {
             TerminalCommand::NavigatePane(direction) => {
                 log::debug!("Terminal requested pane navigation: {:?}", direction);
                 self.focus_pane(direction);
+            }
+            TerminalCommand::SetStatusline(statusline) => {
+                log::debug!("Pane {:?} set statusline: {:?}", pane_id, statusline.as_ref().map(|s| s.len()));
+                // Find the pane and set its custom statusline
+                for tab in &mut self.tabs {
+                    if let Some(pane) = tab.get_pane_mut(pane_id) {
+                        pane.custom_statusline = statusline;
+                        break;
+                    }
+                }
             }
         }
     }
@@ -2258,6 +2273,19 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         
+                        // Clear custom statusline if the foreground process is no longer neovim/vim
+                        // This handles the case where neovim exits but didn't send a clear command
+                        if let Some(pane) = tab.panes.get_mut(&active_pane_id) {
+                            if pane.custom_statusline.is_some() {
+                                if let Some(proc_name) = pane.pty.foreground_process_name() {
+                                    let is_vim = proc_name == "nvim" || proc_name == "vim" || proc_name == "vi";
+                                    if !is_vim {
+                                        pane.custom_statusline = None;
+                                    }
+                                }
+                            }
+                        }
+                        
                         // Build render info for all panes
                         let mut pane_render_data: Vec<(&Terminal, PaneRenderInfo, Option<(usize, usize, usize, usize)>)> = Vec::new();
                         
@@ -2319,20 +2347,27 @@ impl ApplicationHandler<UserEvent> for App {
                             pane.terminal.image_storage.has_animations()
                         });
                         
-                        // Get the cwd from the active pane for the statusline
-                        let statusline_sections: Vec<StatuslineSection> = tab.panes.get(&active_pane_id)
-                            .and_then(|pane| pane.pty.foreground_cwd())
-                            .map(|cwd| {
-                                let mut sections = vec![build_cwd_section(&cwd)];
-                                // Add git section if in a git repository
-                                if let Some(git_section) = build_git_section(&cwd) {
-                                    sections.push(git_section);
+                        // Get the statusline content for the active pane
+                        // If the pane has a custom statusline (from neovim), use raw ANSI content
+                        let statusline_content: StatuslineContent = tab.panes.get(&active_pane_id)
+                            .map(|pane| {
+                                if let Some(ref custom) = pane.custom_statusline {
+                                    // Use raw ANSI content directly - no parsing into sections
+                                    StatuslineContent::Raw(custom.clone())
+                                } else if let Some(cwd) = pane.pty.foreground_cwd() {
+                                    // Default: CWD and git sections
+                                    let mut sections = vec![build_cwd_section(&cwd)];
+                                    if let Some(git_section) = build_git_section(&cwd) {
+                                        sections.push(git_section);
+                                    }
+                                    StatuslineContent::Sections(sections)
+                                } else {
+                                    StatuslineContent::Sections(Vec::new())
                                 }
-                                sections
                             })
                             .unwrap_or_default();
                         
-                        match renderer.render_panes(&pane_render_data, num_tabs, active_tab_idx, &self.edge_glows, self.config.edge_glow_intensity, &statusline_sections) {
+                        match renderer.render_panes(&pane_render_data, num_tabs, active_tab_idx, &self.edge_glows, self.config.edge_glow_intensity, &statusline_content) {
                             Ok(_) => {}
                             Err(wgpu::SurfaceError::Lost) => {
                                 renderer.resize(renderer.width, renderer.height);

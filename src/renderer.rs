@@ -159,6 +159,23 @@ impl StatuslineSection {
     }
 }
 
+/// Content to display in the statusline.
+/// Either structured sections (for ZTerm's default CWD/git display) or raw ANSI
+/// content (from neovim or other programs that provide their own statusline).
+#[derive(Debug, Clone)]
+pub enum StatuslineContent {
+    /// Structured sections with powerline-style transitions.
+    Sections(Vec<StatuslineSection>),
+    /// Raw ANSI-formatted string (rendered as-is without section styling).
+    Raw(String),
+}
+
+impl Default for StatuslineContent {
+    fn default() -> Self {
+        StatuslineContent::Sections(Vec::new())
+    }
+}
+
 /// Edge glow animation state for visual feedback when navigation fails.
 /// Creates an organic glow effect: a single light node appears at center,
 /// then splits into two that travel outward to the corners while fading.
@@ -1660,6 +1677,231 @@ impl Renderer {
             TabBarPosition::Top => self.tab_bar_height(),
             TabBarPosition::Bottom => self.height as f32 - self.tab_bar_height() - self.statusline_height(),
             TabBarPosition::Hidden => 0.0,
+        }
+    }
+    
+    /// Render raw ANSI-formatted content in the statusline.
+    /// This parses ANSI escape sequences inline and renders text with colors.
+    fn render_raw_ansi_statusline(
+        &mut self,
+        content: &str,
+        statusline_y: f32,
+        statusline_height: f32,
+        text_y: f32,
+        screen_width: f32,
+        screen_height: f32,
+    ) {
+        let mut cursor_x = 4.0_f32; // Small left padding
+        
+        // Current text attributes
+        let mut fg_color: [f32; 4] = {
+            let [r, g, b] = self.palette.default_fg;
+            [
+                Self::srgb_to_linear(r as f32 / 255.0),
+                Self::srgb_to_linear(g as f32 / 255.0),
+                Self::srgb_to_linear(b as f32 / 255.0),
+                1.0,
+            ]
+        };
+        let default_fg = fg_color;
+        let mut bg_color: Option<[f32; 4]> = None;
+        
+        let mut chars = content.chars().peekable();
+        
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // Parse escape sequence
+                if chars.peek() == Some(&'[') {
+                    chars.next(); // consume '['
+                    
+                    // Collect the CSI parameters
+                    let mut params = String::new();
+                    while let Some(&ch) = chars.peek() {
+                        if ch.is_ascii_digit() || ch == ';' {
+                            params.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                    
+                    // Get the final character
+                    if let Some(final_char) = chars.next() {
+                        if final_char == 'm' {
+                            // SGR sequence - parse color codes
+                            let parts: Vec<&str> = params.split(';').collect();
+                            let mut i = 0;
+                            while i < parts.len() {
+                                let code: u32 = parts[i].parse().unwrap_or(0);
+                                match code {
+                                    0 => {
+                                        // Reset
+                                        fg_color = default_fg;
+                                        bg_color = None;
+                                    }
+                                    1 => {
+                                        // Bold - could brighten color
+                                    }
+                                    30..=37 => {
+                                        // Standard foreground colors
+                                        let idx = (code - 30) as usize;
+                                        let [r, g, b] = self.palette.colors[idx];
+                                        fg_color = [
+                                            Self::srgb_to_linear(r as f32 / 255.0),
+                                            Self::srgb_to_linear(g as f32 / 255.0),
+                                            Self::srgb_to_linear(b as f32 / 255.0),
+                                            1.0,
+                                        ];
+                                    }
+                                    38 => {
+                                        // Extended foreground color
+                                        if i + 1 < parts.len() {
+                                            let mode: u32 = parts[i + 1].parse().unwrap_or(0);
+                                            if mode == 5 && i + 2 < parts.len() {
+                                                // 256 color
+                                                let idx: usize = parts[i + 2].parse().unwrap_or(0);
+                                                let [r, g, b] = self.palette.colors[idx.min(255)];
+                                                fg_color = [
+                                                    Self::srgb_to_linear(r as f32 / 255.0),
+                                                    Self::srgb_to_linear(g as f32 / 255.0),
+                                                    Self::srgb_to_linear(b as f32 / 255.0),
+                                                    1.0,
+                                                ];
+                                                i += 2;
+                                            } else if mode == 2 && i + 4 < parts.len() {
+                                                // RGB color
+                                                let r: u8 = parts[i + 2].parse().unwrap_or(0);
+                                                let g: u8 = parts[i + 3].parse().unwrap_or(0);
+                                                let b: u8 = parts[i + 4].parse().unwrap_or(0);
+                                                fg_color = [
+                                                    Self::srgb_to_linear(r as f32 / 255.0),
+                                                    Self::srgb_to_linear(g as f32 / 255.0),
+                                                    Self::srgb_to_linear(b as f32 / 255.0),
+                                                    1.0,
+                                                ];
+                                                i += 4;
+                                            }
+                                        }
+                                    }
+                                    40..=47 => {
+                                        // Standard background colors
+                                        let idx = (code - 40) as usize;
+                                        let [r, g, b] = self.palette.colors[idx];
+                                        bg_color = Some([
+                                            Self::srgb_to_linear(r as f32 / 255.0),
+                                            Self::srgb_to_linear(g as f32 / 255.0),
+                                            Self::srgb_to_linear(b as f32 / 255.0),
+                                            1.0,
+                                        ]);
+                                    }
+                                    48 => {
+                                        // Extended background color
+                                        if i + 1 < parts.len() {
+                                            let mode: u32 = parts[i + 1].parse().unwrap_or(0);
+                                            if mode == 5 && i + 2 < parts.len() {
+                                                // 256 color
+                                                let idx: usize = parts[i + 2].parse().unwrap_or(0);
+                                                let [r, g, b] = self.palette.colors[idx.min(255)];
+                                                bg_color = Some([
+                                                    Self::srgb_to_linear(r as f32 / 255.0),
+                                                    Self::srgb_to_linear(g as f32 / 255.0),
+                                                    Self::srgb_to_linear(b as f32 / 255.0),
+                                                    1.0,
+                                                ]);
+                                                i += 2;
+                                            } else if mode == 2 && i + 4 < parts.len() {
+                                                // RGB color
+                                                let r: u8 = parts[i + 2].parse().unwrap_or(0);
+                                                let g: u8 = parts[i + 3].parse().unwrap_or(0);
+                                                let b: u8 = parts[i + 4].parse().unwrap_or(0);
+                                                bg_color = Some([
+                                                    Self::srgb_to_linear(r as f32 / 255.0),
+                                                    Self::srgb_to_linear(g as f32 / 255.0),
+                                                    Self::srgb_to_linear(b as f32 / 255.0),
+                                                    1.0,
+                                                ]);
+                                                i += 4;
+                                            }
+                                        }
+                                    }
+                                    49 => {
+                                        // Default background
+                                        bg_color = None;
+                                    }
+                                    _ => {}
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            
+            // Render the character
+            if cursor_x + self.cell_width > screen_width {
+                break;
+            }
+            
+            // Draw background if set
+            if let Some(bg) = bg_color {
+                self.render_rect(cursor_x, statusline_y, self.cell_width, statusline_height, bg);
+            }
+            
+            if c == ' ' {
+                cursor_x += self.cell_width;
+                continue;
+            }
+            
+            let glyph = self.rasterize_char(c);
+            if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
+                // Powerline characters (U+E0B0-U+E0BF) need to start at y=0 to fill the statusline height
+                let is_powerline_char = ('\u{E0B0}'..='\u{E0BF}').contains(&c);
+                
+                let glyph_x = (cursor_x + glyph.offset[0]).round();
+                let glyph_y = if is_powerline_char {
+                    statusline_y
+                } else {
+                    let baseline_y = (text_y + self.cell_height * 0.8).round();
+                    (baseline_y - glyph.offset[1] - glyph.size[1]).round()
+                };
+
+                let left = Self::pixel_to_ndc_x(glyph_x, screen_width);
+                let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], screen_width);
+                let top = Self::pixel_to_ndc_y(glyph_y, screen_height);
+                let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], screen_height);
+
+                let base_idx = self.glyph_vertices.len() as u32;
+                self.glyph_vertices.push(GlyphVertex {
+                    position: [left, top],
+                    uv: [glyph.uv[0], glyph.uv[1]],
+                    color: fg_color,
+                    bg_color: [0.0, 0.0, 0.0, 0.0],
+                });
+                self.glyph_vertices.push(GlyphVertex {
+                    position: [right, top],
+                    uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
+                    color: fg_color,
+                    bg_color: [0.0, 0.0, 0.0, 0.0],
+                });
+                self.glyph_vertices.push(GlyphVertex {
+                    position: [right, bottom],
+                    uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
+                    color: fg_color,
+                    bg_color: [0.0, 0.0, 0.0, 0.0],
+                });
+                self.glyph_vertices.push(GlyphVertex {
+                    position: [left, bottom],
+                    uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
+                    color: fg_color,
+                    bg_color: [0.0, 0.0, 0.0, 0.0],
+                });
+                self.glyph_indices.extend_from_slice(&[
+                    base_idx, base_idx + 1, base_idx + 2,
+                    base_idx, base_idx + 2, base_idx + 3,
+                ]);
+            }
+            
+            cursor_x += self.cell_width;
         }
     }
 
@@ -4601,7 +4843,7 @@ impl Renderer {
     /// - `active_tab`: Index of the active tab
     /// - `edge_glows`: Active edge glow animations for visual feedback
     /// - `edge_glow_intensity`: Intensity of edge glow effect (0.0 = disabled, 1.0 = full)
-    /// - `statusline_sections`: Sections to render in the statusline
+    /// - `statusline_content`: Content to render in the statusline
     pub fn render_panes(
         &mut self,
         panes: &[(&Terminal, PaneRenderInfo, Option<(usize, usize, usize, usize)>)],
@@ -4609,7 +4851,7 @@ impl Renderer {
         active_tab: usize,
         edge_glows: &[EdgeGlow],
         edge_glow_intensity: f32,
-        statusline_sections: &[StatuslineSection],
+        statusline_content: &StatuslineContent,
     ) -> Result<(), wgpu::SurfaceError> {
         // Sync palette from first terminal
         if let Some((terminal, _, _)) = panes.first() {
@@ -4809,7 +5051,20 @@ impl Renderer {
                 }
             };
             
-            for (section_idx, section) in statusline_sections.iter().enumerate() {
+            match statusline_content {
+                StatuslineContent::Raw(ansi_content) => {
+                    // Render raw ANSI content directly without section styling
+                    self.render_raw_ansi_statusline(
+                        ansi_content,
+                        statusline_y,
+                        statusline_height,
+                        text_y,
+                        width,
+                        height,
+                    );
+                }
+                StatuslineContent::Sections(statusline_sections) => {
+                    for (section_idx, section) in statusline_sections.iter().enumerate() {
                 let section_start_x = cursor_x;
                 
                 // Calculate section width by counting characters
@@ -4951,6 +5206,8 @@ impl Renderer {
                     }
                     
                     cursor_x += self.cell_width;
+                }
+            }
                 }
             }
         }

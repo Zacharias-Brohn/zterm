@@ -11,6 +11,10 @@ pub enum TerminalCommand {
     /// Navigate to a neighboring pane in the given direction.
     /// Triggered by OSC 51;navigate;<direction> ST
     NavigatePane(Direction),
+    /// Set custom statusline content for this pane.
+    /// Triggered by OSC 51;statusline;<content> ST
+    /// Empty content clears the statusline (restores default).
+    SetStatusline(Option<String>),
 }
 
 /// Direction for pane navigation.
@@ -1382,6 +1386,7 @@ impl Handler for Terminal {
             // Format: OSC 51;command;args ST
             // Currently supported:
             //   OSC 51;navigate;up/down/left/right ST - Navigate to neighboring pane
+            //   OSC 51;statusline;<content> ST - Set custom statusline (empty to clear)
             51 => {
                 if parts.len() >= 2 {
                     if let Ok(command) = std::str::from_utf8(parts[1]) {
@@ -1402,6 +1407,37 @@ impl Handler for Terminal {
                                         }
                                     }
                                 }
+                            }
+                            "statusline" => {
+                                // OSC 51;statusline;<content> ST
+                                // If content is empty or missing, clear the statusline
+                                // Content may be base64-encoded (prefixed with "b64:") to avoid
+                                // escape sequence interpretation issues in the terminal
+                                let prefix = b"51;statusline;";
+                                let raw_content = if data.len() > prefix.len() && data.starts_with(prefix) {
+                                    std::str::from_utf8(&data[prefix.len()..]).ok().map(|s| s.to_string())
+                                } else if parts.len() >= 3 {
+                                    std::str::from_utf8(parts[2]).ok().map(|s| s.to_string())
+                                } else {
+                                    None
+                                };
+                                
+                                // Decode base64 if prefixed with "b64:"
+                                let content = raw_content.and_then(|s| {
+                                    if let Some(encoded) = s.strip_prefix("b64:") {
+                                        use base64::Engine;
+                                        base64::engine::general_purpose::STANDARD
+                                            .decode(encoded)
+                                            .ok()
+                                            .and_then(|bytes| String::from_utf8(bytes).ok())
+                                    } else {
+                                        Some(s)
+                                    }
+                                });
+                                
+                                let statusline = content.filter(|s| !s.is_empty());
+                                log::info!("OSC 51: Set statusline: {:?}", statusline.as_ref().map(|s| format!("{} bytes", s.len())));
+                                self.command_queue.push(TerminalCommand::SetStatusline(statusline));
                             }
                             _ => {
                                 log::debug!("OSC 51: Unknown command '{}'", command);
