@@ -35,7 +35,8 @@ pub struct Pty {
 
 impl Pty {
     /// Creates a new PTY and spawns a shell process.
-    pub fn spawn(shell: Option<&str>) -> Result<Self, PtyError> {
+    /// The initial terminal size should be provided so the shell starts with the correct dimensions.
+    pub fn spawn(shell: Option<&str>, cols: u16, rows: u16, xpixel: u16, ypixel: u16) -> Result<Self, PtyError> {
         // Open the PTY master
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
             .map_err(PtyError::OpenMaster)?;
@@ -49,6 +50,21 @@ impl Pty {
 
         // Get the slave name
         let slave_name = ptsname(&master, Vec::new()).map_err(PtyError::PtsName)?;
+        
+        // Set the terminal size BEFORE forking so the child inherits the correct size.
+        // This prevents race conditions where the shell's .zshrc runs before the parent
+        // can call resize(), causing programs like fastfetch to get wrong dimensions.
+        let winsize = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: xpixel,
+            ws_ypixel: ypixel,
+        };
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&master);
+        let result = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) };
+        if result == -1 {
+            return Err(PtyError::Io(std::io::Error::last_os_error()));
+        }
 
         // Fork the process
         // SAFETY: We're careful to only use async-signal-safe functions in the child

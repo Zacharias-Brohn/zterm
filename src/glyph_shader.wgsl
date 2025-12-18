@@ -219,6 +219,43 @@ const CURSOR_BLOCK: u32 = 0u;
 const CURSOR_UNDERLINE: u32 = 1u;
 const CURSOR_BAR: u32 = 2u;
 
+// Check if a cell is within the selection range
+// Selection is specified as (start_col, start_row) to (end_col, end_row), normalized
+// so start <= end in reading order
+fn is_cell_selected(col: u32, row: u32) -> bool {
+    // Check if selection is active (-1 values mean no selection)
+    if grid_params.selection_start_col < 0 || grid_params.selection_start_row < 0 {
+        return false;
+    }
+    
+    let sel_start_col = u32(grid_params.selection_start_col);
+    let sel_start_row = u32(grid_params.selection_start_row);
+    let sel_end_col = u32(grid_params.selection_end_col);
+    let sel_end_row = u32(grid_params.selection_end_row);
+    
+    // Check if cell is within row range
+    if row < sel_start_row || row > sel_end_row {
+        return false;
+    }
+    
+    // Single row selection
+    if sel_start_row == sel_end_row {
+        return col >= sel_start_col && col <= sel_end_col;
+    }
+    
+    // Multi-row selection
+    if row == sel_start_row {
+        // First row: from start_col to end of line
+        return col >= sel_start_col;
+    } else if row == sel_end_row {
+        // Last row: from start of line to end_col
+        return col <= sel_end_col;
+    } else {
+        // Middle rows: entire row is selected
+        return true;
+    }
+}
+
 // Vertex output for instanced cell rendering
 struct CellVertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -327,8 +364,8 @@ fn vs_cell_bg(
         bg = tmp;
     }
     
-    // Check if this cell is selected (per-cell flag set by CPU, respects xlimit)
-    let is_selected = (attrs & ATTR_SELECTED_BIT) != 0u;
+    // Check if this cell is selected using GridParams selection range
+    let is_selected = is_cell_selected(col, row);
     if is_selected {
         fg = vec4<f32>(0.0, 0.0, 0.0, 1.0);  // Black foreground
         bg = vec4<f32>(1.0, 1.0, 1.0, 1.0);  // White background
@@ -346,9 +383,18 @@ fn vs_cell_bg(
         bg.a = 0.0;
     }
     
-    // Calculate cursor color - use fg color (inverted from bg) for visibility
-    // For block cursor, we'll use fg as the cursor background
-    var cursor_color = fg;
+    // Calculate cursor color
+    // If the cell is empty (no glyph), use default foreground color for cursor
+    // Otherwise use the cell's foreground color
+    var cursor_color: vec4<f32>;
+    let sprite_idx = cell.sprite_idx & ~COLORED_GLYPH_FLAG;
+    if sprite_idx == 0u {
+        // Empty cell - use default foreground color for cursor
+        cursor_color = color_table.colors[256]; // default_fg
+    } else {
+        // Cell has a glyph - use its foreground color
+        cursor_color = fg;
+    }
     cursor_color.a = 1.0;
     
     var out: CellVertexOutput;
@@ -444,8 +490,8 @@ fn vs_cell_glyph(
         bg = tmp;
     }
     
-    // Check if this cell is selected (per-cell flag set by CPU, respects xlimit)
-    let is_selected = (attrs & ATTR_SELECTED_BIT) != 0u;
+    // Check if this cell is selected using GridParams selection range
+    let is_selected = is_cell_selected(col, row);
     if is_selected {
         fg = vec4<f32>(0.0, 0.0, 0.0, 1.0);  // Black foreground
         bg = vec4<f32>(1.0, 1.0, 1.0, 1.0);  // White background

@@ -517,6 +517,7 @@ impl Terminal {
 
     /// Creates a new terminal with the given dimensions and scrollback limit.
     pub fn new(cols: usize, rows: usize, scrollback_limit: usize) -> Self {
+        log::info!("Terminal::new: cols={}, rows={}, scroll_bottom={}", cols, rows, rows.saturating_sub(1));
         let grid = vec![vec![Cell::default(); cols]; rows];
         let line_map: Vec<usize> = (0..rows).collect();
         
@@ -703,6 +704,8 @@ impl Terminal {
         if cols == self.cols && rows == self.rows {
             return;
         }
+        
+        log::info!("Terminal::resize: {}x{} -> {}x{}", self.cols, self.rows, cols, rows);
 
         let old_cols = self.cols;
         let old_rows = self.rows;
@@ -1260,10 +1263,12 @@ impl Handler for Terminal {
                 }
                 // Line feed, Vertical tab, Form feed
                 '\x0A' | '\x0B' | '\x0C' => {
+                    let old_row = self.cursor_row;
                     self.cursor_row += 1;
                     if self.cursor_row > self.scroll_bottom {
                         self.scroll_up(1);
                         self.cursor_row = self.scroll_bottom;
+                        log::trace!("LF: scrolled at row {}, now at scroll_bottom {}", old_row, self.cursor_row);
                     }
                     // Update cache after line change
                     cached_row = self.cursor_row;
@@ -1609,17 +1614,23 @@ impl Handler for Terminal {
             // Cursor Up
             'A' => {
                 let n = params.get(0, 1).max(1) as usize;
+                let old_row = self.cursor_row;
                 self.cursor_row = self.cursor_row.saturating_sub(n);
+                log::trace!("CSI A: cursor up {} from row {} to {}", n, old_row, self.cursor_row);
             }
             // Cursor Down
             'B' => {
                 let n = params.get(0, 1).max(1) as usize;
+                let old_row = self.cursor_row;
                 self.cursor_row = (self.cursor_row + n).min(self.rows - 1);
+                log::trace!("CSI B: cursor down {} from row {} to {}", n, old_row, self.cursor_row);
             }
             // Cursor Forward
             'C' => {
                 let n = params.get(0, 1).max(1) as usize;
+                let old_col = self.cursor_col;
                 self.cursor_col = (self.cursor_col + n).min(self.cols - 1);
+                log::trace!("CSI C: cursor forward {} from col {} to {}", n, old_col, self.cursor_col);
             }
             // Cursor Back
             'D' => {
@@ -1641,7 +1652,9 @@ impl Handler for Terminal {
             // Cursor Horizontal Absolute (CHA)
             'G' => {
                 let col = params.get(0, 1).max(1) as usize;
+                let old_col = self.cursor_col;
                 self.cursor_col = (col - 1).min(self.cols - 1);
+                log::trace!("CSI G: cursor to col {} (was {})", self.cursor_col, old_col);
             }
             // Cursor Position
             'H' | 'f' => {

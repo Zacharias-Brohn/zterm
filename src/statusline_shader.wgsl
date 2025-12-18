@@ -144,6 +144,9 @@ struct VertexOutput {
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Statusline default background color (0x1a1a1a in linear RGB)
+const STATUSLINE_DEFAULT_BG: vec3<f32> = vec3<f32>(0.00972, 0.00972, 0.00972);
+
 // Resolve a packed color to RGBA
 fn resolve_color(packed: u32, is_foreground: bool) -> vec4<f32> {
     let color_type = packed & 0xFFu;
@@ -152,7 +155,8 @@ fn resolve_color(packed: u32, is_foreground: bool) -> vec4<f32> {
         if is_foreground {
             return color_table.colors[256];
         } else {
-            return color_table.colors[257];
+            // Statusline uses a solid default background, not the terminal's transparent one
+            return vec4<f32>(STATUSLINE_DEFAULT_BG, 1.0);
         }
     } else if color_type == COLOR_TYPE_INDEXED {
         let index = (packed >> 8u) & 0xFFu;
@@ -207,13 +211,9 @@ fn vs_statusline_bg(
     let ndc_pos = pixel_to_ndc(positions[vertex_index], screen_size);
     
     let fg = resolve_color(cell.fg, true);
-    var bg = resolve_color(cell.bg, false);
+    let bg = resolve_color(cell.bg, false);
     
-    // For default background, use transparent
-    let bg_type = cell.bg & 0xFFu;
-    if bg_type == COLOR_TYPE_DEFAULT {
-        bg.a = 0.0;
-    }
+    // Statusline always has solid background (no transparency for default bg)
     
     var out: VertexOutput;
     out.clip_position = vec4<f32>(ndc_pos, 0.0, 1.0);

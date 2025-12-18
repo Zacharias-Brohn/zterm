@@ -786,6 +786,10 @@ pub struct Renderer {
     
     /// GPU quads for overlay rendering (rendered on top of everything).
     overlay_quads: Vec<Quad>,
+    /// GPU buffer for overlay quad instances (separate from main quads).
+    overlay_quad_buffer: wgpu::Buffer,
+    /// Bind group for overlay quad rendering.
+    overlay_quad_bind_group: wgpu::BindGroup,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2747,6 +2751,30 @@ impl Renderer {
             ],
         });
         
+        // Overlay quad buffer for instance data (separate from main quads)
+        let overlay_quad_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Overlay Quad Buffer"),
+            size: (max_quads * std::mem::size_of::<Quad>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Bind group for overlay quad rendering (uses same params buffer but different quad buffer)
+        let overlay_quad_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Overlay Quad Bind Group"),
+            layout: &quad_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: quad_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: overlay_quad_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        
         // Pipeline layout for quad rendering
         let quad_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Quad Pipeline Layout"),
@@ -2890,6 +2918,8 @@ impl Renderer {
             quad_pipeline,
             quad_bind_group,
             overlay_quads: Vec::with_capacity(32),
+            overlay_quad_buffer,
+            overlay_quad_bind_group,
         }
     }
 
@@ -2990,6 +3020,120 @@ impl Renderer {
         };
         let available_height = self.height as f32 - self.tab_bar_height() - self.statusline_height();
         (available_height - used_height) / 2.0
+    }
+
+    /// Calculates screen-space bounds for edge glow given pane geometry.
+    /// Takes pane coordinates in grid-relative space and transforms them to screen coordinates,
+    /// extending to fill the terminal grid area (but not into tab bar or statusline).
+    /// Returns (screen_x, screen_y, width, height) for the glow mask area.
+    pub fn calculate_edge_glow_bounds(&self, pane_x: f32, pane_y: f32, pane_width: f32, pane_height: f32) -> (f32, f32, f32, f32) {
+        let grid_x_offset = self.grid_x_offset();
+        let grid_y_offset = self.grid_y_offset();
+        let terminal_y_offset = self.terminal_y_offset();
+        let (available_width, available_height) = self.available_grid_space();
+        
+        // Calculate the terminal grid area boundaries in screen coordinates
+        // This is the area where content is rendered, excluding tab bar and statusline
+        let grid_top = terminal_y_offset;
+        let grid_bottom = terminal_y_offset + available_height;
+        let grid_left = 0.0_f32;
+        let grid_right = self.width as f32;
+        
+        log::debug!("calculate_edge_glow_bounds: pane=({}, {}, {}, {})", pane_x, pane_y, pane_width, pane_height);
+        log::debug!("  grid area: top={}, bottom={}, left={}, right={}", grid_top, grid_bottom, grid_left, grid_right);
+        log::debug!("  offsets: grid_x={}, grid_y={}, terminal_y={}", grid_x_offset, grid_y_offset, terminal_y_offset);
+        
+        // Transform pane coordinates to screen space (same as border rendering)
+        let mut screen_x = grid_x_offset + pane_x;
+        let mut screen_y = terminal_y_offset + grid_y_offset + pane_y;
+        let mut width = pane_width;
+        let mut height = pane_height;
+        
+        log::debug!("  initial screen: ({}, {}, {}, {})", screen_x, screen_y, width, height);
+        
+        // Use a larger epsilon to account for cell-alignment gaps in split panes
+        // With cell-aligned splits, gaps can be up to one cell height
+        let epsilon = self.cell_height.max(self.cell_width);
+        
+        // Left edge at screen boundary - extend to screen left edge
+        if pane_x < epsilon {
+            width += screen_x - grid_left;
+            screen_x = grid_left;
+        }
+        
+        // Right edge at screen boundary - extend to screen right edge
+        if (pane_x + pane_width) >= available_width - epsilon {
+            width = grid_right - screen_x;
+        }
+        
+        // Top edge at grid boundary - extend to grid top (respects tab bar/statusline at top)
+        if pane_y < epsilon {
+            height += screen_y - grid_top;
+            screen_y = grid_top;
+        }
+        
+        // Bottom edge at grid boundary - extend to grid bottom (respects tab bar/statusline at bottom)
+        if (pane_y + pane_height) >= available_height - epsilon {
+            height = grid_bottom - screen_y;
+        }
+        
+        log::debug!("  final screen: ({}, {}, {}, {})", screen_x, screen_y, width, height);
+        
+        (screen_x, screen_y, width, height)
+    }
+
+    /// Calculates screen-space bounds for dim overlay given pane geometry.
+    /// Takes pane coordinates in grid-relative space and transforms them to screen coordinates,
+    /// extending to fill the terminal grid area (but not into tab bar or statusline).
+    /// This is identical to calculate_edge_glow_bounds - ensures dim overlays cover the full
+    /// pane area including centering margins, matching edge glow behavior.
+    /// Returns (screen_x, screen_y, width, height) for the overlay area.
+    pub fn calculate_dim_overlay_bounds(&self, pane_x: f32, pane_y: f32, pane_width: f32, pane_height: f32) -> (f32, f32, f32, f32) {
+        let grid_x_offset = self.grid_x_offset();
+        let grid_y_offset = self.grid_y_offset();
+        let terminal_y_offset = self.terminal_y_offset();
+        let (available_width, available_height) = self.available_grid_space();
+        
+        // Calculate the terminal grid area boundaries in screen coordinates
+        // This is the area where content is rendered, excluding tab bar and statusline
+        let grid_top = terminal_y_offset;
+        let grid_bottom = terminal_y_offset + available_height;
+        let grid_left = 0.0_f32;
+        let grid_right = self.width as f32;
+        
+        // Transform pane coordinates to screen space (same as border rendering)
+        let mut screen_x = grid_x_offset + pane_x;
+        let mut screen_y = terminal_y_offset + grid_y_offset + pane_y;
+        let mut width = pane_width;
+        let mut height = pane_height;
+        
+        // Use a larger epsilon to account for cell-alignment gaps in split panes
+        // With cell-aligned splits, gaps can be up to one cell height
+        let epsilon = self.cell_height.max(self.cell_width);
+        
+        // Left edge at screen boundary - extend to screen left edge
+        if pane_x < epsilon {
+            width += screen_x - grid_left;
+            screen_x = grid_left;
+        }
+        
+        // Right edge at screen boundary - extend to screen right edge
+        if (pane_x + pane_width) >= available_width - epsilon {
+            width = grid_right - screen_x;
+        }
+        
+        // Top edge at grid boundary - extend to grid top (respects tab bar/statusline at top)
+        if pane_y < epsilon {
+            height += screen_y - grid_top;
+            screen_y = grid_top;
+        }
+        
+        // Bottom edge at grid boundary - extend to grid bottom (respects tab bar/statusline at bottom)
+        if (pane_y + pane_height) >= available_height - epsilon {
+            height = grid_bottom - screen_y;
+        }
+        
+        (screen_x, screen_y, width, height)
     }
 
     /// Converts a pixel position to a terminal cell position.
@@ -4055,8 +4199,10 @@ impl Renderer {
         self.statusline_gpu_cells.clear();
         
         // Calculate target columns based on window width
+        // Use ceil() to ensure we cover the entire window edge-to-edge
+        // (the rightmost cell may extend slightly past the window, which is fine)
         let target_cols = if self.cell_width > 0.0 {
-            (target_width / self.cell_width).floor() as usize
+            (target_width / self.cell_width).ceil() as usize
         } else {
             self.statusline_max_cols
         };
@@ -4224,8 +4370,15 @@ impl Renderer {
                 }
             }
             StatuslineContent::Sections(sections) => {
-                for section in sections.iter() {
+                for (section_idx, section) in sections.iter().enumerate() {
                     let section_bg = Self::pack_statusline_color(section.bg);
+                    
+                    // Get next section's background for powerline arrow transition
+                    let next_section_bg = if section_idx + 1 < sections.len() {
+                        Self::pack_statusline_color(sections[section_idx + 1].bg)
+                    } else {
+                        default_bg
+                    };
                     
                     for component in section.components.iter() {
                         let component_fg = Self::pack_statusline_color(component.fg);
@@ -4358,10 +4511,10 @@ impl Renderer {
                         let arrow_char = '\u{E0B0}';
                         let (sprite_idx, _) = self.get_or_create_sprite_for(arrow_char, FontStyle::Regular, SpriteTarget::Statusline);
                         
-                        // Arrow foreground is section background, arrow background is next section bg or default
+                        // Arrow foreground is current section's bg, arrow background is next section's bg
                         self.statusline_gpu_cells.push(GPUCell {
-                            fg: section_bg, // Arrow takes section bg color as its foreground
-                            bg: default_bg, // Will be overwritten if there's a next section
+                            fg: section_bg,      // Arrow takes section bg color as its foreground
+                            bg: next_section_bg, // Background is the next section's background
                             decoration_fg: 0,
                             sprite_idx,
                             attrs: 0,
@@ -4369,6 +4522,19 @@ impl Renderer {
                     }
                 }
             }
+        }
+        
+        // Fill remaining width with default background cells
+        // This ensures the statusline covers the entire window width
+        let default_bg_packed = Self::pack_statusline_color(StatuslineColor::Default);
+        while self.statusline_gpu_cells.len() < target_cols && self.statusline_gpu_cells.len() < self.statusline_max_cols {
+            self.statusline_gpu_cells.push(GPUCell {
+                fg: 0,
+                bg: default_bg_packed,
+                decoration_fg: 0,
+                sprite_idx: 0,
+                attrs: 0,
+            });
         }
         
         self.statusline_gpu_cells.len()
@@ -6705,6 +6871,7 @@ impl Renderer {
                 Direction::Right => 3,
             };
 
+            // Glow coordinates are already in screen space (transformed by calculate_edge_glow_bounds)
             glow_instances[i] = GlowInstance {
                 direction,
                 progress: glow.progress(),
@@ -6753,6 +6920,10 @@ impl Renderer {
         // Sync palette from first terminal
         if let Some((terminal, _, _)) = panes.first() {
             self.palette = terminal.palette.clone();
+            log::debug!("render_panes: synced palette from first terminal, default_bg={:?}, default_fg={:?}", 
+                self.palette.default_bg, self.palette.default_fg);
+        } else {
+            log::debug!("render_panes: no panes, using existing palette");
         }
 
         let output = self.surface.get_current_texture()?;
@@ -6794,19 +6965,20 @@ impl Renderer {
                 TabBarPosition::Hidden => unreachable!(),
             };
 
-            let tab_bar_bg = {
-                let [r, g, b] = self.palette.default_bg;
-                let factor = 0.85_f32;
-                [
-                    Self::srgb_to_linear((r as f32 / 255.0) * factor),
-                    Self::srgb_to_linear((g as f32 / 255.0) * factor),
-                    Self::srgb_to_linear((b as f32 / 255.0) * factor),
-                    1.0,
-                ]
-            };
+            // Use same color as statusline: 0x1a1a1a (26, 26, 26) in sRGB
+            // Linear RGB value: ~0.00972
+            let tab_bar_bg = [
+                Self::srgb_to_linear(26.0 / 255.0),
+                Self::srgb_to_linear(26.0 / 255.0),
+                Self::srgb_to_linear(26.0 / 255.0),
+                1.0,
+            ];
 
             // Draw tab bar background
+            log::debug!("render_panes: drawing tab bar at y={}, height={}, num_tabs={}, quads_before={}", 
+                tab_bar_y, tab_bar_height, num_tabs, self.quads.len());
             self.render_rect(0.0, tab_bar_y, width, tab_bar_height, tab_bar_bg);
+            log::debug!("render_panes: after tab bar rect, quads_count={}", self.quads.len());
 
             // Render each tab
             let mut tab_x = 4.0_f32;
@@ -6820,15 +6992,25 @@ impl Renderer {
                 let tab_width = title_width.max(min_tab_width);
 
                 let tab_bg = if is_active {
+                    // Active tab: brightest - significantly brighter than tab bar
                     let [r, g, b] = self.palette.default_bg;
+                    let boost = 50.0_f32; // More visible for active tab
                     [
-                        Self::srgb_to_linear(r as f32 / 255.0),
-                        Self::srgb_to_linear(g as f32 / 255.0),
-                        Self::srgb_to_linear(b as f32 / 255.0),
+                        Self::srgb_to_linear((r as f32 + boost).min(255.0) / 255.0),
+                        Self::srgb_to_linear((g as f32 + boost).min(255.0) / 255.0),
+                        Self::srgb_to_linear((b as f32 + boost).min(255.0) / 255.0),
                         1.0,
                     ]
                 } else {
-                    tab_bar_bg
+                    // Inactive tab: slightly brighter than tab bar background
+                    let [r, g, b] = self.palette.default_bg;
+                    let boost = 30.0_f32;
+                    [
+                        Self::srgb_to_linear((r as f32 + boost).min(255.0) / 255.0),
+                        Self::srgb_to_linear((g as f32 + boost).min(255.0) / 255.0),
+                        Self::srgb_to_linear((b as f32 + boost).min(255.0) / 255.0),
+                        1.0,
+                    ]
                 };
 
                 let tab_fg = {
@@ -6933,6 +7115,15 @@ impl Renderer {
         if panes.len() > 1 {
             // Tolerance for detecting adjacent panes (should be touching or very close)
             let adjacency_tolerance = 1.0;
+            
+            // Calculate grid boundaries for extending borders to screen edges
+            // Same technique as edge glow and dim overlay
+            let (available_width, available_height) = self.available_grid_space();
+            let grid_top = terminal_y_offset;
+            let grid_bottom = terminal_y_offset + available_height;
+            let grid_left = 0.0_f32;
+            let grid_right = width;
+            let epsilon = self.cell_height.max(self.cell_width);
 
             // Check each pair of panes to find adjacent ones
             for i in 0..panes.len() {
@@ -6962,9 +7153,19 @@ impl Renderer {
                     // Pane A is to the left of pane B (A's right edge touches B's left edge)
                     if (a_right - b_x).abs() < adjacency_tolerance {
                         // Check if they overlap vertically
-                        let top = a_y.max(b_y);
-                        let bottom = a_bottom.min(b_bottom);
+                        let mut top = a_y.max(b_y);
+                        let mut bottom = a_bottom.min(b_bottom);
                         if bottom > top {
+                            // Extend to grid edges if both panes reach the edge
+                            // Top edge: extend if both panes are at grid top
+                            if info_a.y < epsilon && info_b.y < epsilon {
+                                top = grid_top;
+                            }
+                            // Bottom edge: extend if both panes reach grid bottom
+                            if (info_a.y + info_a.height) >= available_height - epsilon 
+                               && (info_b.y + info_b.height) >= available_height - epsilon {
+                                bottom = grid_bottom;
+                            }
                             // Draw vertical border centered on their shared edge
                             let border_x = a_right - border_thickness / 2.0;
                             self.render_overlay_rect(border_x, top, border_thickness, bottom - top, border_color);
@@ -6972,9 +7173,17 @@ impl Renderer {
                     }
                     // Pane B is to the left of pane A
                     if (b_right - a_x).abs() < adjacency_tolerance {
-                        let top = a_y.max(b_y);
-                        let bottom = a_bottom.min(b_bottom);
+                        let mut top = a_y.max(b_y);
+                        let mut bottom = a_bottom.min(b_bottom);
                         if bottom > top {
+                            // Extend to grid edges if both panes reach the edge
+                            if info_a.y < epsilon && info_b.y < epsilon {
+                                top = grid_top;
+                            }
+                            if (info_a.y + info_a.height) >= available_height - epsilon 
+                               && (info_b.y + info_b.height) >= available_height - epsilon {
+                                bottom = grid_bottom;
+                            }
                             let border_x = b_right - border_thickness / 2.0;
                             self.render_overlay_rect(border_x, top, border_thickness, bottom - top, border_color);
                         }
@@ -6984,9 +7193,19 @@ impl Renderer {
                     // Pane A is above pane B (A's bottom edge touches B's top edge)
                     if (a_bottom - b_y).abs() < adjacency_tolerance {
                         // Check if they overlap horizontally
-                        let left = a_x.max(b_x);
-                        let right = a_right.min(b_right);
+                        let mut left = a_x.max(b_x);
+                        let mut right = a_right.min(b_right);
                         if right > left {
+                            // Extend to screen edges if both panes reach the edge
+                            // Left edge: extend if both panes are at grid left
+                            if info_a.x < epsilon && info_b.x < epsilon {
+                                left = grid_left;
+                            }
+                            // Right edge: extend if both panes reach grid right
+                            if (info_a.x + info_a.width) >= available_width - epsilon 
+                               && (info_b.x + info_b.width) >= available_width - epsilon {
+                                right = grid_right;
+                            }
                             // Draw horizontal border centered on their shared edge
                             let border_y = a_bottom - border_thickness / 2.0;
                             self.render_overlay_rect(left, border_y, right - left, border_thickness, border_color);
@@ -6994,9 +7213,17 @@ impl Renderer {
                     }
                     // Pane B is above pane A
                     if (b_bottom - a_y).abs() < adjacency_tolerance {
-                        let left = a_x.max(b_x);
-                        let right = a_right.min(b_right);
+                        let mut left = a_x.max(b_x);
+                        let mut right = a_right.min(b_right);
                         if right > left {
+                            // Extend to screen edges if both panes reach the edge
+                            if info_a.x < epsilon && info_b.x < epsilon {
+                                left = grid_left;
+                            }
+                            if (info_a.x + info_a.width) >= available_width - epsilon 
+                               && (info_b.x + info_b.width) >= available_width - epsilon {
+                                right = grid_right;
+                            }
                             let border_y = b_bottom - border_thickness / 2.0;
                             self.render_overlay_rect(left, border_y, right - left, border_thickness, border_color);
                         }
@@ -7026,6 +7253,9 @@ impl Renderer {
             let pane_y = terminal_y_offset + grid_y_offset + info.y;
             let pane_width = info.width;
             let pane_height = info.height;
+            
+            log::debug!("render_panes: pane {} at ({}, {}), size {}x{}, bottom_edge={}", 
+                info.pane_id, pane_x, pane_y, pane_width, pane_height, pane_y + pane_height);
 
             // Update GPU cells for this terminal (populates self.gpu_cells)
             self.update_gpu_cells(terminal);
@@ -7056,8 +7286,9 @@ impl Renderer {
                 screen_height: self.height as f32,
                 x_offset: pane_x,
                 y_offset: pane_y,
-                cursor_col: if terminal.cursor_visible { terminal.cursor_col as i32 } else { -1 },
-                cursor_row: if terminal.cursor_visible { terminal.cursor_row as i32 } else { -1 },
+                // Hide cursor when scrolled into scrollback buffer or when cursor is explicitly hidden
+                cursor_col: if terminal.cursor_visible && terminal.scroll_offset == 0 { terminal.cursor_col as i32 } else { -1 },
+                cursor_row: if terminal.cursor_visible && terminal.scroll_offset == 0 { terminal.cursor_row as i32 } else { -1 },
                 cursor_style: match terminal.cursor_shape {
                     CursorShape::BlinkingBlock | CursorShape::SteadyBlock => 0,
                     CursorShape::BlinkingUnderline | CursorShape::SteadyUnderline => 1,
@@ -7098,11 +7329,14 @@ impl Renderer {
                 );
             }
             
-            // Build dim overlay if needed
+            // Build dim overlay if needed - use calculate_dim_overlay_bounds to extend
+            // edge panes to fill the terminal grid area (matching edge glow behavior)
             let dim_overlay = if info.dim_factor < 1.0 {
                 let overlay_alpha = 1.0 - info.dim_factor;
                 let overlay_color = [0.0, 0.0, 0.0, overlay_alpha];
-                Some((pane_x, pane_y, pane_width, pane_height, overlay_color))
+                // Pass raw grid-relative coordinates, the helper transforms to screen space
+                let (ox, oy, ow, oh) = self.calculate_dim_overlay_bounds(info.x, info.y, info.width, info.height);
+                Some((ox, oy, ow, oh, overlay_color))
             } else {
                 None
             };
@@ -7447,18 +7681,23 @@ impl Renderer {
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             
-            // Draw bg + glyph indices (tab bar text uses legacy vertex rendering)
-            render_pass.draw_indexed(0..total_index_count as u32, 0, 0..1);
-
             // ═══════════════════════════════════════════════════════════════════
             // INSTANCED QUAD RENDERING (tab bar backgrounds, borders, etc.)
-            // Rendered before cell content so backgrounds appear behind cells
+            // Rendered FIRST so backgrounds appear behind text
             // ═══════════════════════════════════════════════════════════════════
             if !self.quads.is_empty() {
                 render_pass.set_pipeline(&self.quad_pipeline);
                 render_pass.set_bind_group(0, &self.quad_bind_group, &[]);
                 render_pass.draw(0..4, 0..self.quads.len() as u32);
             }
+            
+            // Draw bg + glyph indices (tab bar text uses legacy vertex rendering)
+            // Rendered AFTER quads so text appears on top of backgrounds
+            render_pass.set_pipeline(&self.glyph_pipeline);
+            render_pass.set_bind_group(0, &self.glyph_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..total_index_count as u32, 0, 0..1);
 
             // ═══════════════════════════════════════════════════════════════════
             // INSTANCED CELL RENDERING (Like Kitty's per-window VAO approach)
@@ -7518,10 +7757,10 @@ impl Renderer {
             // Rendered last so overlays appear on top of everything
             // ═══════════════════════════════════════════════════════════════════
             if !self.overlay_quads.is_empty() {
-                // Upload overlay quads to the buffer (reusing the same buffer)
-                self.queue.write_buffer(&self.quad_buffer, 0, bytemuck::cast_slice(&self.overlay_quads));
+                // Upload overlay quads to the SEPARATE overlay buffer to avoid overwriting tab bar quads
+                self.queue.write_buffer(&self.overlay_quad_buffer, 0, bytemuck::cast_slice(&self.overlay_quads));
                 render_pass.set_pipeline(&self.quad_pipeline);
-                render_pass.set_bind_group(0, &self.quad_bind_group, &[]);
+                render_pass.set_bind_group(0, &self.overlay_quad_bind_group, &[]);
                 render_pass.draw(0..4, 0..self.overlay_quads.len() as u32);
             }
         }

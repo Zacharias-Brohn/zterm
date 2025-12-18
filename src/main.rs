@@ -270,19 +270,23 @@ impl Pane {
     /// Create a new pane with its own terminal and PTY.
     fn new(cols: usize, rows: usize, scrollback_lines: usize) -> Result<Self, String> {
         let terminal = Terminal::new(cols, rows, scrollback_lines);
-        let pty = Pty::spawn(None).map_err(|e| format!("Failed to spawn PTY: {}", e))?;
         
-        // Set terminal size (use default cell size estimate for initial pixel dimensions)
+        // Calculate pixel dimensions (use default cell size estimate)
         let default_cell_width = 10u16;
         let default_cell_height = 20u16;
-        if let Err(e) = pty.resize(
+        let width_px = cols as u16 * default_cell_width;
+        let height_px = rows as u16 * default_cell_height;
+        
+        // Spawn PTY with initial size - this sets the size BEFORE forking,
+        // so the shell inherits the correct terminal dimensions immediately.
+        // This prevents race conditions where .zshrc runs before resize().
+        let pty = Pty::spawn(
+            None, 
             cols as u16, 
-            rows as u16,
-            cols as u16 * default_cell_width,
-            rows as u16 * default_cell_height,
-        ) {
-            log::warn!("Failed to set initial PTY size: {}", e);
-        }
+            rows as u16, 
+            width_px, 
+            height_px
+        ).map_err(|e| format!("Failed to spawn PTY: {}", e))?;
         
         let pty_fd = pty.as_raw_fd();
         
@@ -302,10 +306,18 @@ impl Pane {
     }
     
     /// Resize the terminal and PTY.
+    /// Only sends SIGWINCH to the PTY if the size actually changed.
     fn resize(&mut self, cols: usize, rows: usize, width_px: u16, height_px: u16) {
+        // Check if size actually changed before sending SIGWINCH
+        // This prevents spurious signals that can interrupt programs like fastfetch
+        let size_changed = cols != self.terminal.cols || rows != self.terminal.rows;
+        
         self.terminal.resize(cols, rows);
-        if let Err(e) = self.pty.resize(cols as u16, rows as u16, width_px, height_px) {
-            log::warn!("Failed to resize PTY: {}", e);
+        
+        if size_changed {
+            if let Err(e) = self.pty.resize(cols as u16, rows as u16, width_px, height_px) {
+                log::warn!("Failed to resize PTY: {}", e);
+            }
         }
     }
     
@@ -439,17 +451,19 @@ impl SplitNode {
                 // Calculate how many cells fit
                 let cols = (width / cell_width).floor() as usize;
                 let rows = (height / cell_height).floor() as usize;
-                // Store actual cell-aligned dimensions (not allocated space)
-                let actual_width = cols.max(1) as f32 * cell_width;
-                let actual_height = rows.max(1) as f32 * cell_height;
+                // Store the full allocated dimensions (not just cell-aligned)
+                // This ensures edge glow and pane dimming cover the full pane area
                 *geometry = PaneGeometry {
                     x,
                     y,
-                    width: actual_width,
-                    height: actual_height,
+                    width,   // Full allocated width
+                    height,  // Full allocated height
                     cols: cols.max(1),
                     rows: rows.max(1),
                 };
+                // Return cell-aligned dimensions for layout calculations
+                let actual_width = cols.max(1) as f32 * cell_width;
+                let actual_height = rows.max(1) as f32 * cell_height;
                 (actual_width, actual_height)
             }
             SplitNode::Split { horizontal, ratio, first, second } => {
@@ -1954,14 +1968,17 @@ impl App {
         
         if !navigated {
             // No neighbor in that direction - trigger edge glow animation
-            // Add to existing glows (don't replace) so multiple can be visible
-            if let Some(geom) = active_pane_geom {
+            // Use renderer's helper to calculate proper screen-space glow bounds
+            if let (Some(geom), Some(renderer)) = (active_pane_geom, &self.renderer) {
+                let (glow_x, glow_y, glow_width, glow_height) = 
+                    renderer.calculate_edge_glow_bounds(geom.x, geom.y, geom.width, geom.height);
+                
                 self.edge_glows.push(EdgeGlow::new(
                     direction,
-                    geom.x,
-                    geom.y,
-                    geom.width,
-                    geom.height,
+                    glow_x,
+                    glow_y,
+                    glow_width,
+                    glow_height,
                 ));
             }
         }
@@ -2380,6 +2397,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     let scroll_offset = self.get_scroll_offset();
                                     let content_row = screen_row as isize - scroll_offset as isize;
                                     let pos = CellPosition { col, row: content_row };
+                                    log::debug!("Selection started at col={}, content_row={}, screen_row={}, scroll_offset={}", col, content_row, screen_row, scroll_offset);
                                     if let Some(tab) = self.active_tab_mut() {
                                         if let Some(pane) = tab.active_pane_mut() {
                                             pane.selection = Some(Selection { start: pos, end: pos });
@@ -2505,8 +2523,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 
                                 // Convert selection to screen coords for this pane
                                 let selection = if is_active {
-                                    pane.selection.as_ref()
-                                        .and_then(|sel| sel.to_screen_coords(scroll_offset, geom.rows))
+                                    let sel = pane.selection.as_ref()
+                                        .and_then(|sel| sel.to_screen_coords(scroll_offset, geom.rows));
+                                    if pane.selection.is_some() {
+                                        log::debug!("Render: pane.selection={:?}, scroll_offset={}, rows={}, screen_coords={:?}", 
+                                            pane.selection, scroll_offset, geom.rows, sel);
+                                    }
+                                    sel
                                 } else {
                                     None
                                 };
