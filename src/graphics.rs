@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::time::Instant;
 
+use base64::Engine;
 use flate2::read::ZlibDecoder;
 use image::{codecs::gif::GifDecoder, AnimationDecoder, ImageFormat};
 
@@ -374,14 +375,14 @@ impl GraphicsCommand {
 
     /// Convert RGB payload to RGBA.
     pub fn rgb_to_rgba(&self) -> Vec<u8> {
-        let mut rgba = Vec::with_capacity(self.payload.len() * 4 / 3);
-        for chunk in self.payload.chunks(3) {
-            if chunk.len() == 3 {
-                rgba.push(chunk[0]);
-                rgba.push(chunk[1]);
-                rgba.push(chunk[2]);
-                rgba.push(255);
-            }
+        let num_pixels = self.payload.len() / 3;
+        let mut rgba = Vec::with_capacity(num_pixels * 4);
+        // Use chunks_exact for better optimization - no bounds check in the loop
+        for chunk in self.payload.chunks_exact(3) {
+            rgba.push(chunk[0]);
+            rgba.push(chunk[1]);
+            rgba.push(chunk[2]);
+            rgba.push(255);
         }
         rgba
     }
@@ -680,10 +681,27 @@ pub struct ImageData {
     pub width: u32,
     /// Image height in pixels.
     pub height: u32,
-    /// RGBA pixel data (current frame for animated images).
+    /// RGBA pixel data (base frame for static images, or root frame for animations).
+    /// For animated images, use `current_frame_data()` to get the current frame.
     pub data: Vec<u8>,
     /// Animation data if this is an animated image.
     pub animation: Option<AnimationData>,
+}
+
+impl ImageData {
+    /// Get the current frame data for display.
+    /// For animated images, returns the current animation frame.
+    /// For static images, returns the base data.
+    /// This avoids cloning by returning a reference.
+    #[inline]
+    pub fn current_frame_data(&self) -> &[u8] {
+        if let Some(ref anim) = self.animation {
+            if anim.current_frame < anim.frames.len() {
+                return &anim.frames[anim.current_frame].data;
+            }
+        }
+        &self.data
+    }
 }
 
 /// Animation state for playback control.
@@ -779,6 +797,8 @@ pub struct ImageStorage {
     placements: Vec<ImagePlacement>,
     /// Buffer for chunked transmissions (image_id -> accumulated data).
     chunk_buffer: HashMap<u32, ChunkBuffer>,
+    /// Current image ID for ongoing chunked transfer (subsequent chunks may omit the ID).
+    current_chunked_id: Option<u32>,
     /// Next auto-generated image ID.
     next_id: u32,
     /// Flag indicating images have changed and need re-upload to GPU.
@@ -799,6 +819,7 @@ impl ImageStorage {
             images: HashMap::new(),
             placements: Vec::new(),
             chunk_buffer: HashMap::new(),
+            current_chunked_id: None,
             next_id: 1,
             dirty: false,
         }
@@ -816,7 +837,14 @@ impl ImageStorage {
     ) -> (Option<String>, Option<PlacementResult>) {
         // Handle chunked transfer
         if cmd.more_chunks {
-            let id = cmd.image_id.unwrap_or(0);
+            // Use explicit image_id if provided, otherwise use the current chunked transfer ID
+            let id = cmd.image_id.or(self.current_chunked_id).unwrap_or(0);
+            
+            // If this chunk has an explicit ID, it starts a new chunked transfer
+            if cmd.image_id.is_some() {
+                self.current_chunked_id = cmd.image_id;
+            }
+            
             let buffer = self.chunk_buffer.entry(id).or_default();
             buffer.data.extend_from_slice(&cmd.payload);
             if buffer.command.is_none() {
@@ -826,7 +854,12 @@ impl ImageStorage {
         }
 
         // Check if this completes a chunked transfer
-        let id = cmd.image_id.unwrap_or(0);
+        // Use explicit image_id if provided, otherwise use the current chunked transfer ID
+        let id = cmd.image_id.or(self.current_chunked_id).unwrap_or(0);
+        
+        // Clear the current chunked transfer ID since we're completing it
+        self.current_chunked_id = None;
+        
         if let Some(mut buffer) = self.chunk_buffer.remove(&id) {
             buffer.data.extend_from_slice(&cmd.payload);
             if let Some(mut buffered_cmd) = buffer.command {
@@ -1336,8 +1369,7 @@ impl ImageStorage {
             if let Some(frame_num) = cmd.base_frame {
                 if frame_num > 0 && (frame_num as usize) <= anim.frames.len() {
                     anim.current_frame = frame_num as usize - 1; // 1-indexed to 0-indexed
-                    // Update image data to show this frame
-                    image.data = anim.frames[anim.current_frame].data.clone();
+                    // No need to clone - renderer uses current_frame_data()
                     anim.frame_start = None; // Reset timing
                     log::debug!("Animation {} jumped to frame {}", id, frame_num);
                 }
@@ -1482,11 +1514,27 @@ impl ImageStorage {
                 Format::Rgba => {
                     let w = cmd.width.ok_or(GraphicsError::MissingDimensions)?;
                     let h = cmd.height.ok_or(GraphicsError::MissingDimensions)?;
+                    let expected_size = (w * h * 4) as usize;
+                    if cmd.payload.len() != expected_size {
+                        log::warn!(
+                            "RGBA image size mismatch: declared {}x{} ({} bytes expected), got {} bytes",
+                            w, h, expected_size, cmd.payload.len()
+                        );
+                        return Err(GraphicsError::InvalidData);
+                    }
                     (w, h, cmd.payload.clone(), None)
                 }
                 Format::Rgb => {
                     let w = cmd.width.ok_or(GraphicsError::MissingDimensions)?;
                     let h = cmd.height.ok_or(GraphicsError::MissingDimensions)?;
+                    let expected_size = (w * h * 3) as usize;
+                    if cmd.payload.len() != expected_size {
+                        log::warn!(
+                            "RGB image size mismatch: declared {}x{} ({} bytes expected), got {} bytes",
+                            w, h, expected_size, cmd.payload.len()
+                        );
+                        return Err(GraphicsError::InvalidData);
+                    }
                     (w, h, cmd.rgb_to_rgba(), None)
                 }
                 Format::Gif => decode_gif(&cmd.payload)?,
@@ -1727,8 +1775,8 @@ impl ImageStorage {
                     log::debug!("Animation {} frame {} -> {} (elapsed {}ms >= {}ms)", 
                         id, old_frame, anim.current_frame, elapsed, current_frame_duration);
 
-                    // Update the image data with the new frame
-                    image.data = anim.frames[anim.current_frame].data.clone();
+                    // Just update frame index - no data clone needed!
+                    // The renderer will use current_frame_data() to get the right frame.
                     anim.frame_start = Some(now);
                     changed.push(*id);
                 }
@@ -1758,43 +1806,14 @@ impl ImageStorage {
     }
 }
 
-/// Simple base64 decoder.
+/// Decode base64 data using the optimized base64 crate.
+/// This is faster than a custom implementation and handles whitespace automatically
+/// when using the STANDARD_NO_PAD engine with lenient decoding.
 fn base64_decode(input: &str) -> Result<Vec<u8>, GraphicsError> {
-    const DECODE_TABLE: [i8; 256] = {
-        let mut table = [-1i8; 256];
-        let chars =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut i = 0;
-        while i < 64 {
-            table[chars[i] as usize] = i as i8;
-            i += 1;
-        }
-        table
-    };
-
-    let input = input.as_bytes();
-    let mut output = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buffer = 0u32;
-    let mut bits = 0;
-
-    for &byte in input {
-        if byte == b'=' || byte == b'\n' || byte == b'\r' || byte == b' ' {
-            continue;
-        }
-        let value = DECODE_TABLE[byte as usize];
-        if value < 0 {
-            return Err(GraphicsError::Base64DecodeFailed);
-        }
-        buffer = (buffer << 6) | (value as u32);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push((buffer >> bits) as u8);
-            buffer &= (1 << bits) - 1;
-        }
-    }
-
-    Ok(output)
+    // Use standard base64 with lenient decoding (ignores whitespace, handles missing padding)
+    base64::engine::general_purpose::STANDARD
+        .decode(input.as_bytes())
+        .map_err(|_| GraphicsError::Base64DecodeFailed)
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@
 use crate::graphics::{GraphicsCommand, ImageStorage};
 use crate::keyboard::{query_response, KeyboardState};
 use crate::vt_parser::{CsiParams, Handler, Parser};
+use unicode_width::UnicodeWidthChar;
 
 /// Commands that the terminal can send to the application.
 /// These are triggered by special escape sequences from programs like Neovim.
@@ -35,6 +36,9 @@ pub struct Cell {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    /// If true, this cell is the continuation of a wide (double-width) character.
+    /// The actual character is stored in the previous cell.
+    pub wide_continuation: bool,
 }
 
 impl Default for Cell {
@@ -46,6 +50,7 @@ impl Default for Cell {
             bold: false,
             italic: false,
             underline: false,
+            wide_continuation: false,
         }
     }
 }
@@ -621,6 +626,13 @@ impl Terminal {
         self.dirty_lines[0]
     }
     
+    /// Check if synchronized output mode is active (rendering should be suppressed).
+    /// This is set by CSI 2026 or DCS pending mode (=1s/=2s).
+    #[inline]
+    pub fn is_synchronized(&self) -> bool {
+        self.synchronized_output
+    }
+    
     /// Get the actual grid row index for a visual row.
     #[inline]
     pub fn grid_row(&self, visual_row: usize) -> usize {
@@ -660,6 +672,7 @@ impl Terminal {
             bold: false,
             italic: false,
             underline: false,
+            wide_continuation: false,
         }
     }
 
@@ -1225,6 +1238,9 @@ impl Handler for Terminal {
         let mut cached_row = self.cursor_row;
         let mut grid_row = self.line_map[cached_row];
         
+        // Mark the initial line as dirty (like Kitty's init_text_loop_line)
+        self.mark_line_dirty(cached_row);
+        
         for &c in chars {
             match c {
                 // Bell
@@ -1252,13 +1268,56 @@ impl Handler for Terminal {
                     // Update cache after line change
                     cached_row = self.cursor_row;
                     grid_row = self.line_map[cached_row];
+                    // Mark the new line as dirty
+                    self.mark_line_dirty(cached_row);
                 }
                 // Carriage return
                 '\x0D' => {
                     self.cursor_col = 0;
                 }
-                // Printable characters (including all Unicode)
-                c if c >= ' ' => {
+                // Fast path for printable ASCII (0x20-0x7E) - like Kitty
+                // ASCII is always width 1, never zero-width, never wide
+                c if c >= ' ' && c <= '~' => {
+                    // Handle wrap
+                    if self.cursor_col >= self.cols {
+                        if self.auto_wrap {
+                            self.cursor_col = 0;
+                            self.cursor_row += 1;
+                            if self.cursor_row > self.scroll_bottom {
+                                self.scroll_up(1);
+                                self.cursor_row = self.scroll_bottom;
+                            }
+                            cached_row = self.cursor_row;
+                            grid_row = self.line_map[cached_row];
+                            self.mark_line_dirty(cached_row);
+                        } else {
+                            self.cursor_col = self.cols - 1;
+                        }
+                    }
+                    
+                    // Write character directly - no wide char handling needed for ASCII
+                    self.grid[grid_row][self.cursor_col] = Cell {
+                        character: c,
+                        fg_color: self.current_fg,
+                        bg_color: self.current_bg,
+                        bold: self.current_bold,
+                        italic: self.current_italic,
+                        underline: self.current_underline,
+                        wide_continuation: false,
+                    };
+                    self.cursor_col += 1;
+                }
+                // Slow path for non-ASCII printable characters (including all Unicode)
+                c if c > '~' => {
+                    // Determine character width using Unicode Standard Annex #11
+                    let char_width = c.width().unwrap_or(1);
+                    
+                    // Skip zero-width characters (combining marks, etc.)
+                    if char_width == 0 {
+                        // TODO: Handle combining characters
+                        continue;
+                    }
+                    
                     // Handle wrap
                     if self.cursor_col >= self.cols {
                         if self.auto_wrap {
@@ -1271,8 +1330,29 @@ impl Handler for Terminal {
                             // Update cache after line change
                             cached_row = self.cursor_row;
                             grid_row = self.line_map[cached_row];
+                            // Mark the new line as dirty
+                            self.mark_line_dirty(cached_row);
                         } else {
                             self.cursor_col = self.cols - 1;
+                        }
+                    }
+                    
+                    // For double-width characters at end of line, wrap first
+                    if char_width == 2 && self.cursor_col == self.cols - 1 {
+                        if self.auto_wrap {
+                            self.grid[grid_row][self.cursor_col] = Cell::default();
+                            self.cursor_col = 0;
+                            self.cursor_row += 1;
+                            if self.cursor_row > self.scroll_bottom {
+                                self.scroll_up(1);
+                                self.cursor_row = self.scroll_bottom;
+                            }
+                            cached_row = self.cursor_row;
+                            grid_row = self.line_map[cached_row];
+                            // Mark the new line as dirty
+                            self.mark_line_dirty(cached_row);
+                        } else {
+                            continue; // Can't fit
                         }
                     }
                     
@@ -1281,6 +1361,16 @@ impl Handler for Terminal {
                     if self.grid[grid_row].len() != self.cols {
                         self.grid[grid_row].resize(self.cols, Cell::default());
                     }
+                    
+                    // Handle overwriting wide character cells
+                    if self.grid[grid_row][self.cursor_col].wide_continuation && self.cursor_col > 0 {
+                        self.grid[grid_row][self.cursor_col - 1] = Cell::default();
+                    }
+                    if char_width == 1 && self.cursor_col + 1 < self.cols 
+                       && self.grid[grid_row][self.cursor_col + 1].wide_continuation {
+                        self.grid[grid_row][self.cursor_col + 1] = Cell::default();
+                    }
+                    
                     self.grid[grid_row][self.cursor_col] = Cell {
                         character: c,
                         fg_color: self.current_fg,
@@ -1288,16 +1378,33 @@ impl Handler for Terminal {
                         bold: self.current_bold,
                         italic: self.current_italic,
                         underline: self.current_underline,
+                        wide_continuation: false,
                     };
                     self.cursor_col += 1;
+                    
+                    // For double-width, write continuation cell
+                    if char_width == 2 && self.cursor_col < self.cols {
+                        if self.cursor_col + 1 < self.cols 
+                           && self.grid[grid_row][self.cursor_col + 1].wide_continuation {
+                            self.grid[grid_row][self.cursor_col + 1] = Cell::default();
+                        }
+                        self.grid[grid_row][self.cursor_col] = Cell {
+                            character: ' ',
+                            fg_color: self.current_fg,
+                            bg_color: self.current_bg,
+                            bold: self.current_bold,
+                            italic: self.current_italic,
+                            underline: self.current_underline,
+                            wide_continuation: true,
+                        };
+                        self.cursor_col += 1;
+                    }
                 }
                 // Other control chars - ignore
                 _ => {}
             }
         }
-        
-        // Mark all lines dirty at the end (we touched many lines)
-        self.mark_all_lines_dirty();
+        // Dirty lines are marked incrementally above - no need for mark_all_lines_dirty()
     }
 
     /// Handle control characters embedded in escape sequences.
@@ -1456,6 +1563,40 @@ impl Handler for Terminal {
     /// Used for Kitty graphics protocol.
     fn apc(&mut self, data: &[u8]) {
         self.handle_apc(data);
+    }
+
+    /// Handle a DCS (Device Control String) sequence.
+    /// Used for pending mode (synchronized output via DCS).
+    fn dcs(&mut self, data: &[u8]) {
+        // DCS pending mode: =1s to start, =2s to stop
+        // This is an alternative to CSI 2026 for synchronized output
+        if data.len() >= 3 && data[0] == b'=' && data[2] == b's' {
+            match data[1] {
+                b'1' => {
+                    // Start pending mode (pause rendering)
+                    if self.synchronized_output {
+                        log::warn!("Pending mode start requested while already in pending mode");
+                    }
+                    self.synchronized_output = true;
+                    log::trace!("DCS pending mode started (=1s)");
+                }
+                b'2' => {
+                    // Stop pending mode (resume rendering)
+                    if !self.synchronized_output {
+                        log::warn!("Pending mode stop requested while not in pending mode");
+                    }
+                    self.synchronized_output = false;
+                    self.dirty = true; // Force a redraw
+                    log::trace!("DCS pending mode stopped (=2s)");
+                }
+                _ => {
+                    log::debug!("Unknown DCS pending mode command: {:?}", data);
+                }
+            }
+        } else {
+            log::debug!("Unhandled DCS sequence: {:?}", 
+                std::str::from_utf8(data).unwrap_or("<invalid utf8>"));
+        }
     }
 
     /// Handle a complete CSI sequence.
@@ -1836,6 +1977,7 @@ impl Handler for Terminal {
                     bold: false,
                     italic: false,
                     underline: false,
+                    wide_continuation: false,
                 };
             }
             self.mark_line_dirty(visual_row);
@@ -1845,8 +1987,22 @@ impl Handler for Terminal {
 
 impl Terminal {
     /// Print a single character at the cursor position.
+    /// Handles double-width characters (emoji, CJK) by occupying two cells.
     #[inline]
     fn print_char(&mut self, c: char) {
+        // Determine character width using Unicode Standard Annex #11
+        // Width 2 = double-width (emoji, CJK, etc.)
+        // Width 1 = normal width
+        // Width 0 = combining/non-spacing marks (handled separately)
+        let char_width = c.width().unwrap_or(1);
+        
+        // Skip zero-width characters (combining marks, etc.)
+        if char_width == 0 {
+            // TODO: Handle combining characters by attaching to previous cell
+            return;
+        }
+        
+        // Check if we need to wrap before printing
         if self.cursor_col >= self.cols {
             if self.auto_wrap {
                 self.cursor_col = 0;
@@ -1859,8 +2015,42 @@ impl Terminal {
                 self.cursor_col = self.cols - 1;
             }
         }
+        
+        // For double-width characters, check if there's room
+        // If at the last column, we need to wrap first
+        if char_width == 2 && self.cursor_col == self.cols - 1 {
+            if self.auto_wrap {
+                // Write a space in the last column and wrap
+                let grid_row = self.line_map[self.cursor_row];
+                self.grid[grid_row][self.cursor_col] = Cell::default();
+                self.cursor_col = 0;
+                self.cursor_row += 1;
+                if self.cursor_row > self.scroll_bottom {
+                    self.scroll_up(1);
+                    self.cursor_row = self.scroll_bottom;
+                }
+            } else {
+                // Can't fit, don't print
+                return;
+            }
+        }
 
         let grid_row = self.line_map[self.cursor_row];
+        
+        // If we're overwriting a wide character's continuation cell,
+        // we need to clear the first cell of that wide character
+        if self.grid[grid_row][self.cursor_col].wide_continuation && self.cursor_col > 0 {
+            self.grid[grid_row][self.cursor_col - 1] = Cell::default();
+        }
+        
+        // If we're overwriting the first cell of a wide character,
+        // we need to clear its continuation cell
+        if char_width == 1 && self.cursor_col + 1 < self.cols 
+           && self.grid[grid_row][self.cursor_col + 1].wide_continuation {
+            self.grid[grid_row][self.cursor_col + 1] = Cell::default();
+        }
+        
+        // Write the character to the first cell
         self.grid[grid_row][self.cursor_col] = Cell {
             character: c,
             fg_color: self.current_fg,
@@ -1868,9 +2058,31 @@ impl Terminal {
             bold: self.current_bold,
             italic: self.current_italic,
             underline: self.current_underline,
+            wide_continuation: false,
         };
         self.mark_line_dirty(self.cursor_row);
         self.cursor_col += 1;
+        
+        // For double-width characters, write a continuation marker to the second cell
+        if char_width == 2 && self.cursor_col < self.cols {
+            // If the next cell is the first cell of another wide character,
+            // clear its continuation cell
+            if self.cursor_col + 1 < self.cols 
+               && self.grid[grid_row][self.cursor_col + 1].wide_continuation {
+                self.grid[grid_row][self.cursor_col + 1] = Cell::default();
+            }
+            
+            self.grid[grid_row][self.cursor_col] = Cell {
+                character: ' ',  // Placeholder - renderer will skip this
+                fg_color: self.current_fg,
+                bg_color: self.current_bg,
+                bold: self.current_bold,
+                italic: self.current_italic,
+                underline: self.current_underline,
+                wide_continuation: true,
+            };
+            self.cursor_col += 1;
+        }
     }
 
     /// Handle SGR (Select Graphic Rendition) parameters.

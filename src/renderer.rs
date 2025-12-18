@@ -7,7 +7,7 @@ use crate::terminal::{Color, ColorPalette, CursorShape, Direction, Terminal};
 use ab_glyph::{Font, FontRef, GlyphId, ScaleFont};
 use rustybuzz::UnicodeBuffer;
 use ttf_parser::Tag;
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::path::PathBuf;
@@ -16,10 +16,17 @@ use std::sync::Arc;
 // Fontconfig for dynamic font fallback
 use fontconfig::Fontconfig;
 
+// FreeType + Cairo for color emoji rendering
+use freetype::Library as FtLibrary;
+use cairo::{Format, ImageSurface};
+
 /// Pane geometry for multi-pane rendering.
 /// Describes where to render a pane within the window.
 #[derive(Debug, Clone, Copy)]
 pub struct PaneRenderInfo {
+    /// Unique identifier for this pane (used to track GPU resources).
+    /// Like Kitty's vao_idx, this maps to per-pane GPU buffers and bind groups.
+    pub pane_id: u64,
     /// Left edge in pixels.
     pub x: f32,
     /// Top edge in pixels.
@@ -37,6 +44,24 @@ pub struct PaneRenderInfo {
     /// Dim factor for this pane (0.0 = fully dimmed, 1.0 = fully bright).
     /// Used for smooth fade animations when switching pane focus.
     pub dim_factor: f32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PER-PANE GPU RESOURCES (Like Kitty's VAO per window)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// GPU resources for a single pane.
+/// Like Kitty's VAO, each pane gets its own buffers and bind group.
+/// This allows uploading each pane's cell data independently before rendering.
+pub struct PaneGpuResources {
+    /// Cell storage buffer - contains GPUCell array for this pane's visible cells.
+    pub cell_buffer: wgpu::Buffer,
+    /// Grid parameters uniform buffer for this pane.
+    pub grid_params_buffer: wgpu::Buffer,
+    /// Bind group for instanced rendering (@group(1)) - references this pane's buffers.
+    pub bind_group: wgpu::BindGroup,
+    /// Buffer capacity (max cells) - used to detect when buffer needs resizing.
+    pub capacity: usize,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -228,15 +253,20 @@ impl EdgeGlow {
 /// Size of the glyph atlas texture.
 const ATLAS_SIZE: u32 = 1024;
 
+/// Bytes per pixel in the RGBA atlas (4 for RGBA8).
+const ATLAS_BPP: u32 = 4;
+
 /// Cached glyph information.
+/// In Kitty's model, all glyphs are stored as cell-sized sprites with the glyph
+/// pre-positioned at the correct baseline within the sprite.
 #[derive(Clone, Copy, Debug)]
 struct GlyphInfo {
     /// UV coordinates in the atlas (left, top, width, height) normalized 0-1.
     uv: [f32; 4],
-    /// Offset from cell origin to glyph origin.
-    offset: [f32; 2],
-    /// Size of the glyph in pixels.
+    /// Size of the sprite in pixels (always cell_width x cell_height).
     size: [f32; 2],
+    /// Whether this is a colored glyph (emoji).
+    is_colored: bool,
 }
 
 /// Wrapper to hold the rustybuzz Face with a 'static lifetime.
@@ -291,16 +321,6 @@ struct ShapedGlyphs {
     /// Each tuple is (glyph_id, x_advance, x_offset, y_offset, cluster).
     /// x_offset/y_offset are for texture healing - they shift the glyph without affecting advance.
     glyphs: Vec<(u16, f32, f32, f32, u32)>,
-}
-
-/// Cached cell sprites for a text run.
-/// When we render a text run using Kitty's canvas approach, we get one sprite per cell.
-/// This caches those sprites so we don't re-render the same text runs.
-#[derive(Clone, Debug)]
-struct TextRunSprites {
-    /// UV coordinates and sizes for each cell in the run.
-    /// Each entry is (uv_x, uv_y, uv_w, uv_h) in the atlas, plus cell_width and cell_height.
-    cells: Vec<[f32; 4]>,
 }
 
 /// Vertex for rendering textured quads.
@@ -397,6 +417,169 @@ struct GpuImage {
     height: u32,
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// KITTY-STYLE INSTANCED CELL RENDERING STRUCTURES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// GPU cell data for instanced rendering.
+/// Matches GPUCell in glyph_shader.wgsl exactly.
+/// 
+/// Like Kitty, we store a sprite_idx that references pre-rendered glyphs in the atlas.
+/// This allows us to update GPU buffers with a simple memcpy when content changes,
+/// rather than rebuilding vertex buffers every frame.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GPUCell {
+    /// Foreground color (packed: type in low byte, then RGB or index)
+    pub fg: u32,
+    /// Background color (packed: type in low byte, then RGB or index)
+    pub bg: u32,
+    /// Decoration foreground color (for underlines, etc.)
+    pub decoration_fg: u32,
+    /// Sprite index in the sprite info array. High bit set = colored glyph.
+    /// 0 = no glyph (space or empty)
+    pub sprite_idx: u32,
+    /// Cell attributes (bold, italic, reverse, etc.)
+    pub attrs: u32,
+}
+
+/// Color type constants for packed color encoding.
+pub const COLOR_TYPE_DEFAULT: u32 = 0;
+pub const COLOR_TYPE_INDEXED: u32 = 1;
+pub const COLOR_TYPE_RGB: u32 = 2;
+
+/// Attribute bit flags.
+pub const ATTR_BOLD: u32 = 0x8;
+pub const ATTR_ITALIC: u32 = 0x10;
+pub const ATTR_REVERSE: u32 = 0x20;
+pub const ATTR_STRIKE: u32 = 0x40;
+pub const ATTR_DIM: u32 = 0x80;
+pub const ATTR_UNDERLINE: u32 = 0x1; // Part of decoration mask
+pub const ATTR_SELECTED: u32 = 0x100; // Cell is selected (for selection highlighting)
+
+/// Flag for colored glyphs (emoji).
+pub const COLORED_GLYPH_FLAG: u32 = 0x80000000;
+
+/// Sprite info for glyph positioning.
+/// Matches SpriteInfo in glyph_shader.wgsl exactly.
+/// 
+/// In Kitty's model, sprites are always cell-sized and glyphs are pre-positioned
+/// within the sprite at the correct baseline. The shader just maps the sprite
+/// to the cell 1:1, with no offset math needed.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SpriteInfo {
+    /// UV coordinates in atlas (x, y, width, height) - normalized 0-1
+    pub uv: [f32; 4],
+    /// Padding to maintain alignment (previously offset, now unused)
+    pub _padding: [f32; 2],
+    /// Size in pixels (width, height) - always matches cell dimensions
+    pub size: [f32; 2],
+}
+
+/// Grid parameters uniform for instanced rendering.
+/// Matches GridParams in glyph_shader.wgsl exactly.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct GridParams {
+    cols: u32,
+    rows: u32,
+    cell_width: f32,
+    cell_height: f32,
+    screen_width: f32,
+    screen_height: f32,
+    x_offset: f32,
+    y_offset: f32,
+    cursor_col: i32,
+    cursor_row: i32,
+    cursor_style: u32,
+    background_opacity: f32,
+    // Selection range (-1 values mean no selection)
+    selection_start_col: i32,
+    selection_start_row: i32,
+    selection_end_col: i32,
+    selection_end_row: i32,
+}
+
+/// GPU quad instance for instanced rectangle rendering.
+/// Matches Quad in glyph_shader.wgsl exactly.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Quad {
+    /// X position in pixels
+    pub x: f32,
+    /// Y position in pixels
+    pub y: f32,
+    /// Width in pixels
+    pub width: f32,
+    /// Height in pixels
+    pub height: f32,
+    /// Color (linear RGBA)
+    pub color: [f32; 4],
+}
+
+/// Parameters for quad rendering.
+/// Matches QuadParams in glyph_shader.wgsl exactly.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct QuadParams {
+    screen_width: f32,
+    screen_height: f32,
+    _padding: [f32; 2],
+}
+
+/// Parameters for statusline rendering.
+/// Matches StatuslineParams in statusline_shader.wgsl exactly.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct StatuslineParams {
+    /// Number of characters in statusline
+    char_count: u32,
+    /// Cell width in pixels
+    cell_width: f32,
+    /// Cell height in pixels
+    cell_height: f32,
+    /// Screen width in pixels
+    screen_width: f32,
+    /// Screen height in pixels
+    screen_height: f32,
+    /// Y offset from top of screen in pixels
+    y_offset: f32,
+    /// Padding for alignment (to match shader struct layout)
+    _padding: [f32; 2],
+}
+
+/// Color table uniform containing 256 indexed colors + default fg/bg.
+/// Matches ColorTable in glyph_shader.wgsl.
+/// Note: We don't use this directly - colors are resolved per-cell on CPU side.
+/// This struct is kept for documentation/future use.
+#[allow(dead_code)]
+struct ColorTable {
+    /// 256 indexed colors + default_fg (256) + default_bg (257)
+    colors: [[f32; 4]; 258],
+}
+
+/// Key for looking up sprites in the sprite map.
+/// A sprite is uniquely identified by the glyph content and style.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct SpriteKey {
+    /// The character or ligature string
+    text: String,
+    /// Font style (regular, bold, italic, bold-italic)
+    style: FontStyle,
+    /// Whether this is a colored glyph (emoji)
+    colored: bool,
+}
+
+/// Target sprite buffer for glyph allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpriteTarget {
+    /// Terminal pane sprites (main sprite buffer)
+    Terminal,
+    /// Statusline sprites (separate buffer)
+    Statusline,
+}
+
 /// The terminal renderer.
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -440,6 +623,11 @@ pub struct Renderer {
     fontconfig: OnceCell<Option<Fontconfig>>,
     /// Set of font paths we've already tried (to avoid reloading)
     tried_font_paths: HashSet<PathBuf>,
+    /// Color font renderer (FreeType + Cairo) for emoji - lazy initialized
+    /// Using RefCell because ColorFontRenderer needs mutable access to cache font faces
+    color_font_renderer: RefCell<Option<ColorFontRenderer>>,
+    /// Cache mapping characters to their color font path (if any)
+    color_font_cache: HashMap<char, Option<PathBuf>>,
     shaping_ctx: ShapingContext,
     /// OpenType features for shaping (shared across all font variants)
     shaping_features: Vec<rustybuzz::Feature>,
@@ -448,14 +636,6 @@ pub struct Renderer {
     /// Glyph cache keyed by (font_style, font_index, glyph_id)
     /// font_style is FontStyle as usize, font_index is 0 for primary, 1+ for fallbacks
     glyph_cache: HashMap<(usize, usize, u16), GlyphInfo>,
-    /// Cache for text run sprites (Kitty-style texture healing).
-    /// Keyed by the text string of the run. Value contains UV coords for each cell.
-    text_run_cache: HashMap<String, TextRunSprites>,
-    /// Reusable canvas buffer for rendering text runs (Kitty-style texture healing).
-    /// This is a temporary buffer we render multiple glyphs into, then slice into cells.
-    canvas_buffer: Vec<u8>,
-    /// Current canvas dimensions (width, height) in pixels.
-    canvas_size: (u32, u32),
     atlas_cursor_x: u32,
     atlas_cursor_y: u32,
     atlas_row_height: u32,
@@ -481,6 +661,9 @@ pub struct Renderer {
     /// Cell dimensions in pixels.
     pub cell_width: f32,
     pub cell_height: f32,
+    /// Baseline offset from top of cell in pixels.
+    /// Glyphs are positioned so their baseline sits at this Y position within the cell.
+    baseline: f32,
     /// Window dimensions.
     pub width: u32,
     pub height: u32,
@@ -490,18 +673,119 @@ pub struct Renderer {
     tab_bar_position: TabBarPosition,
     /// Background opacity (0.0 = transparent, 1.0 = opaque).
     background_opacity: f32,
+    /// Actual used grid dimensions (set by pane layout, used for centering).
+    /// When there are splits, this is the total size of all panes + borders.
+    grid_used_width: f32,
+    grid_used_height: f32,
 
     // Reusable vertex/index buffers to avoid per-frame allocations
     bg_vertices: Vec<GlyphVertex>,
     bg_indices: Vec<u32>,
     glyph_vertices: Vec<GlyphVertex>,
     glyph_indices: Vec<u32>,
-    overlay_vertices: Vec<GlyphVertex>,
-    overlay_indices: Vec<u32>,
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // KITTY-STYLE INSTANCED RENDERING STATE
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// Sprite map: maps glyph content + style to sprite index.
+    /// The sprite index is used in GPUCell.sprite_idx to reference the glyph in the atlas.
+    sprite_map: HashMap<SpriteKey, u32>,
+    /// Sprite info array: UV coordinates and offsets for each sprite.
+    /// Index 0 is reserved for "no glyph" (space).
+    sprite_info: Vec<SpriteInfo>,
+    /// Next sprite index to allocate.
+    next_sprite_idx: u32,
+    /// GPU cell buffer for all visible cells (flattened row-major).
+    /// Updated only when terminal content changes.
+    gpu_cells: Vec<GPUCell>,
+    /// Whether the GPU cell buffer needs to be re-uploaded.
+    cells_dirty: bool,
+    /// Last rendered grid dimensions (cols, rows) to detect resizes.
+    last_grid_size: (usize, usize),
+
+    // GPU buffers for instanced rendering
+    /// Cell storage buffer - contains GPUCell array for all visible cells.
+    cell_buffer: wgpu::Buffer,
+    /// Sprite storage buffer - contains SpriteInfo array for all sprites.
+    sprite_buffer: wgpu::Buffer,
+    /// Current capacity of sprite buffer (number of sprites it can hold).
+    sprite_buffer_capacity: usize,
+    /// Grid parameters uniform buffer.
+    grid_params_buffer: wgpu::Buffer,
+    /// Color table uniform buffer (258 colors: 256 indexed + default fg/bg).
+    color_table_buffer: wgpu::Buffer,
+    /// Bind group for instanced rendering (@group(1)).
+    instanced_bind_group: wgpu::BindGroup,
+    /// Background pipeline for instanced cell rendering.
+    cell_bg_pipeline: wgpu::RenderPipeline,
+    /// Glyph pipeline for instanced cell rendering.
+    cell_glyph_pipeline: wgpu::RenderPipeline,
 
     /// Current selection range for rendering (start_col, start_row, end_col, end_row).
     /// If set, cells within this range will be rendered with inverted colors.
     selection: Option<(usize, usize, usize, usize)>,
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // PER-PANE GPU RESOURCES (Like Kitty's VAO per window)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// Bind group layout for instanced rendering - needed to create per-pane bind groups.
+    instanced_bind_group_layout: wgpu::BindGroupLayout,
+    /// Per-pane GPU resources, keyed by pane_id.
+    /// Like Kitty's VAO array, each pane gets its own cell buffer, grid params buffer, and bind group.
+    pane_resources: HashMap<u64, PaneGpuResources>,
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // STATUSLINE RENDERING (dedicated shader and pipeline)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// GPU cells for the statusline (single row).
+    statusline_gpu_cells: Vec<GPUCell>,
+    /// GPU buffer for statusline cells.
+    statusline_cell_buffer: wgpu::Buffer,
+    /// Maximum columns for statusline (to size buffer appropriately).
+    statusline_max_cols: usize,
+    /// Statusline params uniform buffer.
+    statusline_params_buffer: wgpu::Buffer,
+    /// Bind group layout for statusline rendering.
+    statusline_bind_group_layout: wgpu::BindGroupLayout,
+    /// Bind group for statusline rendering.
+    statusline_bind_group: wgpu::BindGroup,
+    /// Pipeline for statusline background rendering.
+    statusline_bg_pipeline: wgpu::RenderPipeline,
+    /// Pipeline for statusline glyph rendering.
+    statusline_glyph_pipeline: wgpu::RenderPipeline,
+    /// Separate sprite map for statusline (isolated from terminal sprites).
+    statusline_sprite_map: HashMap<SpriteKey, u32>,
+    /// Sprite info array for statusline.
+    statusline_sprite_info: Vec<SpriteInfo>,
+    /// Next sprite index for statusline.
+    statusline_next_sprite_idx: u32,
+    /// GPU buffer for statusline sprites.
+    statusline_sprite_buffer: wgpu::Buffer,
+    /// Capacity of the statusline sprite buffer.
+    statusline_sprite_buffer_capacity: usize,
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // INSTANCED QUAD RENDERING (for rectangles, borders, overlays, tab bar)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// GPU quads for rectangle rendering.
+    quads: Vec<Quad>,
+    /// GPU buffer for quad instances.
+    quad_buffer: wgpu::Buffer,
+    /// Maximum number of quads (to size buffer appropriately).
+    max_quads: usize,
+    /// Quad params uniform buffer.
+    quad_params_buffer: wgpu::Buffer,
+    /// Pipeline for instanced quad rendering.
+    quad_pipeline: wgpu::RenderPipeline,
+    /// Bind group for quad rendering.
+    quad_bind_group: wgpu::BindGroup,
+    
+    /// GPU quads for overlay rendering (rendered on top of everything).
+    overlay_quads: Vec<Quad>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -509,10 +793,19 @@ pub struct Renderer {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Find a font that contains the given character using fontconfig.
-/// Returns the path to the font file if found.
-fn find_font_for_char(_fc: &Fontconfig, c: char) -> Option<PathBuf> {
+/// Returns the path to the font file and whether it's a color font.
+/// 
+/// For emoji characters (detected via the `emojis` crate), this function
+/// explicitly requests a color font from fontconfig, similar to how Kitty
+/// handles emoji presentation: FC_FAMILY = "emoji" and FC_COLOR = true.
+fn find_font_for_char(_fc: &Fontconfig, c: char) -> Option<(PathBuf, bool)> {
     use fontconfig_sys as fcsys;
     use fcsys::*;
+    use fcsys::constants::FC_COLOR;
+
+    // Check if this character is an emoji using the emojis crate (O(1) lookup)
+    let char_str = c.to_string();
+    let is_emoji = emojis::get(&char_str).is_some();
 
     unsafe {
         // Create a pattern
@@ -535,6 +828,15 @@ fn find_font_for_char(_fc: &Fontconfig, c: char) -> Option<PathBuf> {
         let fc_charset_cstr = CStr::from_bytes_with_nul(b"charset\0").unwrap();
         FcPatternAddCharSet(pat, fc_charset_cstr.as_ptr(), charset);
 
+        // For emoji characters, explicitly request a color font from the "emoji" family
+        // This matches Kitty's approach in fontconfig.c:create_fallback_face()
+        if is_emoji {
+            let fc_family_cstr = CStr::from_bytes_with_nul(b"family\0").unwrap();
+            let emoji_family = CStr::from_bytes_with_nul(b"emoji\0").unwrap();
+            FcPatternAddString(pat, fc_family_cstr.as_ptr(), emoji_family.as_ptr() as *const u8);
+            FcPatternAddBool(pat, FC_COLOR.as_ptr() as *const i8, 1); // Request color font
+        }
+
         // Run substitutions
         FcConfigSubstitute(std::ptr::null_mut(), pat, FcMatchPattern);
         FcDefaultSubstitute(pat);
@@ -543,14 +845,22 @@ fn find_font_for_char(_fc: &Fontconfig, c: char) -> Option<PathBuf> {
         let mut result = FcResultNoMatch;
         let matched = FcFontMatch(std::ptr::null_mut(), pat, &mut result);
 
-        let font_path = if !matched.is_null() && result == FcResultMatch {
+        let font_result = if !matched.is_null() && result == FcResultMatch {
             // Get the file path from the matched pattern
             let mut file_ptr: *mut FcChar8 = std::ptr::null_mut();
             let fc_file_cstr = CStr::from_bytes_with_nul(b"file\0").unwrap();
             if FcPatternGetString(matched, fc_file_cstr.as_ptr(), 0, &mut file_ptr) == FcResultMatch
             {
                 let path_cstr = CStr::from_ptr(file_ptr as *const i8);
-                Some(PathBuf::from(path_cstr.to_string_lossy().into_owned()))
+                let path = PathBuf::from(path_cstr.to_string_lossy().into_owned());
+                
+                // Check if the font is a color font (FC_COLOR property)
+                let mut is_color: i32 = 0;
+                let has_color = FcPatternGetBool(matched, FC_COLOR.as_ptr() as *const i8, 0, &mut is_color) == FcResultMatch && is_color != 0;
+                
+                log::debug!("find_font_for_char: found font for U+{:04X} '{}': {:?} (color={}, requested_emoji={})", 
+                           c as u32, c, path, has_color, is_emoji);
+                Some((path, has_color))
             } else {
                 None
             }
@@ -565,7 +875,391 @@ fn find_font_for_char(_fc: &Fontconfig, c: char) -> Option<PathBuf> {
         FcCharSetDestroy(charset);
         FcPatternDestroy(pat);
 
+        font_result
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COLOR EMOJI RENDERING (FreeType + Cairo)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Find a color font (emoji font) that contains the given character using fontconfig.
+/// Returns the path to the font file if found.
+fn find_color_font_for_char(c: char) -> Option<PathBuf> {
+    use fontconfig_sys as fcsys;
+    use fcsys::*;
+    use fcsys::constants::{FC_CHARSET, FC_COLOR, FC_FILE};
+
+    log::debug!("find_color_font_for_char: looking for color font for U+{:04X} '{}'", c as u32, c);
+
+    unsafe {
+        // Create a pattern
+        let pat = FcPatternCreate();
+        if pat.is_null() {
+            log::debug!("find_color_font_for_char: FcPatternCreate failed");
+            return None;
+        }
+
+        // Create a charset with the target character
+        let charset = FcCharSetCreate();
+        if charset.is_null() {
+            FcPatternDestroy(pat);
+            log::debug!("find_color_font_for_char: FcCharSetCreate failed");
+            return None;
+        }
+
+        // Add the character to the charset
+        FcCharSetAddChar(charset, c as u32);
+
+        // Add the charset to the pattern
+        FcPatternAddCharSet(pat, FC_CHARSET.as_ptr() as *const i8, charset);
+        
+        // Request a color font
+        FcPatternAddBool(pat, FC_COLOR.as_ptr() as *const i8, 1); // FcTrue = 1
+
+        // Run substitutions
+        FcConfigSubstitute(std::ptr::null_mut(), pat, FcMatchPattern);
+        FcDefaultSubstitute(pat);
+
+        // Find matching font
+        let mut result = FcResultNoMatch;
+        let matched = FcFontMatch(std::ptr::null_mut(), pat, &mut result);
+
+        let font_path = if !matched.is_null() && result == FcResultMatch {
+            // Check if the matched font is actually a color font
+            let mut is_color: i32 = 0;
+            let has_color = FcPatternGetBool(matched, FC_COLOR.as_ptr() as *const i8, 0, &mut is_color) == FcResultMatch && is_color != 0;
+            
+            log::debug!("find_color_font_for_char: matched font, is_color={}", has_color);
+            
+            if has_color {
+                // Get the file path from the matched pattern
+                let mut file_ptr: *mut u8 = std::ptr::null_mut();
+                if FcPatternGetString(matched, FC_FILE.as_ptr() as *const i8, 0, &mut file_ptr) == FcResultMatch {
+                    let path_cstr = CStr::from_ptr(file_ptr as *const i8);
+                    let path = PathBuf::from(path_cstr.to_string_lossy().into_owned());
+                    log::debug!("find_color_font_for_char: found color font {:?}", path);
+                    Some(path)
+                } else {
+                    log::debug!("find_color_font_for_char: couldn't get file path");
+                    None
+                }
+            } else {
+                log::debug!("find_color_font_for_char: matched font is not a color font");
+                None
+            }
+        } else {
+            log::debug!("find_color_font_for_char: no match found (result={:?})", result);
+            None
+        };
+
+        // Cleanup
+        if !matched.is_null() {
+            FcPatternDestroy(matched);
+        }
+        FcCharSetDestroy(charset);
+        FcPatternDestroy(pat);
+
         font_path
+    }
+}
+
+/// Lazy-initialized color font renderer using FreeType + Cairo.
+/// Only created when a color emoji is first encountered.
+/// Cairo is required for proper color font rendering (COLR, CBDT, sbix formats).
+struct ColorFontRenderer {
+    /// FreeType library instance
+    ft_library: FtLibrary,
+    /// Loaded FreeType faces and their Cairo font faces, keyed by font path
+    faces: HashMap<PathBuf, (freetype::Face, cairo::FontFace)>,
+    /// Reusable Cairo surface for rendering
+    surface: Option<ImageSurface>,
+    /// Current surface dimensions
+    surface_size: (i32, i32),
+}
+
+impl ColorFontRenderer {
+    fn new() -> Result<Self, freetype::Error> {
+        let ft_library = FtLibrary::init()?;
+        Ok(Self {
+            ft_library,
+            faces: HashMap::new(),
+            surface: None,
+            surface_size: (0, 0),
+        })
+    }
+
+    /// Ensure faces are loaded and return font size to set
+    fn ensure_faces_loaded(&mut self, path: &PathBuf) -> bool {
+        if !self.faces.contains_key(path) {
+            match self.ft_library.new_face(path, 0) {
+                Ok(ft_face) => {
+                    // Create Cairo font face from FreeType face
+                    match cairo::FontFace::create_from_ft(&ft_face) {
+                        Ok(cairo_face) => {
+                            self.faces.insert(path.clone(), (ft_face, cairo_face));
+                            true
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to create Cairo font face for {:?}: {:?}", path, e);
+                            false
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to load color font {:?}: {:?}", path, e);
+                    false
+                }
+            }
+        } else {
+            true
+        }
+    }
+
+    /// Render a color glyph using FreeType + Cairo.
+    /// Returns (width, height, RGBA bitmap, offset_x, offset_y) or None if rendering fails.
+    fn render_color_glyph(
+        &mut self,
+        font_path: &PathBuf,
+        c: char,
+        font_size_px: f32,
+        cell_width: u32,
+        cell_height: u32,
+    ) -> Option<(u32, u32, Vec<u8>, f32, f32)> {
+        log::debug!("render_color_glyph: U+{:04X} '{}' font={:?}", c as u32, c, font_path);
+        
+        // Ensure faces are loaded
+        if !self.ensure_faces_loaded(font_path) {
+            log::debug!("render_color_glyph: failed to load faces");
+            return None;
+        }
+        log::debug!("render_color_glyph: faces loaded successfully, faces count={}", self.faces.len());
+        
+        // Get glyph index from FreeType face
+        // Note: We do NOT call set_pixel_sizes here because CBDT (bitmap) fonts have fixed sizes
+        // and will fail. Cairo handles font sizing internally.
+        let glyph_index = {
+            let face_entry = self.faces.get(font_path);
+            if face_entry.is_none() {
+                log::debug!("render_color_glyph: face not found in hashmap after ensure_faces_loaded!");
+                return None;
+            }
+            let (ft_face, _) = face_entry?;
+            log::debug!("render_color_glyph: got ft_face, getting char index for U+{:04X}", c as u32);
+            let idx = ft_face.get_char_index(c as usize);
+            log::debug!("render_color_glyph: FreeType glyph index for U+{:04X} = {:?}", c as u32, idx);
+            if idx.is_none() {
+                log::debug!("render_color_glyph: glyph index is None - char not in font!");
+                return None;
+            }
+            idx?
+        };
+        
+        // Clone the Cairo font face (it's reference-counted)
+        let cairo_face = {
+            let (_, cairo_face) = self.faces.get(font_path)?;
+            cairo_face.clone()
+        };
+
+        // For emoji, we typically render at 2x cell width (double-width character)
+        let render_width = (cell_width * 2).max(cell_height) as i32;
+        let render_height = cell_height as i32;
+        
+        log::debug!("render_color_glyph: render size {}x{}", render_width, render_height);
+        
+        // Ensure we have a large enough surface
+        let surface_width = render_width.max(256);
+        let surface_height = render_height.max(256);
+        
+        if self.surface.is_none() || self.surface_size.0 < surface_width || self.surface_size.1 < surface_height {
+            let new_width = surface_width.max(self.surface_size.0);
+            let new_height = surface_height.max(self.surface_size.1);
+            match ImageSurface::create(Format::ARgb32, new_width, new_height) {
+                Ok(surface) => {
+                    log::debug!("render_color_glyph: created Cairo surface {}x{}", new_width, new_height);
+                    self.surface = Some(surface);
+                    self.surface_size = (new_width, new_height);
+                }
+                Err(e) => {
+                    log::warn!("Failed to create Cairo surface: {:?}", e);
+                    return None;
+                }
+            }
+        }
+        
+        let surface = self.surface.as_mut()?;
+        
+        // Create Cairo context
+        let cr = match cairo::Context::new(surface) {
+            Ok(cr) => cr,
+            Err(e) => {
+                log::warn!("Failed to create Cairo context: {:?}", e);
+                return None;
+            }
+        };
+        
+        // Clear the surface
+        cr.set_operator(cairo::Operator::Clear);
+        cr.paint().ok()?;
+        cr.set_operator(cairo::Operator::Over);
+        
+        // Set the font face and initial size
+        cr.set_font_face(&cairo_face);
+        
+        // Target dimensions for the glyph (2 cells wide, 1 cell tall for emoji)
+        let target_width = render_width as f64;
+        let target_height = render_height as f64;
+        
+        // Start with the requested font size and reduce until glyph fits
+        // This matches Kitty's fit_cairo_glyph() approach
+        let mut current_size = font_size_px as f64;
+        let min_size = 2.0;
+        
+        cr.set_font_size(current_size);
+        let mut glyph = cairo::Glyph::new(glyph_index as u64, 0.0, 0.0);
+        let mut text_extents = cr.glyph_extents(&[glyph]).ok()?;
+        
+        while current_size > min_size && (text_extents.width() > target_width || text_extents.height() > target_height) {
+            let ratio = (target_width / text_extents.width()).min(target_height / text_extents.height());
+            let new_size = (ratio * current_size).max(min_size);
+            if new_size >= current_size {
+                current_size -= 2.0;
+            } else {
+                current_size = new_size;
+            }
+            cr.set_font_size(current_size);
+            text_extents = cr.glyph_extents(&[glyph]).ok()?;
+        }
+        
+        log::debug!("render_color_glyph: fitted font size {:.1} (from {:.1}), glyph extents {:.1}x{:.1}", 
+                   current_size, font_size_px, text_extents.width(), text_extents.height());
+        
+        // Get font metrics for positioning with the final size
+        let font_extents = cr.font_extents().ok()?;
+        log::debug!("render_color_glyph: font extents - ascent={:.1}, descent={:.1}, height={:.1}", 
+                   font_extents.ascent(), font_extents.descent(), font_extents.height());
+        
+        // Create glyph with positioning at baseline
+        // y position should be at baseline (ascent from top)
+        glyph = cairo::Glyph::new(glyph_index as u64, 0.0, font_extents.ascent());
+        
+        // Get final glyph extents for sizing
+        text_extents = cr.glyph_extents(&[glyph]).ok()?;
+        log::debug!("render_color_glyph: text extents - width={:.1}, height={:.1}, x_bearing={:.1}, y_bearing={:.1}, x_advance={:.1}", 
+                   text_extents.width(), text_extents.height(), 
+                   text_extents.x_bearing(), text_extents.y_bearing(),
+                   text_extents.x_advance());
+        
+        // Set source color to white - the atlas stores colors directly for emoji
+        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+        
+        // Render the glyph
+        if let Err(e) = cr.show_glyphs(&[glyph]) {
+            log::warn!("render_color_glyph: show_glyphs failed: {:?}", e);
+            return None;
+        }
+        log::debug!("render_color_glyph: cairo show_glyphs succeeded");
+        
+        // Flush and get surface reference again
+        drop(cr); // Drop the context before accessing surface data
+        let surface = self.surface.as_mut()?;
+        surface.flush();
+        
+        // Calculate actual glyph bounds
+        let glyph_width = text_extents.width().ceil() as u32;
+        let glyph_height = text_extents.height().ceil() as u32;
+        
+        log::debug!("render_color_glyph: glyph size {}x{}", glyph_width, glyph_height);
+        
+        if glyph_width == 0 || glyph_height == 0 {
+            log::debug!("render_color_glyph: zero size glyph, returning None");
+            return None;
+        }
+        
+        // The actual rendered area - use the text extents to determine position
+        let x_offset = text_extents.x_bearing();
+        let y_offset = text_extents.y_bearing();
+        
+        // Calculate source rectangle in the surface
+        let src_x = x_offset.max(0.0) as i32;
+        let src_y = (font_extents.ascent() + y_offset).max(0.0) as i32;
+        
+        log::debug!("render_color_glyph: source rect starts at ({}, {})", src_x, src_y);
+        
+        // Get surface data
+        let stride = surface.stride() as usize;
+        let surface_data = surface.data().ok()?;
+        
+        // Extract the glyph region and convert ARGB -> RGBA
+        let out_width = glyph_width.min(render_width as u32);
+        let out_height = glyph_height.min(render_height as u32);
+        
+        let mut rgba = vec![0u8; (out_width * out_height * 4) as usize];
+        let mut non_zero_pixels = 0u32;
+        let mut has_color = false;
+        
+        for y in 0..out_height as i32 {
+            for x in 0..out_width as i32 {
+                let src_pixel_x = src_x + x;
+                let src_pixel_y = src_y + y;
+                
+                if src_pixel_x >= 0 && src_pixel_x < self.surface_size.0 
+                   && src_pixel_y >= 0 && src_pixel_y < self.surface_size.1 {
+                    let src_idx = (src_pixel_y as usize) * stride + (src_pixel_x as usize) * 4;
+                    let dst_idx = (y as usize * out_width as usize + x as usize) * 4;
+                    
+                    if src_idx + 3 < surface_data.len() {
+                        // Cairo uses ARGB in native byte order (on little-endian: BGRA in memory)
+                        // We need to convert to RGBA
+                        let b = surface_data[src_idx];
+                        let g = surface_data[src_idx + 1];
+                        let r = surface_data[src_idx + 2];
+                        let a = surface_data[src_idx + 3];
+                        
+                        if a > 0 {
+                            non_zero_pixels += 1;
+                            // Check if this is actual color (not just white/gray)
+                            if r != g || g != b {
+                                has_color = true;
+                            }
+                        }
+                        
+                        // Un-premultiply alpha if needed (Cairo uses premultiplied alpha)
+                        if a > 0 && a < 255 {
+                            let inv_alpha = 255.0 / a as f32;
+                            rgba[dst_idx] = (r as f32 * inv_alpha).min(255.0) as u8;
+                            rgba[dst_idx + 1] = (g as f32 * inv_alpha).min(255.0) as u8;
+                            rgba[dst_idx + 2] = (b as f32 * inv_alpha).min(255.0) as u8;
+                            rgba[dst_idx + 3] = a;
+                        } else {
+                            rgba[dst_idx] = r;
+                            rgba[dst_idx + 1] = g;
+                            rgba[dst_idx + 2] = b;
+                            rgba[dst_idx + 3] = a;
+                        }
+                    }
+                }
+            }
+        }
+        
+        log::debug!("render_color_glyph: extracted {}x{} pixels, {} non-zero, has_color={}", 
+                   out_width, out_height, non_zero_pixels, has_color);
+        
+        // Check if we actually got any non-transparent pixels
+        let has_content = rgba.chunks(4).any(|p| p[3] > 0);
+        if !has_content {
+            log::debug!("render_color_glyph: no visible content, returning None");
+            return None;
+        }
+        
+        // Kitty convention: bitmap_top = -y_bearing (distance from baseline to glyph top)
+        let offset_x = text_extents.x_bearing() as f32;
+        let offset_y = -text_extents.y_bearing() as f32;
+        
+        log::debug!("render_color_glyph: SUCCESS - returning {}x{} glyph, offset=({:.1}, {:.1})", 
+                   out_width, out_height, offset_x, offset_y);
+        
+        Some((out_width, out_height, rgba, offset_x, offset_y))
     }
 }
 
@@ -1262,6 +1956,11 @@ impl Renderer {
         // ab_glyph's height() = ascent - descent (where descent is negative)
         let cell_height = scaled_font.height().round();
         
+        // Calculate baseline offset from top of cell.
+        // The baseline is where the bottom of uppercase letters sit.
+        // ascent is the distance from baseline to top of tallest glyph.
+        let baseline = scaled_font.ascent().round();
+        
         // Calculate the correct scale factor for converting font units to pixels.
         // This matches ab_glyph's calculation: scale / height_unscaled
         // where height_unscaled = ascent - descent (the font's natural line height).
@@ -1278,7 +1977,7 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -1595,6 +2294,501 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // KITTY-STYLE INSTANCED RENDERING SETUP
+        // ═══════════════════════════════════════════════════════════════════════════════
+
+        // Initial capacity: 200x50 grid = 10000 cells, 4096 sprites
+        let initial_cells = 10000;
+        let initial_sprites = 4096;
+
+        // Cell storage buffer - holds GPUCell array
+        let cell_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Cell Storage Buffer"),
+            size: (initial_cells * std::mem::size_of::<GPUCell>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Statusline cell buffer - single row, max 500 columns
+        let statusline_max_cols = 500;
+        let statusline_cell_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Statusline Cell Buffer"),
+            size: (statusline_max_cols * std::mem::size_of::<GPUCell>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Sprite storage buffer - holds SpriteInfo array
+        let sprite_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Sprite Storage Buffer"),
+            size: (initial_sprites * std::mem::size_of::<SpriteInfo>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Grid parameters uniform buffer
+        let grid_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Grid Params Buffer"),
+            size: std::mem::size_of::<GridParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Color table uniform buffer - 258 colors * 16 bytes (vec4<f32>)
+        let color_table_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Color Table Buffer"),
+            size: (258 * 16) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Create bind group layout for instanced rendering (@group(1))
+        let instanced_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Instanced Bind Group Layout"),
+            entries: &[
+                // @binding(0): color_table (uniform)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // @binding(1): grid_params (uniform)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // @binding(2): cells (storage, read-only)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // @binding(3): sprites (storage, read-only)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // Create bind group for instanced rendering
+        let instanced_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Instanced Bind Group"),
+            layout: &instanced_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: color_table_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: grid_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: cell_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: sprite_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // STATUSLINE RENDERING SETUP (dedicated shader and pipeline)
+        // ═══════════════════════════════════════════════════════════════════════════════
+        
+        let statusline_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Statusline Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("statusline_shader.wgsl").into()),
+        });
+        
+        // Statusline params uniform buffer
+        let statusline_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Statusline Params Buffer"),
+            size: std::mem::size_of::<StatuslineParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Statusline sprite buffer (separate from terminal sprites)
+        let statusline_sprite_buffer_capacity = 256; // Smaller than terminal - statusline has fewer glyphs
+        let statusline_sprite_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Statusline Sprite Buffer"),
+            size: (statusline_sprite_buffer_capacity * std::mem::size_of::<SpriteInfo>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Create bind group layout for statusline rendering (@group(1))
+        // Same bindings as instanced_bind_group_layout but with StatuslineParams instead of GridParams
+        let statusline_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Statusline Bind Group Layout"),
+            entries: &[
+                // @binding(0): color_table (uniform)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // @binding(1): statusline_params (uniform)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // @binding(2): cells (storage, read-only)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // @binding(3): sprites (storage, read-only)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        
+        // Create bind group for statusline rendering
+        let statusline_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Statusline Bind Group"),
+            layout: &statusline_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: color_table_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: statusline_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: statusline_cell_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: statusline_sprite_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        
+        // Create pipeline layout for statusline rendering
+        let statusline_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Statusline Pipeline Layout"),
+            bind_group_layouts: &[&glyph_bind_group_layout, &statusline_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        
+        // Statusline background pipeline
+        let statusline_bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Statusline Background Pipeline"),
+            layout: Some(&statusline_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &statusline_shader,
+                entry_point: Some("vs_statusline_bg"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &statusline_shader,
+                entry_point: Some("fs_statusline"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        
+        // Statusline glyph pipeline
+        let statusline_glyph_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Statusline Glyph Pipeline"),
+            layout: Some(&statusline_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &statusline_shader,
+                entry_point: Some("vs_statusline_glyph"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &statusline_shader,
+                entry_point: Some("fs_statusline"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Create pipeline layout for instanced cell rendering
+        // Uses @group(0) for atlas texture/sampler and @group(1) for cell data
+        let instanced_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Instanced Pipeline Layout"),
+            bind_group_layouts: &[&glyph_bind_group_layout, &instanced_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        // Background pipeline - uses vs_cell_bg and fs_cell
+        let cell_bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Cell Background Pipeline"),
+            layout: Some(&instanced_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_cell_bg"),
+                buffers: &[], // No vertex buffers - uses instancing
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_cell"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Glyph pipeline - uses vs_cell_glyph and fs_cell
+        let cell_glyph_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Cell Glyph Pipeline"),
+            layout: Some(&instanced_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_cell_glyph"),
+                buffers: &[], // No vertex buffers - uses instancing
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_cell"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // INSTANCED QUAD RENDERING SETUP
+        // For rectangles, borders, overlays, and tab bar backgrounds
+        // ═══════════════════════════════════════════════════════════════════════════════
+        
+        let quad_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Quad Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("quad_shader.wgsl").into()),
+        });
+        
+        // Maximum number of quads we can render in one batch
+        let max_quads: usize = 256;
+        
+        // Quad buffer for instance data
+        let quad_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Quad Buffer"),
+            size: (max_quads * std::mem::size_of::<Quad>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Quad params uniform buffer
+        let quad_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Quad Params Buffer"),
+            size: std::mem::size_of::<QuadParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Bind group layout for quad rendering
+        let quad_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Quad Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        
+        // Bind group for quad rendering
+        let quad_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Quad Bind Group"),
+            layout: &quad_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: quad_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: quad_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        
+        // Pipeline layout for quad rendering
+        let quad_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Quad Pipeline Layout"),
+            bind_group_layouts: &[&quad_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        
+        // Quad pipeline
+        let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Quad Pipeline"),
+            layout: Some(&quad_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &quad_shader,
+                entry_point: Some("vs_quad"),
+                buffers: &[], // No vertex buffers - uses instancing
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &quad_shader,
+                entry_point: Some("fs_quad"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         Self {
             surface,
             device,
@@ -1610,7 +2804,7 @@ impl Renderer {
             image_sampler,
             image_textures: HashMap::new(),
             atlas_texture,
-            atlas_data: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE) as usize],
+            atlas_data: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * ATLAS_BPP) as usize],
             atlas_dirty: false,
             font_data,
             primary_font,
@@ -1618,15 +2812,13 @@ impl Renderer {
             fallback_fonts,
             fontconfig: OnceCell::new(),
             tried_font_paths,
+            color_font_renderer: RefCell::new(None),
+            color_font_cache: HashMap::new(),
             shaping_ctx,
             shaping_features,
             char_cache: HashMap::new(),
             ligature_cache: HashMap::new(),
             glyph_cache: HashMap::new(),
-            text_run_cache: HashMap::new(),
-            // Initial canvas size - will be resized as needed
-            canvas_buffer: vec![0u8; (cell_width as usize * 16) * cell_height as usize],
-            canvas_size: (cell_width as u32 * 16, cell_height as u32),
             atlas_cursor_x: 0,
             atlas_cursor_y: 0,
             atlas_row_height: 0,
@@ -1641,19 +2833,63 @@ impl Renderer {
             font_units_to_px,
             cell_width,
             cell_height,
+            baseline,
             width: size.width,
             height: size.height,
             palette: ColorPalette::default(),
             tab_bar_position: config.tab_bar_position,
             background_opacity: config.background_opacity.clamp(0.0, 1.0),
+            // Initialize with single-pane dimensions (will be updated by layout)
+            grid_used_width: 0.0,
+            grid_used_height: 0.0,
             // Pre-allocate reusable buffers for rendering
             bg_vertices: Vec::with_capacity(4096),
             bg_indices: Vec::with_capacity(6144),
             glyph_vertices: Vec::with_capacity(4096),
             glyph_indices: Vec::with_capacity(6144),
-            overlay_vertices: Vec::with_capacity(64),
-            overlay_indices: Vec::with_capacity(96),
+            // Kitty-style instanced rendering state
+            sprite_map: HashMap::new(),
+            // Index 0 is reserved for "no glyph" (space/empty)
+            sprite_info: vec![SpriteInfo::default()],
+            next_sprite_idx: 1,
+            gpu_cells: Vec::new(),
+            cells_dirty: true,
+            last_grid_size: (0, 0),
+            // GPU buffers for instanced rendering
+            cell_buffer,
+            sprite_buffer,
+            sprite_buffer_capacity: initial_sprites,
+            grid_params_buffer,
+            color_table_buffer,
+            instanced_bind_group,
+            cell_bg_pipeline,
+            cell_glyph_pipeline,
             selection: None,
+            // Per-pane GPU resources (like Kitty's VAO per window)
+            instanced_bind_group_layout,
+            pane_resources: HashMap::new(),
+            // Statusline rendering (dedicated shader and pipeline)
+            statusline_gpu_cells: Vec::with_capacity(statusline_max_cols),
+            statusline_cell_buffer,
+            statusline_max_cols,
+            statusline_params_buffer,
+            statusline_bind_group_layout,
+            statusline_bind_group,
+            statusline_bg_pipeline,
+            statusline_glyph_pipeline,
+            statusline_sprite_map: HashMap::new(),
+            statusline_sprite_info: vec![SpriteInfo::default()], // Index 0 reserved for "no glyph"
+            statusline_next_sprite_idx: 1,
+            statusline_sprite_buffer,
+            statusline_sprite_buffer_capacity,
+            // Instanced quad rendering
+            quads: Vec::with_capacity(max_quads),
+            quad_buffer,
+            max_quads,
+            quad_params_buffer,
+            quad_pipeline,
+            quad_bind_group,
+            overlay_quads: Vec::with_capacity(32),
         }
     }
 
@@ -1677,231 +2913,6 @@ impl Renderer {
             TabBarPosition::Top => self.tab_bar_height(),
             TabBarPosition::Bottom => self.height as f32 - self.tab_bar_height() - self.statusline_height(),
             TabBarPosition::Hidden => 0.0,
-        }
-    }
-    
-    /// Render raw ANSI-formatted content in the statusline.
-    /// This parses ANSI escape sequences inline and renders text with colors.
-    fn render_raw_ansi_statusline(
-        &mut self,
-        content: &str,
-        statusline_y: f32,
-        statusline_height: f32,
-        text_y: f32,
-        screen_width: f32,
-        screen_height: f32,
-    ) {
-        let mut cursor_x = 4.0_f32; // Small left padding
-        
-        // Current text attributes
-        let mut fg_color: [f32; 4] = {
-            let [r, g, b] = self.palette.default_fg;
-            [
-                Self::srgb_to_linear(r as f32 / 255.0),
-                Self::srgb_to_linear(g as f32 / 255.0),
-                Self::srgb_to_linear(b as f32 / 255.0),
-                1.0,
-            ]
-        };
-        let default_fg = fg_color;
-        let mut bg_color: Option<[f32; 4]> = None;
-        
-        let mut chars = content.chars().peekable();
-        
-        while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                // Parse escape sequence
-                if chars.peek() == Some(&'[') {
-                    chars.next(); // consume '['
-                    
-                    // Collect the CSI parameters
-                    let mut params = String::new();
-                    while let Some(&ch) = chars.peek() {
-                        if ch.is_ascii_digit() || ch == ';' {
-                            params.push(chars.next().unwrap());
-                        } else {
-                            break;
-                        }
-                    }
-                    
-                    // Get the final character
-                    if let Some(final_char) = chars.next() {
-                        if final_char == 'm' {
-                            // SGR sequence - parse color codes
-                            let parts: Vec<&str> = params.split(';').collect();
-                            let mut i = 0;
-                            while i < parts.len() {
-                                let code: u32 = parts[i].parse().unwrap_or(0);
-                                match code {
-                                    0 => {
-                                        // Reset
-                                        fg_color = default_fg;
-                                        bg_color = None;
-                                    }
-                                    1 => {
-                                        // Bold - could brighten color
-                                    }
-                                    30..=37 => {
-                                        // Standard foreground colors
-                                        let idx = (code - 30) as usize;
-                                        let [r, g, b] = self.palette.colors[idx];
-                                        fg_color = [
-                                            Self::srgb_to_linear(r as f32 / 255.0),
-                                            Self::srgb_to_linear(g as f32 / 255.0),
-                                            Self::srgb_to_linear(b as f32 / 255.0),
-                                            1.0,
-                                        ];
-                                    }
-                                    38 => {
-                                        // Extended foreground color
-                                        if i + 1 < parts.len() {
-                                            let mode: u32 = parts[i + 1].parse().unwrap_or(0);
-                                            if mode == 5 && i + 2 < parts.len() {
-                                                // 256 color
-                                                let idx: usize = parts[i + 2].parse().unwrap_or(0);
-                                                let [r, g, b] = self.palette.colors[idx.min(255)];
-                                                fg_color = [
-                                                    Self::srgb_to_linear(r as f32 / 255.0),
-                                                    Self::srgb_to_linear(g as f32 / 255.0),
-                                                    Self::srgb_to_linear(b as f32 / 255.0),
-                                                    1.0,
-                                                ];
-                                                i += 2;
-                                            } else if mode == 2 && i + 4 < parts.len() {
-                                                // RGB color
-                                                let r: u8 = parts[i + 2].parse().unwrap_or(0);
-                                                let g: u8 = parts[i + 3].parse().unwrap_or(0);
-                                                let b: u8 = parts[i + 4].parse().unwrap_or(0);
-                                                fg_color = [
-                                                    Self::srgb_to_linear(r as f32 / 255.0),
-                                                    Self::srgb_to_linear(g as f32 / 255.0),
-                                                    Self::srgb_to_linear(b as f32 / 255.0),
-                                                    1.0,
-                                                ];
-                                                i += 4;
-                                            }
-                                        }
-                                    }
-                                    40..=47 => {
-                                        // Standard background colors
-                                        let idx = (code - 40) as usize;
-                                        let [r, g, b] = self.palette.colors[idx];
-                                        bg_color = Some([
-                                            Self::srgb_to_linear(r as f32 / 255.0),
-                                            Self::srgb_to_linear(g as f32 / 255.0),
-                                            Self::srgb_to_linear(b as f32 / 255.0),
-                                            1.0,
-                                        ]);
-                                    }
-                                    48 => {
-                                        // Extended background color
-                                        if i + 1 < parts.len() {
-                                            let mode: u32 = parts[i + 1].parse().unwrap_or(0);
-                                            if mode == 5 && i + 2 < parts.len() {
-                                                // 256 color
-                                                let idx: usize = parts[i + 2].parse().unwrap_or(0);
-                                                let [r, g, b] = self.palette.colors[idx.min(255)];
-                                                bg_color = Some([
-                                                    Self::srgb_to_linear(r as f32 / 255.0),
-                                                    Self::srgb_to_linear(g as f32 / 255.0),
-                                                    Self::srgb_to_linear(b as f32 / 255.0),
-                                                    1.0,
-                                                ]);
-                                                i += 2;
-                                            } else if mode == 2 && i + 4 < parts.len() {
-                                                // RGB color
-                                                let r: u8 = parts[i + 2].parse().unwrap_or(0);
-                                                let g: u8 = parts[i + 3].parse().unwrap_or(0);
-                                                let b: u8 = parts[i + 4].parse().unwrap_or(0);
-                                                bg_color = Some([
-                                                    Self::srgb_to_linear(r as f32 / 255.0),
-                                                    Self::srgb_to_linear(g as f32 / 255.0),
-                                                    Self::srgb_to_linear(b as f32 / 255.0),
-                                                    1.0,
-                                                ]);
-                                                i += 4;
-                                            }
-                                        }
-                                    }
-                                    49 => {
-                                        // Default background
-                                        bg_color = None;
-                                    }
-                                    _ => {}
-                                }
-                                i += 1;
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-            
-            // Render the character
-            if cursor_x + self.cell_width > screen_width {
-                break;
-            }
-            
-            // Draw background if set
-            if let Some(bg) = bg_color {
-                self.render_rect(cursor_x, statusline_y, self.cell_width, statusline_height, bg);
-            }
-            
-            if c == ' ' {
-                cursor_x += self.cell_width;
-                continue;
-            }
-            
-            let glyph = self.rasterize_char(c);
-            if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
-                // Powerline characters (U+E0B0-U+E0BF) need to start at y=0 to fill the statusline height
-                let is_powerline_char = ('\u{E0B0}'..='\u{E0BF}').contains(&c);
-                
-                let glyph_x = (cursor_x + glyph.offset[0]).round();
-                let glyph_y = if is_powerline_char {
-                    statusline_y
-                } else {
-                    let baseline_y = (text_y + self.cell_height * 0.8).round();
-                    (baseline_y - glyph.offset[1] - glyph.size[1]).round()
-                };
-
-                let left = Self::pixel_to_ndc_x(glyph_x, screen_width);
-                let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], screen_width);
-                let top = Self::pixel_to_ndc_y(glyph_y, screen_height);
-                let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], screen_height);
-
-                let base_idx = self.glyph_vertices.len() as u32;
-                self.glyph_vertices.push(GlyphVertex {
-                    position: [left, top],
-                    uv: [glyph.uv[0], glyph.uv[1]],
-                    color: fg_color,
-                    bg_color: [0.0, 0.0, 0.0, 0.0],
-                });
-                self.glyph_vertices.push(GlyphVertex {
-                    position: [right, top],
-                    uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
-                    color: fg_color,
-                    bg_color: [0.0, 0.0, 0.0, 0.0],
-                });
-                self.glyph_vertices.push(GlyphVertex {
-                    position: [right, bottom],
-                    uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
-                    color: fg_color,
-                    bg_color: [0.0, 0.0, 0.0, 0.0],
-                });
-                self.glyph_vertices.push(GlyphVertex {
-                    position: [left, bottom],
-                    uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
-                    color: fg_color,
-                    bg_color: [0.0, 0.0, 0.0, 0.0],
-                });
-                self.glyph_indices.extend_from_slice(&[
-                    base_idx, base_idx + 1, base_idx + 2,
-                    base_idx, base_idx + 2, base_idx + 3,
-                ]);
-            }
-            
-            cursor_x += self.cell_width;
         }
     }
 
@@ -1941,12 +2952,54 @@ impl Renderer {
         (cols.max(1), rows.max(1))
     }
 
+    /// Returns the raw available pixel dimensions for the terminal grid area.
+    /// This is the space available for panes before any cell alignment.
+    pub fn available_grid_space(&self) -> (f32, f32) {
+        let available_width = self.width as f32;
+        let available_height = self.height as f32 - self.tab_bar_height() - self.statusline_height();
+        (available_width, available_height)
+    }
+
+    /// Sets the actual used grid dimensions (from pane layout).
+    /// This is called after layout to ensure centering accounts for splits and borders.
+    pub fn set_grid_used_dimensions(&mut self, width: f32, height: f32) {
+        self.grid_used_width = width;
+        self.grid_used_height = height;
+    }
+
+    /// Returns the horizontal offset needed to center the cell grid in the window.
+    /// Uses the actual used width from pane layout if set, otherwise calculates from terminal_size.
+    pub fn grid_x_offset(&self) -> f32 {
+        let used_width = if self.grid_used_width > 0.0 {
+            self.grid_used_width
+        } else {
+            let (cols, _) = self.terminal_size();
+            cols as f32 * self.cell_width
+        };
+        (self.width as f32 - used_width) / 2.0
+    }
+
+    /// Returns the vertical offset needed to center the cell grid in the terminal area.
+    /// Uses the actual used height from pane layout if set, otherwise calculates from terminal_size.
+    pub fn grid_y_offset(&self) -> f32 {
+        let used_height = if self.grid_used_height > 0.0 {
+            self.grid_used_height
+        } else {
+            let (_, rows) = self.terminal_size();
+            rows as f32 * self.cell_height
+        };
+        let available_height = self.height as f32 - self.tab_bar_height() - self.statusline_height();
+        (available_height - used_height) / 2.0
+    }
+
     /// Converts a pixel position to a terminal cell position.
     /// Returns None if the position is outside the terminal area (e.g., in the tab bar or statusline).
     pub fn pixel_to_cell(&self, x: f64, y: f64) -> Option<(usize, usize)> {
         let terminal_y_offset = self.terminal_y_offset();
         let tab_bar_height = self.tab_bar_height();
         let statusline_height = self.statusline_height();
+        let grid_x_offset = self.grid_x_offset();
+        let grid_y_offset = self.grid_y_offset();
         let height = self.height as f32;
 
         // Check if position is in the tab bar or statusline area
@@ -1972,19 +3025,26 @@ impl Renderer {
             }
         }
 
-        // Adjust y to be relative to terminal area
-        let terminal_y = y as f32 - terminal_y_offset;
+        // Adjust position to be relative to the centered grid
+        let grid_x = x as f32 - grid_x_offset;
+        let grid_y = y as f32 - terminal_y_offset - grid_y_offset;
+
+        // Check if position is in the padding area (outside the centered grid)
+        if grid_x < 0.0 || grid_y < 0.0 {
+            return None;
+        }
 
         // Calculate cell position
-        let col = (x as f32 / self.cell_width).floor() as usize;
-        let row = (terminal_y / self.cell_height).floor() as usize;
+        let col = (grid_x / self.cell_width).floor() as usize;
+        let row = (grid_y / self.cell_height).floor() as usize;
 
-        // Get terminal dimensions to clamp
+        // Get terminal dimensions to check bounds
         let (max_cols, max_rows) = self.terminal_size();
 
-        // Clamp to valid range
-        let col = col.min(max_cols.saturating_sub(1));
-        let row = row.min(max_rows.saturating_sub(1));
+        // Return None if outside the grid bounds
+        if col >= max_cols || row >= max_rows {
+            return None;
+        }
 
         Some((col, row))
     }
@@ -2023,14 +3083,25 @@ impl Renderer {
         self.char_cache.clear();
         self.ligature_cache.clear();
         self.glyph_cache.clear();
-        self.text_run_cache.clear();
 
-        // Reset atlas
+        // Reset atlas and sprite tracking
         self.atlas_cursor_x = 0;
         self.atlas_cursor_y = 0;
         self.atlas_row_height = 0;
         self.atlas_data.fill(0);
         self.atlas_dirty = true;
+        
+        // Clear sprite maps since sprite indices are now invalid
+        self.sprite_map.clear();
+        self.sprite_info.clear();
+        self.sprite_info.push(SpriteInfo::default());
+        self.next_sprite_idx = 1;
+        self.cells_dirty = true;
+        
+        self.statusline_sprite_map.clear();
+        self.statusline_sprite_info.clear();
+        self.statusline_sprite_info.push(SpriteInfo::default());
+        self.statusline_next_sprite_idx = 1;
 
         // Return true if cell dimensions changed
         (self.cell_width - old_cell_width).abs() > 0.01
@@ -2080,18 +3151,1227 @@ impl Renderer {
         self.char_cache.clear();
         self.ligature_cache.clear();
         self.glyph_cache.clear();
-        self.text_run_cache.clear();
 
-        // Reset atlas
+        // Reset atlas and sprite tracking
         self.atlas_cursor_x = 0;
         self.atlas_cursor_y = 0;
         self.atlas_row_height = 0;
         self.atlas_data.fill(0);
         self.atlas_dirty = true;
+        
+        // Clear sprite maps since sprite indices are now invalid
+        self.sprite_map.clear();
+        self.sprite_info.clear();
+        self.sprite_info.push(SpriteInfo::default());
+        self.next_sprite_idx = 1;
+        self.cells_dirty = true;
+        
+        self.statusline_sprite_map.clear();
+        self.statusline_sprite_info.clear();
+        self.statusline_sprite_info.push(SpriteInfo::default());
+        self.statusline_next_sprite_idx = 1;
 
         // Return true if cell dimensions changed
         (self.cell_width - old_cell_width).abs() > 0.01
             || (self.cell_height - old_cell_height).abs() > 0.01
+    }
+
+    /// Reset the glyph atlas when it becomes full.
+    /// This clears all cached glyphs and resets the atlas cursor.
+    fn reset_atlas(&mut self) {
+        log::info!("Resetting glyph atlas (was full)");
+        
+        // Clear all glyph caches - they need to be re-rasterized
+        self.char_cache.clear();
+        self.ligature_cache.clear();
+        self.glyph_cache.clear();
+        
+        // Also clear sprite map since sprite indices are now invalid
+        self.sprite_map.clear();
+        self.sprite_info.clear();
+        self.sprite_info.push(SpriteInfo::default()); // Index 0 = no glyph
+        self.next_sprite_idx = 1;
+        self.cells_dirty = true; // Force re-upload of cell data
+        
+        // Also clear statusline sprite tracking - they share the same atlas
+        self.statusline_sprite_map.clear();
+        self.statusline_sprite_info.clear();
+        self.statusline_sprite_info.push(SpriteInfo::default()); // Index 0 = no glyph
+        self.statusline_next_sprite_idx = 1;
+        
+        // Reset atlas cursor and data
+        self.atlas_cursor_x = 0;
+        self.atlas_cursor_y = 0;
+        self.atlas_row_height = 0;
+        self.atlas_data.fill(0);
+        self.atlas_dirty = true;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // KITTY-STYLE SPRITE AND CELL HELPERS
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// Pack a terminal Color into u32 format for GPU.
+    /// Format: type in low byte, then color data in higher bytes.
+    #[inline]
+    fn pack_color(color: &Color) -> u32 {
+        match color {
+            Color::Default => COLOR_TYPE_DEFAULT,
+            Color::Indexed(idx) => COLOR_TYPE_INDEXED | ((*idx as u32) << 8),
+            Color::Rgb(r, g, b) => {
+                COLOR_TYPE_RGB | ((*r as u32) << 8) | ((*g as u32) << 16) | ((*b as u32) << 24)
+            }
+        }
+    }
+
+    /// Pack cell attributes into u32 format for GPU.
+    #[inline]
+    fn pack_attrs(bold: bool, italic: bool, underline: bool) -> u32 {
+        let mut attrs = 0u32;
+        if bold { attrs |= ATTR_BOLD; }
+        if italic { attrs |= ATTR_ITALIC; }
+        if underline { attrs |= ATTR_UNDERLINE; }
+        attrs
+    }
+
+    /// Pack a StatuslineColor into u32 format for GPU.
+    #[inline]
+    fn pack_statusline_color(color: StatuslineColor) -> u32 {
+        match color {
+            StatuslineColor::Default => COLOR_TYPE_DEFAULT,
+            StatuslineColor::Indexed(idx) => COLOR_TYPE_INDEXED | ((idx as u32) << 8),
+            StatuslineColor::Rgb(r, g, b) => {
+                COLOR_TYPE_RGB | ((r as u32) << 8) | ((g as u32) << 16) | ((b as u32) << 24)
+            }
+        }
+    }
+
+    /// Get or create a sprite index for a character.
+    /// Returns (sprite_idx, is_colored).
+    /// 
+    /// This uses the same approach as Kitty: shape the text with HarfBuzz using
+    /// the appropriate font variant (regular, bold, italic, bold-italic), then
+    /// rasterize the resulting glyph ID with the styled font.
+    /// 
+    /// The `target` parameter specifies which sprite buffer to use:
+    /// - `SpriteTarget::Terminal` uses the main terminal sprite buffer
+    /// - `SpriteTarget::Statusline` uses the separate statusline sprite buffer
+    fn get_or_create_sprite_for(&mut self, c: char, style: FontStyle, target: SpriteTarget) -> (u32, bool) {
+        // Skip spaces and null characters - they use sprite index 0
+        if c == ' ' || c == '\0' {
+            return (0, false);
+        }
+        
+        // Select the appropriate sprite tracking based on target
+        let (sprite_map, _sprite_info, _next_sprite_idx) = match target {
+            SpriteTarget::Terminal => (
+                &mut self.sprite_map,
+                &mut self.sprite_info,
+                &mut self.next_sprite_idx,
+            ),
+            SpriteTarget::Statusline => (
+                &mut self.statusline_sprite_map,
+                &mut self.statusline_sprite_info,
+                &mut self.statusline_next_sprite_idx,
+            ),
+        };
+        
+        // Check if we already have this sprite
+        let key = SpriteKey {
+            text: c.to_string(),
+            style,
+            colored: false, // Will check for emoji below
+        };
+        
+        if let Some(&idx) = sprite_map.get(&key) {
+            // Check if it's a colored glyph
+            let is_colored = (idx & COLORED_GLYPH_FLAG) != 0;
+            return (idx, is_colored);
+        }
+        
+        // Check for emoji with color key
+        let color_key = SpriteKey {
+            text: c.to_string(),
+            style,
+            colored: true,
+        };
+        if let Some(&idx) = sprite_map.get(&color_key) {
+            return (idx, true);
+        }
+        
+        // Need to rasterize this glyph
+        // First, check if it's an emoji
+        let char_str = c.to_string();
+        let is_emoji = emojis::get(&char_str).is_some();
+        
+        // For emoji, box-drawing, and multi-cell symbols (PUA/dingbats), use rasterize_char
+        // which has scaling logic for oversized glyphs. Regular text uses HarfBuzz shaping.
+        let glyph = if is_emoji || Self::is_box_drawing(c) || Self::is_multicell_symbol(c) {
+            // These don't need style variants or use rasterize_char for scaling
+            self.rasterize_char(c)
+        } else {
+            // Shape the single character with HarfBuzz using the styled font
+            // This gets us the correct glyph ID for the styled font variant
+            let shaped = self.shape_text_with_style(&char_str, style);
+            
+            if shaped.glyphs.is_empty() {
+                // Fallback to regular rasterization if shaping fails
+                self.rasterize_char(c)
+            } else {
+                // Get the glyph ID from shaping
+                let (glyph_id, _x_advance, _x_offset, _y_offset, _cluster) = shaped.glyphs[0];
+                
+                // If glyph_id is 0, the font doesn't have this character (.notdef)
+                // Fall back to rasterize_char which has full font fallback support
+                if glyph_id == 0 {
+                    self.rasterize_char(c)
+                } else {
+                    // Rasterize with the styled font
+                    self.get_glyph_by_id_with_style(glyph_id, style)
+                }
+            }
+        };
+        
+        // If glyph has no size, return 0
+        if glyph.size[0] <= 0.0 || glyph.size[1] <= 0.0 {
+            return (0, false);
+        }
+        
+        // Create sprite info from glyph info
+        // In Kitty's model, glyphs are pre-positioned in cell-sized sprites,
+        // so no offset is needed - the shader just maps sprite to cell 1:1
+        let sprite = SpriteInfo {
+            uv: glyph.uv,
+            _padding: [0.0, 0.0],
+            size: glyph.size,
+        };
+        
+        // Re-borrow the sprite tracking for the target (needed after self borrows above)
+        let (sprite_map, sprite_info, next_sprite_idx) = match target {
+            SpriteTarget::Terminal => (
+                &mut self.sprite_map,
+                &mut self.sprite_info,
+                &mut self.next_sprite_idx,
+            ),
+            SpriteTarget::Statusline => (
+                &mut self.statusline_sprite_map,
+                &mut self.statusline_sprite_info,
+                &mut self.statusline_next_sprite_idx,
+            ),
+        };
+        
+        // Allocate new sprite index
+        let sprite_idx = *next_sprite_idx;
+        *next_sprite_idx += 1;
+        
+        // Add to sprite info array (ensure we have enough capacity)
+        while sprite_info.len() <= sprite_idx as usize {
+            sprite_info.push(SpriteInfo::default());
+        }
+        sprite_info[sprite_idx as usize] = sprite;
+        
+        // Mark as colored if it's an emoji
+        let final_idx = if is_emoji || glyph.is_colored {
+            sprite_idx | COLORED_GLYPH_FLAG
+        } else {
+            sprite_idx
+        };
+        
+        // Cache the mapping
+        let cache_key = SpriteKey {
+            text: c.to_string(),
+            style,
+            colored: is_emoji || glyph.is_colored,
+        };
+        sprite_map.insert(cache_key, final_idx);
+        
+        (final_idx, is_emoji || glyph.is_colored)
+    }
+    
+    /// Get or create a sprite index for a character in the terminal sprite buffer.
+    /// Returns (sprite_idx, is_colored).
+    /// 
+    /// This is a convenience wrapper around `get_or_create_sprite_for` that uses
+    /// the terminal sprite buffer.
+    fn get_or_create_sprite(&mut self, c: char, style: FontStyle) -> (u32, bool) {
+        self.get_or_create_sprite_for(c, style, SpriteTarget::Terminal)
+    }
+
+    /// Convert terminal cells to GPU cells for a visible row.
+    /// This is called when terminal content changes to update the GPU buffer.
+    /// 
+    /// Note: This method cannot take &mut self because it's called from update_gpu_cells
+    /// which needs to borrow both self (for sprite lookups) and self.gpu_cells (for output).
+    /// Instead, we pass in the necessary state explicitly.
+    fn cells_to_gpu_row_static(
+        row: &[crate::terminal::Cell],
+        gpu_row: &mut [GPUCell],
+        cols: usize,
+        sprite_map: &HashMap<SpriteKey, u32>,
+    ) {
+        let mut col = 0;
+        while col < cols.min(row.len()) {
+            let cell = &row[col];
+            
+            // Skip wide character continuations - they share the sprite of the previous cell
+            if cell.wide_continuation {
+                gpu_row[col] = GPUCell {
+                    fg: Self::pack_color(&cell.fg_color),
+                    bg: Self::pack_color(&cell.bg_color),
+                    decoration_fg: 0,
+                    sprite_idx: 0, // No glyph for continuation
+                    attrs: Self::pack_attrs(cell.bold, cell.italic, cell.underline),
+                };
+                col += 1;
+                continue;
+            }
+            
+            // Get font style
+            let style = FontStyle::from_flags(cell.bold, cell.italic);
+            let c = cell.character;
+            
+            // Check for symbol+empty multi-cell pattern
+            // Like Kitty, look for symbol character followed by empty cells
+            if c != ' ' && c != '\0' && Self::is_multicell_symbol(c) && !Self::is_box_drawing(c) {
+                // Count trailing empty cells to determine if this is a multi-cell group
+                let mut num_empty = 0;
+                const MAX_EXTRA_CELLS: usize = 4;
+                
+                while col + num_empty + 1 < row.len() && num_empty < MAX_EXTRA_CELLS {
+                    let next_char = row[col + num_empty + 1].character;
+                    // Check for space, en-space, or empty/null cell
+                    if next_char == ' ' || next_char == '\u{2002}' || next_char == '\0' {
+                        num_empty += 1;
+                    } else {
+                        break;
+                    }
+                }
+                
+                if num_empty > 0 {
+                    let total_cells = 1 + num_empty;
+                    
+                    // Try to find multi-cell sprites - check colored first, then non-colored
+                    // This avoids expensive emoji detection in the hot path
+                    let first_key_colored = SpriteKey {
+                        text: format!("{}_0", c),
+                        style,
+                        colored: true,
+                    };
+                    let first_key_normal = SpriteKey {
+                        text: format!("{}_0", c),
+                        style,
+                        colored: false,
+                    };
+                    
+                    let (first_sprite, is_colored) = if let Some(&sprite) = sprite_map.get(&first_key_colored) {
+                        (Some(sprite), true)
+                    } else if let Some(&sprite) = sprite_map.get(&first_key_normal) {
+                        (Some(sprite), false)
+                    } else {
+                        (None, false)
+                    };
+                    
+                    if let Some(first_sprite) = first_sprite {
+                        // Use multi-cell sprites for each cell in the group
+                        for cell_idx in 0..total_cells {
+                            if col + cell_idx >= cols {
+                                break;
+                            }
+                            
+                            let sprite_idx = if cell_idx == 0 {
+                                first_sprite
+                            } else {
+                                let key = SpriteKey {
+                                    text: format!("{}_{}", c, cell_idx),
+                                    style,
+                                    colored: is_colored,
+                                };
+                                sprite_map.get(&key).copied().unwrap_or(0)
+                            };
+                            
+                            // For colored glyphs (emoji), set the COLORED_GLYPH_FLAG so the shader
+                            // knows to use the atlas color directly instead of applying fg color
+                            let final_sprite_idx = if is_colored {
+                                sprite_idx | COLORED_GLYPH_FLAG
+                            } else {
+                                sprite_idx
+                            };
+                            
+                            // Use the symbol cell's foreground color for all cells in the group
+                            let current_cell = &row[col + cell_idx];
+                            gpu_row[col + cell_idx] = GPUCell {
+                                fg: Self::pack_color(&cell.fg_color),
+                                bg: Self::pack_color(&current_cell.bg_color),
+                                decoration_fg: 0,
+                                sprite_idx: final_sprite_idx,
+                                attrs: Self::pack_attrs(cell.bold, cell.italic, cell.underline),
+                            };
+                        }
+                        
+                        col += total_cells;
+                        continue;
+                    }
+                }
+            }
+            
+            // Check for emoji multi-cell pattern (colored glyphs followed by empty cells)
+            // This is separate from PUA because emoji detection happens via sprite lookup
+            if c != ' ' && c != '\0' {
+                let mut num_empty = 0;
+                const MAX_EXTRA_CELLS: usize = 1; // Emoji are 2 cells wide
+                
+                while col + num_empty + 1 < row.len() && num_empty < MAX_EXTRA_CELLS {
+                    let next_char = row[col + num_empty + 1].character;
+                    if next_char == ' ' || next_char == '\u{2002}' || next_char == '\0' {
+                        num_empty += 1;
+                    } else {
+                        break;
+                    }
+                }
+                
+                if num_empty > 0 {
+                    // Check if we have colored multi-cell sprites for this character
+                    let first_key = SpriteKey {
+                        text: format!("{}_0", c),
+                        style,
+                        colored: true,
+                    };
+                    
+                    if let Some(&first_sprite) = sprite_map.get(&first_key) {
+                        let total_cells = 1 + num_empty;
+                        
+                        for cell_idx in 0..total_cells {
+                            if col + cell_idx >= cols {
+                                break;
+                            }
+                            
+                            let sprite_idx = if cell_idx == 0 {
+                                first_sprite
+                            } else {
+                                let key = SpriteKey {
+                                    text: format!("{}_{}", c, cell_idx),
+                                    style,
+                                    colored: true,
+                                };
+                                sprite_map.get(&key).copied().unwrap_or(0)
+                            };
+                            
+                            let current_cell = &row[col + cell_idx];
+                            gpu_row[col + cell_idx] = GPUCell {
+                                fg: Self::pack_color(&cell.fg_color),
+                                bg: Self::pack_color(&current_cell.bg_color),
+                                decoration_fg: 0,
+                                sprite_idx: sprite_idx | COLORED_GLYPH_FLAG,
+                                attrs: Self::pack_attrs(cell.bold, cell.italic, cell.underline),
+                            };
+                        }
+                        
+                        col += total_cells;
+                        continue;
+                    }
+                }
+            }
+            
+            // Regular character lookup
+            let sprite_idx = if c == ' ' || c == '\0' {
+                0
+            } else {
+                // Check cache - first try non-colored, then colored
+                let key = SpriteKey {
+                    text: c.to_string(),
+                    style,
+                    colored: false,
+                };
+                if let Some(&idx) = sprite_map.get(&key) {
+                    idx
+                } else {
+                    let color_key = SpriteKey {
+                        text: c.to_string(),
+                        style,
+                        colored: true,
+                    };
+                    sprite_map.get(&color_key).copied().unwrap_or(0)
+                }
+            };
+            
+            gpu_row[col] = GPUCell {
+                fg: Self::pack_color(&cell.fg_color),
+                bg: Self::pack_color(&cell.bg_color),
+                decoration_fg: 0,
+                sprite_idx,
+                attrs: Self::pack_attrs(cell.bold, cell.italic, cell.underline),
+            };
+            col += 1;
+        }
+        
+        // Fill remaining columns with empty cells
+        for col_idx in row.len()..cols {
+            gpu_row[col_idx] = GPUCell::default();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // PER-PANE GPU RESOURCE MANAGEMENT (Like Kitty's VAO per window)
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// Get or create GPU resources for a pane.
+    /// Like Kitty's create_cell_vao(), this allocates per-pane buffers and bind group.
+    /// 
+    /// Following Kitty's approach: we check if size matches exactly and reallocate if needed.
+    /// This is simpler than tracking capacity with headroom.
+    fn get_or_create_pane_resources(&mut self, pane_id: u64, required_cells: usize) -> &PaneGpuResources {
+        // Check if we need to create or resize (like Kitty's alloc_buffer size check)
+        let needs_create = match self.pane_resources.get(&pane_id) {
+            None => true,
+            Some(res) => res.capacity != required_cells,  // Reallocate if size changed (Kitty's approach)
+        };
+        
+        if needs_create {
+            // Create new buffers with exact size needed (like Kitty - no headroom)
+            let capacity = required_cells;
+            
+            let cell_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Pane {} Cell Buffer", pane_id)),
+                size: (capacity * std::mem::size_of::<GPUCell>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            
+            let grid_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Pane {} Grid Params Buffer", pane_id)),
+                size: std::mem::size_of::<GridParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            
+            // Create bind group referencing this pane's buffers + shared resources
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("Pane {} Bind Group", pane_id)),
+                layout: &self.instanced_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.color_table_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: grid_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: cell_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.sprite_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            
+            self.pane_resources.insert(pane_id, PaneGpuResources {
+                cell_buffer,
+                grid_params_buffer,
+                bind_group,
+                capacity,
+            });
+        }
+        
+        self.pane_resources.get(&pane_id).unwrap()
+    }
+    
+    /// Remove GPU resources for panes that no longer exist.
+    /// Like Kitty's remove_vao(), this frees GPU resources when panes are destroyed.
+    /// 
+    /// Call this after rendering with a set of active pane IDs.
+    pub fn cleanup_unused_pane_resources(&mut self, active_pane_ids: &std::collections::HashSet<u64>) {
+        self.pane_resources.retain(|id, _| active_pane_ids.contains(id));
+    }
+
+    /// Update GPU cell buffer from terminal content.
+    /// Like Kitty, this only processes dirty lines to minimize work.
+    /// 
+    /// Returns true if any cells were updated (buffer needs upload to GPU).
+    pub fn update_gpu_cells(&mut self, terminal: &Terminal) -> bool {
+        let cols = terminal.cols;
+        let rows = terminal.rows;
+        let total_cells = cols * rows;
+        
+        // Check if grid size changed - need full rebuild
+        let size_changed = self.last_grid_size != (cols, rows);
+        if size_changed {
+            self.gpu_cells.resize(total_cells, GPUCell::default());
+            self.last_grid_size = (cols, rows);
+            self.cells_dirty = true;
+        }
+        
+        // Get visible rows (accounts for scroll offset)
+        let visible_rows = terminal.visible_rows();
+        
+        // First pass: ensure all characters have sprites
+        // This needs mutable access to self for sprite creation
+        // Like Kitty's render_line(), detect PUA+space patterns for multi-cell rendering
+        for row in visible_rows.iter() {
+            let mut col = 0;
+            while col < row.len() {
+                let cell = &row[col];
+                
+                if cell.character == ' ' || cell.character == '\0' || cell.wide_continuation {
+                    col += 1;
+                    continue;
+                }
+                
+                let c = cell.character;
+                let style = FontStyle::from_flags(cell.bold, cell.italic);
+                
+                // Check if this is a symbol that might need multi-cell rendering
+                // Like Kitty's render_line() at fonts.c:1873-1912
+                // This includes PUA characters and dingbats
+                if Self::is_multicell_symbol(c) && !Self::is_box_drawing(c) {
+                    // Get the glyph's natural width to determine desired cells
+                    let glyph_width = self.get_glyph_width(c);
+                    let desired_cells = (glyph_width / self.cell_width).ceil() as usize;
+                    
+                    log::debug!("Symbol check U+{:04X}: glyph_width={:.1}, cell_width={:.1}, desired_cells={}", 
+                               c as u32, glyph_width, self.cell_width, desired_cells);
+                    
+                    if desired_cells > 1 {
+                        // Count trailing empty cells (spaces or null characters)
+                        // Like Kitty's loop at fonts.c:1888-1903, but also including empty cells
+                        let mut num_empty = 0;
+                        const MAX_EXTRA_CELLS: usize = 4; // Like Kitty's MAX_NUM_EXTRA_GLYPHS_PUA
+                        
+                        while col + num_empty + 1 < row.len()
+                            && num_empty + 1 < desired_cells
+                            && num_empty < MAX_EXTRA_CELLS
+                        {
+                            let next_char = row[col + num_empty + 1].character;
+                            log::debug!("  next char at col {}: U+{:04X} '{}'", 
+                                       col + num_empty + 1, next_char as u32, next_char);
+                            // Check for space, en-space, or empty/null cell
+                            if next_char == ' ' || next_char == '\u{2002}' || next_char == '\0' {
+                                num_empty += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        
+                        log::debug!("  found {} trailing empty cells", num_empty);
+                        
+                        if num_empty > 0 {
+                            // We have symbol + empty cells - render as multi-cell
+                            let total_cells = 1 + num_empty;
+                            
+                            // Check if we already have sprites for this multi-cell group
+                            // PUA symbols are not colored
+                            let first_key = SpriteKey {
+                                text: format!("{}_0_{}", c, total_cells),
+                                style,
+                                colored: false,
+                            };
+                            
+                            if self.sprite_map.get(&first_key).is_none() {
+                                // Need to rasterize
+                                let cell_sprites = self.rasterize_pua_multicell(c, total_cells);
+                                
+                                // Store each cell's sprite with a unique key
+                                for (cell_idx, glyph) in cell_sprites.into_iter().enumerate() {
+                                    if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
+                                        let key = SpriteKey {
+                                            text: format!("{}_{}", c, cell_idx),
+                                            style,
+                                            colored: false,
+                                        };
+                                        
+                                        // Create sprite info from glyph info
+                                        let sprite = SpriteInfo {
+                                            uv: glyph.uv,
+                                            _padding: [0.0, 0.0],
+                                            size: glyph.size,
+                                        };
+                                        
+                                        // Use next_sprite_idx like get_or_create_sprite does
+                                        let sprite_idx = self.next_sprite_idx;
+                                        self.next_sprite_idx += 1;
+                                        
+                                        // Ensure sprite_info array is large enough
+                                        while self.sprite_info.len() <= sprite_idx as usize {
+                                            self.sprite_info.push(SpriteInfo::default());
+                                        }
+                                        self.sprite_info[sprite_idx as usize] = sprite;
+                                        self.sprite_map.insert(key, sprite_idx);
+                                    }
+                                }
+                            }
+                            
+                            // Skip the spaces we consumed
+                            col += total_cells;
+                            continue;
+                        }
+                    }
+                }
+                
+                // Regular character - create sprite as normal
+                // This also handles emoji detection (via emojis::get, but cached per character)
+                let (sprite_idx, is_colored) = self.get_or_create_sprite(c, style);
+                
+                // If this is a colored glyph (emoji) followed by empty cells, create multi-cell sprites
+                if is_colored && sprite_idx != 0 {
+                    // Count trailing empty cells for potential multi-cell emoji
+                    let mut num_empty = 0;
+                    const MAX_EXTRA_CELLS: usize = 1; // Emoji are typically 2 cells wide
+                    
+                    while col + num_empty + 1 < row.len() && num_empty < MAX_EXTRA_CELLS {
+                        let next_char = row[col + num_empty + 1].character;
+                        if next_char == ' ' || next_char == '\u{2002}' || next_char == '\0' {
+                            num_empty += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    
+                    if num_empty > 0 {
+                        let total_cells = 1 + num_empty;
+                        
+                        // Check if we already have multi-cell sprites for this emoji
+                        let first_key = SpriteKey {
+                            text: format!("{}_0", c),
+                            style,
+                            colored: true,
+                        };
+                        
+                        if self.sprite_map.get(&first_key).is_none() {
+                            // Need to create multi-cell emoji sprites
+                            let cell_sprites = self.rasterize_emoji_multicell(c, total_cells);
+                            
+                            for (cell_idx, glyph) in cell_sprites.into_iter().enumerate() {
+                                if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
+                                    let key = SpriteKey {
+                                        text: format!("{}_{}", c, cell_idx),
+                                        style,
+                                        colored: true,
+                                    };
+                                    
+                                    let sprite = SpriteInfo {
+                                        uv: glyph.uv,
+                                        _padding: [0.0, 0.0],
+                                        size: glyph.size,
+                                    };
+                                    
+                                    // Use next_sprite_idx like get_or_create_sprite does
+                                    let idx = self.next_sprite_idx;
+                                    self.next_sprite_idx += 1;
+                                    
+                                    // Ensure sprite_info array is large enough
+                                    while self.sprite_info.len() <= idx as usize {
+                                        self.sprite_info.push(SpriteInfo::default());
+                                    }
+                                    self.sprite_info[idx as usize] = sprite;
+                                    self.sprite_map.insert(key, idx);
+                                }
+                            }
+                        }
+                        
+                        col += total_cells;
+                        continue;
+                    }
+                }
+                
+                col += 1;
+            }
+        }
+        
+        // Re-get visible rows (the reference was invalidated by get_or_create_sprite)
+        let visible_rows = terminal.visible_rows();
+        
+        // Check dirty lines and update only those
+        let dirty_bitmap = terminal.get_dirty_lines();
+        let mut any_updated = false;
+        
+        // If we did a full reset or size changed, update all lines
+        if self.cells_dirty {
+            for (row_idx, row) in visible_rows.iter().enumerate() {
+                if row_idx >= rows {
+                    break;
+                }
+                let start = row_idx * cols;
+                let end = start + cols;
+                Self::cells_to_gpu_row_static(row, &mut self.gpu_cells[start..end], cols, &self.sprite_map);
+            }
+            self.cells_dirty = false;
+            any_updated = true;
+        } else {
+            // Only update dirty lines
+            for row_idx in 0..rows.min(64) {
+                let bit = 1u64 << row_idx;
+                if (dirty_bitmap & bit) != 0 {
+                    if row_idx < visible_rows.len() {
+                        let start = row_idx * cols;
+                        let end = start + cols;
+                        Self::cells_to_gpu_row_static(visible_rows[row_idx], &mut self.gpu_cells[start..end], cols, &self.sprite_map);
+                        any_updated = true;
+                    }
+                }
+            }
+            
+            // For terminals with more than 64 rows, check additional dirty_lines words
+            if rows > 64 && dirty_bitmap != 0 {
+                for row_idx in 64..rows.min(visible_rows.len()) {
+                    let start = row_idx * cols;
+                    let end = start + cols;
+                    Self::cells_to_gpu_row_static(visible_rows[row_idx], &mut self.gpu_cells[start..end], cols, &self.sprite_map);
+                    any_updated = true;
+                }
+            }
+        }
+        
+        any_updated
+    }
+
+    /// Parse ANSI escape sequences from raw statusline content.
+    /// Returns a vector of (char, fg_color, bg_color, bold) tuples.
+    fn parse_ansi_statusline(content: &str) -> Vec<(char, StatuslineColor, StatuslineColor, bool)> {
+        let mut result = Vec::new();
+        let chars: Vec<char> = content.chars().collect();
+        let mut i = 0;
+        
+        // Current styling state
+        let mut fg = StatuslineColor::Default;
+        let mut bg = StatuslineColor::Rgb(0x1a, 0x1a, 0x1a); // Default statusline background
+        let mut bold = false;
+        
+        while i < chars.len() {
+            let c = chars[i];
+            
+            // Check for escape sequence (ESC = 0x1B)
+            if c == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '[' {
+                // Parse CSI sequence: ESC [ params m
+                i += 2; // Skip ESC [
+                
+                // Collect parameters
+                let mut params: Vec<u16> = Vec::new();
+                let mut current_param: u16 = 0;
+                let mut has_digit = false;
+                
+                while i < chars.len() {
+                    let pc = chars[i];
+                    if pc.is_ascii_digit() {
+                        current_param = current_param * 10 + (pc as u16 - '0' as u16);
+                        has_digit = true;
+                        i += 1;
+                    } else if pc == ';' || pc == ':' {
+                        params.push(if has_digit { current_param } else { 0 });
+                        current_param = 0;
+                        has_digit = false;
+                        i += 1;
+                    } else if pc == 'm' {
+                        // SGR sequence complete
+                        params.push(if has_digit { current_param } else { 0 });
+                        i += 1;
+                        
+                        // Process SGR parameters
+                        let mut pi = 0;
+                        while pi < params.len() {
+                            let code = params[pi];
+                            match code {
+                                0 => {
+                                    fg = StatuslineColor::Default;
+                                    bg = StatuslineColor::Rgb(0x1a, 0x1a, 0x1a);
+                                    bold = false;
+                                }
+                                1 => bold = true,
+                                22 => bold = false,
+                                30..=37 => fg = StatuslineColor::Indexed((code - 30) as u8),
+                                38 => {
+                                    // Extended foreground color
+                                    if pi + 1 < params.len() {
+                                        let mode = params[pi + 1];
+                                        if mode == 5 && pi + 2 < params.len() {
+                                            fg = StatuslineColor::Indexed(params[pi + 2] as u8);
+                                            pi += 2;
+                                        } else if mode == 2 && pi + 4 < params.len() {
+                                            fg = StatuslineColor::Rgb(
+                                                params[pi + 2] as u8,
+                                                params[pi + 3] as u8,
+                                                params[pi + 4] as u8,
+                                            );
+                                            pi += 4;
+                                        }
+                                    }
+                                }
+                                39 => fg = StatuslineColor::Default,
+                                40..=47 => bg = StatuslineColor::Indexed((code - 40) as u8),
+                                48 => {
+                                    // Extended background color
+                                    if pi + 1 < params.len() {
+                                        let mode = params[pi + 1];
+                                        if mode == 5 && pi + 2 < params.len() {
+                                            bg = StatuslineColor::Indexed(params[pi + 2] as u8);
+                                            pi += 2;
+                                        } else if mode == 2 && pi + 4 < params.len() {
+                                            bg = StatuslineColor::Rgb(
+                                                params[pi + 2] as u8,
+                                                params[pi + 3] as u8,
+                                                params[pi + 4] as u8,
+                                            );
+                                            pi += 4;
+                                        }
+                                    }
+                                }
+                                49 => bg = StatuslineColor::Rgb(0x1a, 0x1a, 0x1a), // Reset to default statusline bg
+                                90..=97 => fg = StatuslineColor::Indexed((code - 90 + 8) as u8),
+                                100..=107 => bg = StatuslineColor::Indexed((code - 100 + 8) as u8),
+                                _ => {}
+                            }
+                            pi += 1;
+                        }
+                        break;
+                    } else {
+                        // Unknown sequence terminator, skip it
+                        i += 1;
+                        break;
+                    }
+                }
+            } else if c >= ' ' {
+                // Printable character - add to result with current styling
+                result.push((c, fg, bg, bold));
+                i += 1;
+            } else {
+                // Skip other control characters
+                i += 1;
+            }
+        }
+        
+        result
+    }
+
+    /// Update statusline GPU cells from StatuslineContent.
+    /// This converts the statusline sections/components into GPUCell format for instanced rendering.
+    /// 
+    /// `target_width` is the desired width in pixels - for Raw content (like neovim statuslines),
+    /// this is used to expand the middle gap to fill the full window width.
+    /// 
+    /// Returns the number of columns used.
+    fn update_statusline_cells(&mut self, content: &StatuslineContent, target_width: f32) -> usize {
+        self.statusline_gpu_cells.clear();
+        
+        // Calculate target columns based on window width
+        let target_cols = if self.cell_width > 0.0 {
+            (target_width / self.cell_width).floor() as usize
+        } else {
+            self.statusline_max_cols
+        };
+        
+        // Default background color for statusline (dark gray)
+        let default_bg = Self::pack_statusline_color(StatuslineColor::Rgb(0x1a, 0x1a, 0x1a));
+        let _ = default_bg; // Silence unused warning - used by Sections path
+        
+        match content {
+            StatuslineContent::Raw(ansi_content) => {
+                // Parse ANSI escape sequences to extract colors and text
+                let parsed = Self::parse_ansi_statusline(ansi_content);
+                
+                // Find the middle gap (largest consecutive run of spaces)
+                // and expand it to fill the target width
+                let current_len = parsed.len();
+                
+                if current_len < target_cols && current_len > 0 {
+                    // Find the largest gap of consecutive spaces
+                    let mut best_gap_start = 0;
+                    let mut best_gap_len = 0;
+                    let mut current_gap_start = 0;
+                    let mut current_gap_len = 0;
+                    let mut in_gap = false;
+                    
+                    for (i, (c, _, _, _)) in parsed.iter().enumerate() {
+                        if *c == ' ' {
+                            if !in_gap {
+                                current_gap_start = i;
+                                current_gap_len = 0;
+                                in_gap = true;
+                            }
+                            current_gap_len += 1;
+                        } else {
+                            if in_gap && current_gap_len > best_gap_len {
+                                // Prefer gaps in the middle (not at start or end)
+                                let is_middle = current_gap_start > 0 && (current_gap_start + current_gap_len) < current_len;
+                                if is_middle || best_gap_len == 0 {
+                                    best_gap_start = current_gap_start;
+                                    best_gap_len = current_gap_len;
+                                }
+                            }
+                            in_gap = false;
+                        }
+                    }
+                    // Check final gap
+                    if in_gap && current_gap_len > best_gap_len {
+                        let is_middle = current_gap_start > 0;
+                        if is_middle || best_gap_len == 0 {
+                            best_gap_start = current_gap_start;
+                            best_gap_len = current_gap_len;
+                        }
+                    }
+                    
+                    // Calculate how many extra spaces we need
+                    let extra_spaces = target_cols.saturating_sub(current_len);
+                    
+                    // Get the background color for padding (from the gap area)
+                    let gap_bg = if best_gap_len > 0 && best_gap_start < parsed.len() {
+                        parsed[best_gap_start].2
+                    } else {
+                        StatuslineColor::Rgb(0x1a, 0x1a, 0x1a)
+                    };
+                    
+                    // The position right before right-hand content starts (end of gap)
+                    let gap_end = best_gap_start + best_gap_len;
+                    
+                    // Render with expanded gap - insert extra padding at the END of the gap
+                    for (i, (c, fg_color, bg_color, bold)) in parsed.iter().enumerate() {
+                        // Insert extra padding right before the right-hand content
+                        if i == gap_end && extra_spaces > 0 && best_gap_len > 0 {
+                            let padding_bg = Self::pack_statusline_color(gap_bg);
+                            for _ in 0..extra_spaces {
+                                if self.statusline_gpu_cells.len() >= self.statusline_max_cols {
+                                    break;
+                                }
+                                self.statusline_gpu_cells.push(GPUCell {
+                                    fg: 0,
+                                    bg: padding_bg,
+                                    decoration_fg: 0,
+                                    sprite_idx: 0,
+                                    attrs: 0,
+                                });
+                            }
+                        }
+                        
+                        if self.statusline_gpu_cells.len() >= self.statusline_max_cols {
+                            break;
+                        }
+                        
+                        let fg = Self::pack_statusline_color(*fg_color);
+                        let bg = Self::pack_statusline_color(*bg_color);
+                        let style = if *bold { FontStyle::Bold } else { FontStyle::Regular };
+                        let attrs = Self::pack_attrs(*bold, false, false);
+                        
+                        let (sprite_idx, is_colored) = if *c == ' ' || *c == '\0' {
+                            (0, false)
+                        } else {
+                            self.get_or_create_sprite_for(*c, style, SpriteTarget::Statusline)
+                        };
+                        
+                        let final_sprite_idx = if is_colored {
+                            sprite_idx | COLORED_GLYPH_FLAG
+                        } else {
+                            sprite_idx
+                        };
+                        
+                        self.statusline_gpu_cells.push(GPUCell {
+                            fg,
+                            bg,
+                            decoration_fg: 0,
+                            sprite_idx: final_sprite_idx,
+                            attrs,
+                        });
+                    }
+                    
+                    // If gap is at the very end (right content is empty), add padding after everything
+                    if gap_end == parsed.len() && extra_spaces > 0 && best_gap_len > 0 {
+                        let padding_bg = Self::pack_statusline_color(gap_bg);
+                        for _ in 0..extra_spaces {
+                            if self.statusline_gpu_cells.len() >= self.statusline_max_cols {
+                                break;
+                            }
+                            self.statusline_gpu_cells.push(GPUCell {
+                                fg: 0,
+                                bg: padding_bg,
+                                decoration_fg: 0,
+                                sprite_idx: 0,
+                                attrs: 0,
+                            });
+                        }
+                    }
+                } else {
+                    // No expansion needed, render as-is
+                    for (c, fg_color, bg_color, bold) in parsed {
+                        if self.statusline_gpu_cells.len() >= self.statusline_max_cols {
+                            break;
+                        }
+                        
+                        let fg = Self::pack_statusline_color(fg_color);
+                        let bg = Self::pack_statusline_color(bg_color);
+                        let style = if bold { FontStyle::Bold } else { FontStyle::Regular };
+                        let attrs = Self::pack_attrs(bold, false, false);
+                        
+                        let (sprite_idx, is_colored) = if c == ' ' || c == '\0' {
+                            (0, false)
+                        } else {
+                            self.get_or_create_sprite_for(c, style, SpriteTarget::Statusline)
+                        };
+                        
+                        let final_sprite_idx = if is_colored {
+                            sprite_idx | COLORED_GLYPH_FLAG
+                        } else {
+                            sprite_idx
+                        };
+                        
+                        self.statusline_gpu_cells.push(GPUCell {
+                            fg,
+                            bg,
+                            decoration_fg: 0,
+                            sprite_idx: final_sprite_idx,
+                            attrs,
+                        });
+                    }
+                }
+            }
+            StatuslineContent::Sections(sections) => {
+                for section in sections.iter() {
+                    let section_bg = Self::pack_statusline_color(section.bg);
+                    
+                    for component in section.components.iter() {
+                        let component_fg = Self::pack_statusline_color(component.fg);
+                        let style = if component.bold { FontStyle::Bold } else { FontStyle::Regular };
+                        let attrs = Self::pack_attrs(component.bold, false, false);
+                        
+                        // Process characters with lookahead for multi-cell symbols
+                        let chars: Vec<char> = component.text.chars().collect();
+                        let mut char_idx = 0;
+                        
+                        while char_idx < chars.len() {
+                            if self.statusline_gpu_cells.len() >= self.statusline_max_cols {
+                                break;
+                            }
+                            
+                            let c = chars[char_idx];
+                            
+                            // Check for multi-cell symbol pattern
+                            let is_powerline_char = ('\u{E0B0}'..='\u{E0BF}').contains(&c);
+                            let is_multicell_with_space = !is_powerline_char 
+                                && Self::is_multicell_symbol(c) 
+                                && !Self::is_box_drawing(c)
+                                && char_idx + 1 < chars.len() 
+                                && chars[char_idx + 1] == ' ';
+                            
+                            if is_multicell_with_space {
+                                // Render as 2-cell symbol
+                                let multi_style = FontStyle::Regular;
+                                
+                                // Check if we already have multi-cell sprites
+                                let first_key = SpriteKey {
+                                    text: format!("{}_0", c),
+                                    style: multi_style,
+                                    colored: false,
+                                };
+                                
+                                if self.statusline_sprite_map.get(&first_key).is_none() {
+                                    // Need to rasterize multi-cell sprites
+                                    let cell_sprites = self.rasterize_pua_multicell(c, 2);
+                                    
+                                    for (cell_i, glyph) in cell_sprites.into_iter().enumerate() {
+                                        if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
+                                            let key = SpriteKey {
+                                                text: format!("{}_{}", c, cell_i),
+                                                style: multi_style,
+                                                colored: false,
+                                            };
+                                            
+                                            let sprite = SpriteInfo {
+                                                uv: glyph.uv,
+                                                _padding: [0.0, 0.0],
+                                                size: glyph.size,
+                                            };
+                                            
+                                            // Use statusline sprite tracking
+                                            let sprite_idx = self.statusline_next_sprite_idx;
+                                            self.statusline_next_sprite_idx += 1;
+                                            
+                                            // Ensure sprite_info array is large enough
+                                            while self.statusline_sprite_info.len() <= sprite_idx as usize {
+                                                self.statusline_sprite_info.push(SpriteInfo::default());
+                                            }
+                                            self.statusline_sprite_info[sprite_idx as usize] = sprite;
+                                            
+                                            self.statusline_sprite_map.insert(key, sprite_idx);
+                                        }
+                                    }
+                                }
+                                
+                                // Add GPUCells for both parts
+                                for cell_i in 0..2 {
+                                    if self.statusline_gpu_cells.len() >= self.statusline_max_cols {
+                                        break;
+                                    }
+                                    
+                                    let key = SpriteKey {
+                                        text: format!("{}_{}", c, cell_i),
+                                        style: multi_style,
+                                        colored: false,
+                                    };
+                                    
+                                    let sprite_idx = self.statusline_sprite_map.get(&key).copied().unwrap_or(0);
+                                    
+                                    self.statusline_gpu_cells.push(GPUCell {
+                                        fg: component_fg,
+                                        bg: section_bg,
+                                        decoration_fg: 0,
+                                        sprite_idx,
+                                        attrs,
+                                    });
+                                }
+                                
+                                // Skip symbol and space
+                                char_idx += 2;
+                                continue;
+                            }
+                            
+                            // Regular character
+                            let (sprite_idx, is_colored) = if c == ' ' || c == '\0' {
+                                (0, false)
+                            } else {
+                                self.get_or_create_sprite_for(c, style, SpriteTarget::Statusline)
+                            };
+                            
+                            log::debug!("        char '{}' (U+{:04X}) -> sprite_idx={}, is_colored={}", 
+                                c, c as u32, sprite_idx, is_colored);
+                            
+                            let final_sprite_idx = if is_colored {
+                                sprite_idx | COLORED_GLYPH_FLAG
+                            } else {
+                                sprite_idx
+                            };
+                            
+                            self.statusline_gpu_cells.push(GPUCell {
+                                fg: component_fg,
+                                bg: section_bg,
+                                decoration_fg: 0,
+                                sprite_idx: final_sprite_idx,
+                                attrs,
+                            });
+                            
+                            char_idx += 1;
+                        }
+                    }
+                    
+                    // Add powerline arrow at end of section if it has a background
+                    let has_bg = matches!(section.bg, StatuslineColor::Indexed(_) | StatuslineColor::Rgb(_, _, _));
+                    if has_bg && self.statusline_gpu_cells.len() < self.statusline_max_cols {
+                        // The powerline arrow character
+                        let arrow_char = '\u{E0B0}';
+                        let (sprite_idx, _) = self.get_or_create_sprite_for(arrow_char, FontStyle::Regular, SpriteTarget::Statusline);
+                        
+                        // Arrow foreground is section background, arrow background is next section bg or default
+                        self.statusline_gpu_cells.push(GPUCell {
+                            fg: section_bg, // Arrow takes section bg color as its foreground
+                            bg: default_bg, // Will be overwritten if there's a next section
+                            decoration_fg: 0,
+                            sprite_idx,
+                            attrs: 0,
+                        });
+                    }
+                }
+            }
+        }
+        
+        self.statusline_gpu_cells.len()
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2121,6 +4401,91 @@ impl Renderer {
             || (0x25A0..=0x25FF).contains(&cp)
             || (0x2800..=0x28FF).contains(&cp)
             || (0xE0B0..=0xE0BF).contains(&cp)
+    }
+
+    /// Check if a character is in the Unicode Private Use Area (PUA).
+    /// Nerd Fonts and other symbol fonts use PUA codepoints.
+    /// Returns true for:
+    /// - BMP Private Use Area: U+E000-U+F8FF
+    /// - Supplementary Private Use Area-A: U+F0000-U+FFFFD
+    /// - Supplementary Private Use Area-B: U+100000-U+10FFFD
+    fn is_private_use(c: char) -> bool {
+        let cp = c as u32;
+        (0xE000..=0xF8FF).contains(&cp)
+            || (0xF0000..=0xFFFFD).contains(&cp)
+            || (0x100000..=0x10FFFD).contains(&cp)
+    }
+
+    /// Check if a character is a symbol that may need multi-cell rendering.
+    /// This includes PUA characters and dingbats.
+    /// Emoji are handled separately via the colored sprite path.
+    /// Used to detect symbols that might be wider than a single cell.
+    fn is_multicell_symbol(c: char) -> bool {
+        let cp = c as u32;
+        // Private Use Areas
+        if Self::is_private_use(c) {
+            return true;
+        }
+        // Dingbats: U+2700-U+27BF (like Kitty's is_non_emoji_dingbat)
+        // This includes arrows like ➜ (U+279C)
+        if (0x2700..=0x27BF).contains(&cp) {
+            return true;
+        }
+        // Miscellaneous Symbols: U+2600-U+26FF
+        if (0x2600..=0x26FF).contains(&cp) {
+            return true;
+        }
+        false
+    }
+
+    /// Get the rendered width of a glyph in pixels.
+    /// Used to determine if a PUA glyph needs multiple cells.
+    /// Like Kitty's get_glyph_width() in freetype.c, this returns the actual
+    /// bitmap/bounding box width, not the advance width.
+    fn get_glyph_width(&self, c: char) -> f32 {
+        use ab_glyph::Font;
+        
+        // Try primary font first
+        let glyph_id = self.primary_font.glyph_id(c);
+        if glyph_id.0 != 0 {
+            let scaled = self.primary_font.as_scaled(self.font_size);
+            // Create a Glyph from the GlyphId
+            let glyph = glyph_id.with_scale(self.font_size);
+            // Use pixel bounds width (like Kitty's B.width)
+            // This is the actual rendered glyph width, not the advance width
+            if let Some(outlined) = scaled.outline_glyph(glyph) {
+                let bounds = outlined.px_bounds();
+                let width = bounds.max.x - bounds.min.x;
+                if width > 0.0 {
+                    return width;
+                }
+            }
+            // Fall back to h_advance if no outline
+            return scaled.h_advance(glyph_id);
+        }
+        
+        // Try fallback fonts
+        for (_, fallback_font) in &self.fallback_fonts {
+            let fb_glyph_id = fallback_font.glyph_id(c);
+            if fb_glyph_id.0 != 0 {
+                let scaled = fallback_font.as_scaled(self.font_size);
+                // Create a Glyph from the GlyphId
+                let glyph = fb_glyph_id.with_scale(self.font_size);
+                // Use pixel bounds width (like Kitty's B.width)
+                if let Some(outlined) = scaled.outline_glyph(glyph) {
+                    let bounds = outlined.px_bounds();
+                    let width = bounds.max.x - bounds.min.x;
+                    if width > 0.0 {
+                        return width;
+                    }
+                }
+                // Fall back to h_advance if no outline
+                return scaled.h_advance(fb_glyph_id);
+            }
+        }
+        
+        // Default to one cell width if glyph not found
+        self.cell_width
     }
 
     /// Render a box-drawing character procedurally to a bitmap.
@@ -3315,94 +5680,61 @@ impl Renderer {
     fn rasterize_char(&mut self, c: char) -> GlyphInfo {
         // Check cache first
         if let Some(info) = self.char_cache.get(&c) {
+            // Log cache hits for emoji to debug first-emoji issue
+            if info.is_colored {
+                log::debug!("CACHE HIT for color glyph U+{:04X} '{}'", c as u32, c);
+            }
             return *info;
         }
+        
+        log::debug!("CACHE MISS for U+{:04X} '{}' - will rasterize", c as u32, c);
 
         // Check if this is a box-drawing character - render procedurally
+        // Box-drawing characters are already cell-sized, positioned at (0,0)
         if Self::is_box_drawing(c) {
-            if let Some((bitmap, supersampled)) = self.render_box_char(c) {
-                let glyph_width = self.cell_width.ceil() as u32;
-                let glyph_height = self.cell_height.ceil() as u32;
-
-                // Check if we need to move to next row
-                if self.atlas_cursor_x + glyph_width > ATLAS_SIZE {
-                    self.atlas_cursor_x = 0;
-                    self.atlas_cursor_y += self.atlas_row_height + 1;
-                    self.atlas_row_height = 0;
-                }
-
-                // Check if atlas is full
-                if self.atlas_cursor_y + glyph_height > ATLAS_SIZE {
-                    log::warn!("Glyph atlas is full!");
-                    let info = GlyphInfo {
-                        uv: [0.0, 0.0, 0.0, 0.0],
-                        offset: [0.0, 0.0],
-                        size: [0.0, 0.0],
-                    };
-                    self.char_cache.insert(c, info);
-                    return info;
-                }
-
-                // Copy bitmap to atlas
-                for y in 0..glyph_height as usize {
-                    for x in 0..glyph_width as usize {
-                        let src_idx = y * glyph_width as usize + x;
-                        let dst_x = self.atlas_cursor_x + x as u32;
-                        let dst_y = self.atlas_cursor_y + y as u32;
-                        let dst_idx = (dst_y * ATLAS_SIZE + dst_x) as usize;
-                        self.atlas_data[dst_idx] = bitmap[src_idx];
-                    }
-                }
-                self.atlas_dirty = true;
-
-                // Calculate UV coordinates
-                let uv_x = self.atlas_cursor_x as f32 / ATLAS_SIZE as f32;
-                let uv_y = self.atlas_cursor_y as f32 / ATLAS_SIZE as f32;
-                let uv_w = glyph_width as f32 / ATLAS_SIZE as f32;
-                let uv_h = glyph_height as f32 / ATLAS_SIZE as f32;
-
-                // For supersampled glyphs, use actual cell dimensions to avoid bleeding
-                // For pixel-perfect glyphs, use ceiled bitmap dimensions
-                let (size_w, size_h) = if supersampled {
-                    (self.cell_width as f32, self.cell_height as f32)
-                } else {
-                    (glyph_width as f32, glyph_height as f32)
-                };
-
-                let info = GlyphInfo {
-                    uv: [uv_x, uv_y, uv_w, uv_h],
-                    offset: [0.0, 0.0],
-                    size: [size_w, size_h],
-                };
-
-                // Update atlas cursor
-                self.atlas_cursor_x += glyph_width + 1;
-                self.atlas_row_height = self.atlas_row_height.max(glyph_height);
-
+            if let Some((bitmap, _supersampled)) = self.render_box_char(c) {
+                // Box-drawing bitmaps are already cell-sized and fill from top-left.
+                // Use upload_cell_canvas_to_atlas directly since no repositioning needed.
+                let info = self.upload_cell_canvas_to_atlas(&bitmap, false);
                 self.char_cache.insert(c, info);
                 return info;
             }
         }
 
-        // Try primary font first, then fallbacks using ab_glyph
-        let glyph_id = self.primary_font.glyph_id(c);
+        // Check if this is an emoji BEFORE checking primary font.
+        // Like Kitty, we skip the primary font for emoji since it may report a glyph
+        // (tofu/fallback) that isn't a proper color emoji. Go straight to fontconfig.
+        let char_str = c.to_string();
+        let is_emoji = emojis::get(&char_str).is_some();
+        
+        // Track whether we found the glyph in a regular font
+        let mut found_in_regular_font = false;
         
         // Rasterize glyph data: (width, height, bitmap, offset_x, offset_y)
-        let raster_result: Option<(u32, u32, Vec<u8>, f32, f32)> = if glyph_id.0 != 0 {
-            // Primary font has this glyph
+        let raster_result: Option<(u32, u32, Vec<u8>, f32, f32)> = if is_emoji {
+            // Emoji: skip primary font, will be handled by fontconfig color font path below
+            log::debug!("Character U+{:04X} is emoji, skipping primary font check", c as u32);
+            None
+        } else if { let glyph_id = self.primary_font.glyph_id(c); glyph_id.0 != 0 } {
+            // Primary font has this glyph (non-emoji)
+            let glyph_id = self.primary_font.glyph_id(c);
+            found_in_regular_font = true;
             self.rasterize_glyph_ab(&self.primary_font.clone(), glyph_id)
         } else {
-            // Try already-loaded fallback fonts first
+            // Try already-loaded fallback fonts first (but NOT for emoji)
             let mut result = None;
-            for (_, fallback_font) in &self.fallback_fonts {
-                let fb_glyph_id = fallback_font.glyph_id(c);
-                if fb_glyph_id.0 != 0 {
-                    result = self.rasterize_glyph_ab(&fallback_font.clone(), fb_glyph_id);
-                    break;
+            if !is_emoji {
+                for (_, fallback_font) in &self.fallback_fonts {
+                    let fb_glyph_id = fallback_font.glyph_id(c);
+                    if fb_glyph_id.0 != 0 {
+                        result = self.rasterize_glyph_ab(&fallback_font.clone(), fb_glyph_id);
+                        found_in_regular_font = true;
+                        break;
+                    }
                 }
             }
 
-            // If no cached fallback has the glyph, use fontconfig to find one
+            // If no cached fallback has the glyph (or it's emoji), use fontconfig to find one
             if result.is_none() {
                 // Lazy-initialize fontconfig on first use
                 let fc = self.fontconfig.get_or_init(|| {
@@ -3411,7 +5743,55 @@ impl Renderer {
                 });
                 if let Some(fc) = fc {
                     // Query fontconfig for a font that has this character
-                    if let Some(path) = find_font_for_char(fc, c) {
+                    // This now also tells us if the font is a color font
+                    if let Some((path, is_color_font)) = find_font_for_char(fc, c) {
+                        // If fontconfig returns a COLOR font, use Cairo to render it
+                        // (ab_glyph can't render color glyphs from COLR/CBDT/sbix fonts)
+                        if is_color_font {
+                            log::debug!("Fontconfig found color font for U+{:04X}, using Cairo renderer", c as u32);
+                            
+                            // Render color glyph in a separate scope to release borrow before atlas ops
+                            let color_glyph_data: Option<(u32, u32, Vec<u8>, f32, f32)> = {
+                                let mut renderer_cell = self.color_font_renderer.borrow_mut();
+                                if renderer_cell.is_none() {
+                                    *renderer_cell = ColorFontRenderer::new().ok();
+                                    if renderer_cell.is_some() {
+                                        log::debug!("Initialized color font renderer for emoji support");
+                                    } else {
+                                        log::warn!("Failed to initialize color font renderer");
+                                    }
+                                }
+                                
+                                if let Some(ref mut renderer) = *renderer_cell {
+                                    log::debug!("Attempting to render color glyph for U+{:04X} with font_size={}, cell={}x{}", 
+                                               c as u32, self.font_size, self.cell_width as u32, self.cell_height as u32);
+                                    
+                                    renderer.render_color_glyph(
+                                        &path, c, self.font_size, self.cell_width as u32, self.cell_height as u32
+                                    )
+                                } else {
+                                    None
+                                }
+                            }; // renderer_cell borrow ends here
+                            
+                            if let Some((w, h, rgba, ox, oy)) = color_glyph_data {
+                                log::debug!("Successfully rendered color glyph U+{:04X}: {}x{} pixels, offset=({}, {})", 
+                                           c as u32, w, h, ox, oy);
+                                
+                                // Place the color glyph in a cell-sized canvas at baseline
+                                let canvas = self.place_color_glyph_in_cell_canvas(
+                                    &rgba, w, h, ox, oy
+                                );
+                                let info = self.upload_cell_canvas_to_atlas(&canvas, true);
+                                
+                                self.char_cache.insert(c, info);
+                                return info;
+                            }
+                            // If color rendering failed, fall through to try ab_glyph
+                            log::debug!("Color rendering failed for U+{:04X}, trying ab_glyph fallback", c as u32);
+                        }
+                        
+                        // Non-color font or color rendering failed: use ab_glyph
                         // Only load if we haven't tried this path before
                         if !self.tried_font_paths.contains(&path) {
                             self.tried_font_paths.insert(path.clone());
@@ -3425,6 +5805,7 @@ impl Renderer {
                                     let fb_glyph_id = font.glyph_id(c);
                                     if fb_glyph_id.0 != 0 {
                                         result = self.rasterize_glyph_ab(&font, fb_glyph_id);
+                                        found_in_regular_font = true;
                                     }
 
                                     // Cache the font for future use
@@ -3438,17 +5819,78 @@ impl Renderer {
                 }
             }
 
-            // Use primary font's .notdef if no fallback has the glyph
-            result.or_else(|| self.rasterize_glyph_ab(&self.primary_font.clone(), glyph_id))
+            // Don't fall back to .notdef yet - we may still try color fonts below
+            result
         };
+        
+        // If no regular font has this glyph, try color fonts (emoji) as last resort
+        // This handles cases where no font at all was found via normal fontconfig
+        if !found_in_regular_font {
+            log::debug!("Character U+{:04X} '{}' not found in regular fonts, trying dedicated color font query", c as u32, c);
+            
+            // Check color font cache or query fontconfig for color font explicitly
+            let color_path = self.color_font_cache.entry(c).or_insert_with(|| {
+                let path = find_color_font_for_char(c);
+                log::debug!("Fontconfig color font query for U+{:04X}: {:?}", c as u32, path);
+                path
+            }).clone();
+            
+            if let Some(ref path) = color_path {
+                log::debug!("Found color font for U+{:04X}: {:?}", c as u32, path);
+                
+                // Render color glyph in a separate scope to release borrow before atlas ops
+                let color_glyph_data: Option<(u32, u32, Vec<u8>, f32, f32)> = {
+                    let mut renderer_cell = self.color_font_renderer.borrow_mut();
+                    if renderer_cell.is_none() {
+                        *renderer_cell = ColorFontRenderer::new().ok();
+                        if renderer_cell.is_some() {
+                            log::debug!("Initialized color font renderer for emoji support");
+                        } else {
+                            log::warn!("Failed to initialize color font renderer");
+                        }
+                    }
+                    
+                    if let Some(ref mut renderer) = *renderer_cell {
+                        log::debug!("Attempting to render color glyph for U+{:04X} with font_size={}, cell={}x{}", 
+                                   c as u32, self.font_size, self.cell_width as u32, self.cell_height as u32);
+                        
+                        renderer.render_color_glyph(
+                            path, c, self.font_size, self.cell_width as u32, self.cell_height as u32
+                        )
+                    } else {
+                        None
+                    }
+                }; // renderer_cell borrow ends here
+                
+                if let Some((w, h, rgba, ox, oy)) = color_glyph_data {
+                    log::debug!("Successfully rendered color glyph U+{:04X}: {}x{} pixels, offset=({}, {})", 
+                               c as u32, w, h, ox, oy);
+                    
+                    // Place the color glyph in a cell-sized canvas at baseline
+                    let canvas = self.place_color_glyph_in_cell_canvas(
+                        &rgba, w, h, ox, oy
+                    );
+                    let info = self.upload_cell_canvas_to_atlas(&canvas, true);
+                    
+                    self.char_cache.insert(c, info);
+                    return info;
+                }
+            }
+        }
+        
+        // Fall back to .notdef from primary font if we still have no glyph
+        let raster_result = raster_result.or_else(|| {
+            let notdef_glyph_id = self.primary_font.glyph_id(c);
+            self.rasterize_glyph_ab(&self.primary_font.clone(), notdef_glyph_id)
+        });
 
         // Handle rasterization result
         let Some((glyph_width, glyph_height, bitmap, offset_x, offset_y)) = raster_result else {
             // Empty glyph (e.g., space)
             let info = GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
-                offset: [0.0, 0.0],
                 size: [0.0, 0.0],
+                is_colored: false,
             };
             self.char_cache.insert(c, info);
             return info;
@@ -3458,62 +5900,291 @@ impl Renderer {
             // Empty glyph (e.g., space)
             let info = GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
-                offset: [0.0, 0.0],
                 size: [0.0, 0.0],
+                is_colored: false,
             };
             self.char_cache.insert(c, info);
             return info;
         }
 
-        // Check if we need to move to next row
-        if self.atlas_cursor_x + glyph_width > ATLAS_SIZE {
-            self.atlas_cursor_x = 0;
-            self.atlas_cursor_y += self.atlas_row_height + 1;
-            self.atlas_row_height = 0;
-        }
-
-        // Check if atlas is full
-        if self.atlas_cursor_y + glyph_height > ATLAS_SIZE {
-            log::warn!("Glyph atlas is full!");
-            let info = GlyphInfo {
-                uv: [0.0, 0.0, 0.0, 0.0],
-                offset: [0.0, 0.0],
-                size: [0.0, 0.0],
+        // Check if this is an oversized symbol glyph that needs rescaling.
+        // PUA glyphs (Nerd Fonts), dingbats, and other symbols that are wider than
+        // one cell should be rescaled to fit when rendered standalone (not part of
+        // a multi-cell group).
+        let (final_bitmap, final_width, final_height, final_offset_x, final_offset_y) = 
+            if Self::is_multicell_symbol(c) {
+                let cell_w = self.cell_width;
+                // Use just the glyph bitmap width for comparison, not offset_x + width
+                // offset_x is the left bearing which can be negative
+                let glyph_w = glyph_width as f32;
+                
+                log::debug!("Scaling check for U+{:04X}: glyph_width={}, cell_width={:.1}, offset_x={:.1}", 
+                           c as u32, glyph_width, cell_w, offset_x);
+                
+                if glyph_w > cell_w {
+                    // Glyph is wider than cell - rescale to fit
+                    // Calculate scale factor to fit within cell width with small margin
+                    let target_width = cell_w * 0.95; // Leave 5% margin
+                    let scale_factor = target_width / glyph_w;
+                    
+                    log::debug!("Scaling U+{:04X} by factor {:.2} (glyph_w={:.1} > cell_w={:.1})",
+                               c as u32, scale_factor, glyph_w, cell_w);
+                    
+                    // Rescale bitmap using simple nearest-neighbor (good enough for icons)
+                    let new_width = (glyph_width as f32 * scale_factor).ceil() as u32;
+                    let new_height = (glyph_height as f32 * scale_factor).ceil() as u32;
+                    
+                    if new_width > 0 && new_height > 0 {
+                        let mut scaled_bitmap = vec![0u8; (new_width * new_height) as usize];
+                        
+                        for y in 0..new_height {
+                            for x in 0..new_width {
+                                // Map to source coordinates
+                                let src_x = ((x as f32 / scale_factor) as u32).min(glyph_width - 1);
+                                let src_y = ((y as f32 / scale_factor) as u32).min(glyph_height - 1);
+                                let src_idx = (src_y * glyph_width + src_x) as usize;
+                                let dst_idx = (y * new_width + x) as usize;
+                                scaled_bitmap[dst_idx] = bitmap[src_idx];
+                            }
+                        }
+                        
+                        // Adjust offset to center the scaled glyph
+                        let new_offset_x = (cell_w - new_width as f32) / 2.0;
+                        let new_offset_y = offset_y * scale_factor;
+                        
+                        (scaled_bitmap, new_width, new_height, new_offset_x, new_offset_y)
+                    } else {
+                        (bitmap, glyph_width, glyph_height, offset_x, offset_y)
+                    }
+                } else {
+                    (bitmap, glyph_width, glyph_height, offset_x, offset_y)
+                }
+            } else {
+                (bitmap, glyph_width, glyph_height, offset_x, offset_y)
             };
-            self.char_cache.insert(c, info);
-            return info;
-        }
 
-        // Copy bitmap to atlas
-        for y in 0..glyph_height as usize {
-            for x in 0..glyph_width as usize {
-                let src_idx = y * glyph_width as usize + x;
-                let dst_x = self.atlas_cursor_x + x as u32;
-                let dst_y = self.atlas_cursor_y + y as u32;
-                let dst_idx = (dst_y * ATLAS_SIZE + dst_x) as usize;
-                self.atlas_data[dst_idx] = bitmap[src_idx];
-            }
-        }
-        self.atlas_dirty = true;
-
-        // Calculate UV coordinates
-        let uv_x = self.atlas_cursor_x as f32 / ATLAS_SIZE as f32;
-        let uv_y = self.atlas_cursor_y as f32 / ATLAS_SIZE as f32;
-        let uv_w = glyph_width as f32 / ATLAS_SIZE as f32;
-        let uv_h = glyph_height as f32 / ATLAS_SIZE as f32;
-
-        let info = GlyphInfo {
-            uv: [uv_x, uv_y, uv_w, uv_h],
-            offset: [offset_x, offset_y],
-            size: [glyph_width as f32, glyph_height as f32],
-        };
-
-        // Update atlas cursor
-        self.atlas_cursor_x += glyph_width + 1;
-        self.atlas_row_height = self.atlas_row_height.max(glyph_height);
+        // Place the glyph in a cell-sized canvas at the correct baseline position
+        let canvas = self.place_glyph_in_cell_canvas(
+            &final_bitmap, final_width, final_height, final_offset_x, final_offset_y
+        );
+        let info = self.upload_cell_canvas_to_atlas(&canvas, false);
 
         self.char_cache.insert(c, info);
         info
+    }
+    
+    /// Rasterize a PUA character into a multi-cell canvas and return GlyphInfo for each cell.
+    /// This is used when a PUA glyph is followed by space(s) - the glyph spans multiple cells.
+    /// 
+    /// Like Kitty's approach:
+    /// 1. Render the glyph to a canvas sized for `num_cells` cells
+    /// 2. Center the glyph horizontally within the canvas
+    /// 3. Extract each cell's portion as a separate sprite
+    /// 
+    /// Returns a Vec of GlyphInfo, one for each cell.
+    fn rasterize_pua_multicell(&mut self, c: char, num_cells: usize) -> Vec<GlyphInfo> {
+        let cell_w = self.cell_width.ceil() as usize;
+        let cell_h = self.cell_height.ceil() as usize;
+        let canvas_width = cell_w * num_cells;
+        
+        // First, rasterize the glyph at full size
+        let raster_result: Option<(u32, u32, Vec<u8>, f32, f32)> = {
+            let glyph_id = self.primary_font.glyph_id(c);
+            if glyph_id.0 != 0 {
+                self.rasterize_glyph_ab(&self.primary_font.clone(), glyph_id)
+            } else {
+                // Try fallback fonts
+                let mut result = None;
+                for (_, fallback_font) in &self.fallback_fonts {
+                    let fb_glyph_id = fallback_font.glyph_id(c);
+                    if fb_glyph_id.0 != 0 {
+                        result = self.rasterize_glyph_ab(&fallback_font.clone(), fb_glyph_id);
+                        break;
+                    }
+                }
+                result
+            }
+        };
+        
+        let Some((glyph_width, glyph_height, bitmap, _offset_x, offset_y)) = raster_result else {
+            // Empty glyph - return empty sprites for each cell
+            return vec![GlyphInfo {
+                uv: [0.0, 0.0, 0.0, 0.0],
+                size: [0.0, 0.0],
+                is_colored: false,
+            }; num_cells];
+        };
+        
+        if bitmap.is_empty() || glyph_width == 0 || glyph_height == 0 {
+            return vec![GlyphInfo {
+                uv: [0.0, 0.0, 0.0, 0.0],
+                size: [0.0, 0.0],
+                is_colored: false,
+            }; num_cells];
+        }
+        
+        // Create a multi-cell canvas
+        let mut canvas = vec![0u8; canvas_width * cell_h];
+        
+        // Position glyph at x=0 (left-aligned), like Kitty's model where
+        // glyphs are positioned at origin without offset adjustments
+        let dest_x = 0i32;
+        
+        // Calculate vertical position using baseline, same as single-cell rendering
+        // dest_y = baseline - glyph_height - offset_y
+        let dest_y = (self.baseline - glyph_height as f32 - offset_y).round() as i32;
+        
+        // Copy glyph bitmap to the multi-cell canvas
+        for gy in 0..glyph_height as i32 {
+            let cy = dest_y + gy;
+            if cy < 0 || cy >= cell_h as i32 {
+                continue;
+            }
+            for gx in 0..glyph_width as i32 {
+                let cx = dest_x + gx;
+                if cx < 0 || cx >= canvas_width as i32 {
+                    continue;
+                }
+                let src_idx = (gy as u32 * glyph_width + gx as u32) as usize;
+                let dst_idx = cy as usize * canvas_width + cx as usize;
+                canvas[dst_idx] = canvas[dst_idx].max(bitmap[src_idx]);
+            }
+        }
+        
+        // Extract each cell's portion as a separate sprite
+        let mut sprites = Vec::with_capacity(num_cells);
+        
+        for cell_idx in 0..num_cells {
+            // Extract this cell's portion from the canvas
+            let mut cell_canvas = vec![0u8; cell_w * cell_h];
+            let cell_start_x = cell_idx * cell_w;
+            
+            for y in 0..cell_h {
+                for x in 0..cell_w {
+                    let src_idx = y * canvas_width + cell_start_x + x;
+                    let dst_idx = y * cell_w + x;
+                    cell_canvas[dst_idx] = canvas[src_idx];
+                }
+            }
+            
+            // Upload this cell's sprite to the atlas
+            let info = self.upload_cell_canvas_to_atlas(&cell_canvas, false);
+            sprites.push(info);
+        }
+        
+        sprites
+    }
+    
+    /// Rasterize an emoji into a multi-cell canvas and return GlyphInfo for each cell.
+    /// This uses the Cairo color font renderer since emoji are color glyphs.
+    /// 
+    /// Returns a Vec of GlyphInfo, one for each cell.
+    fn rasterize_emoji_multicell(&mut self, c: char, num_cells: usize) -> Vec<GlyphInfo> {
+        let cell_w = self.cell_width.ceil() as usize;
+        let cell_h = self.cell_height.ceil() as usize;
+        let canvas_width = cell_w * num_cells;
+        
+        // Find a color font for this emoji (find_color_font_for_char handles fontconfig internally)
+        let Some(font_path) = find_color_font_for_char(c) else {
+            log::debug!("No color font found for emoji U+{:04X}", c as u32);
+            return vec![GlyphInfo {
+                uv: [0.0, 0.0, 0.0, 0.0],
+                size: [0.0, 0.0],
+                is_colored: true,
+            }; num_cells];
+        };
+        
+        // Render the emoji using Cairo at full multi-cell size
+        let color_glyph_data: Option<(u32, u32, Vec<u8>, f32, f32)> = {
+            let mut renderer_cell = self.color_font_renderer.borrow_mut();
+            if renderer_cell.is_none() {
+                *renderer_cell = ColorFontRenderer::new().ok();
+            }
+            
+            if let Some(ref mut renderer) = *renderer_cell {
+                // Render at multi-cell width
+                renderer.render_color_glyph(
+                    &font_path, c, self.font_size, 
+                    (cell_w * num_cells) as u32, cell_h as u32
+                )
+            } else {
+                None
+            }
+        };
+        
+        let Some((glyph_width, glyph_height, rgba, offset_x, offset_y)) = color_glyph_data else {
+            log::debug!("Failed to render emoji U+{:04X}", c as u32);
+            return vec![GlyphInfo {
+                uv: [0.0, 0.0, 0.0, 0.0],
+                size: [0.0, 0.0],
+                is_colored: true,
+            }; num_cells];
+        };
+        
+        if rgba.is_empty() || glyph_width == 0 || glyph_height == 0 {
+            return vec![GlyphInfo {
+                uv: [0.0, 0.0, 0.0, 0.0],
+                size: [0.0, 0.0],
+                is_colored: true,
+            }; num_cells];
+        }
+        
+        // Create a multi-cell RGBA canvas
+        let mut canvas = vec![0u8; canvas_width * cell_h * 4];
+        
+        // Position the glyph - for color glyphs, offset_y is ascent (distance from baseline to TOP)
+        let dest_x = offset_x.round() as i32;
+        let dest_y = (self.baseline - offset_y).round() as i32;
+        
+        // Copy the RGBA bitmap to the multi-cell canvas
+        for gy in 0..glyph_height as i32 {
+            let cy = dest_y + gy;
+            if cy < 0 || cy >= cell_h as i32 {
+                continue;
+            }
+            for gx in 0..glyph_width as i32 {
+                let cx = dest_x + gx;
+                if cx < 0 || cx >= canvas_width as i32 {
+                    continue;
+                }
+                let src_idx = (gy as u32 * glyph_width + gx as u32) as usize * 4;
+                let dst_idx = (cy as usize * canvas_width + cx as usize) * 4;
+                if src_idx + 3 < rgba.len() && dst_idx + 3 < canvas.len() {
+                    canvas[dst_idx] = rgba[src_idx];
+                    canvas[dst_idx + 1] = rgba[src_idx + 1];
+                    canvas[dst_idx + 2] = rgba[src_idx + 2];
+                    canvas[dst_idx + 3] = rgba[src_idx + 3];
+                }
+            }
+        }
+        
+        // Extract each cell's portion as a separate sprite
+        let mut sprites = Vec::with_capacity(num_cells);
+        
+        for cell_idx in 0..num_cells {
+            // Extract this cell's RGBA portion from the canvas
+            let mut cell_canvas = vec![0u8; cell_w * cell_h * 4];
+            let cell_start_x = cell_idx * cell_w;
+            
+            for y in 0..cell_h {
+                for x in 0..cell_w {
+                    let src_idx = (y * canvas_width + cell_start_x + x) * 4;
+                    let dst_idx = (y * cell_w + x) * 4;
+                    if src_idx + 3 < canvas.len() && dst_idx + 3 < cell_canvas.len() {
+                        cell_canvas[dst_idx] = canvas[src_idx];
+                        cell_canvas[dst_idx + 1] = canvas[src_idx + 1];
+                        cell_canvas[dst_idx + 2] = canvas[src_idx + 2];
+                        cell_canvas[dst_idx + 3] = canvas[src_idx + 3];
+                    }
+                }
+            }
+            
+            // Upload this cell's sprite to the atlas (colored = true for RGBA)
+            let info = self.upload_cell_canvas_to_atlas(&cell_canvas, true);
+            sprites.push(info);
+        }
+        
+        sprites
     }
     
     /// Rasterize a glyph using ab_glyph with pixel-perfect alignment.
@@ -3578,6 +6249,180 @@ impl Renderer {
         Some((width, height, bitmap, offset_x, offset_y))
     }
 
+    /// Place a glyph bitmap into a cell-sized canvas at the correct baseline position.
+    /// This follows Kitty's model where sprites are always cell-sized.
+    /// 
+    /// Parameters:
+    /// - bitmap: The rasterized glyph bitmap (grayscale)
+    /// - glyph_width, glyph_height: Dimensions of the bitmap
+    /// - offset_x: Left bearing (horizontal offset from cell origin)
+    /// - offset_y: Distance from baseline to glyph bottom (negative = below baseline)
+    /// 
+    /// Returns: Cell-sized canvas with the glyph positioned at baseline
+    fn place_glyph_in_cell_canvas(
+        &self,
+        bitmap: &[u8],
+        glyph_width: u32,
+        glyph_height: u32,
+        offset_x: f32,
+        offset_y: f32,
+    ) -> Vec<u8> {
+        let cell_w = self.cell_width.ceil() as usize;
+        let cell_h = self.cell_height.ceil() as usize;
+        let mut canvas = vec![0u8; cell_w * cell_h];
+        
+        // Calculate destination position in the cell canvas.
+        // baseline is the Y position where the baseline sits (from top of cell).
+        // offset_y is the distance from baseline to glyph bottom.
+        // glyph_top = baseline - (glyph_height + offset_y)
+        //           = baseline - glyph_height - offset_y
+        // Since offset_y can be negative (for descenders), this works correctly.
+        let dest_x = offset_x.round() as i32;
+        let dest_y = (self.baseline - glyph_height as f32 - offset_y).round() as i32;
+        
+        // Copy the glyph bitmap to the canvas, clipping to cell bounds
+        for gy in 0..glyph_height as i32 {
+            let cy = dest_y + gy;
+            if cy < 0 || cy >= cell_h as i32 {
+                continue;
+            }
+            for gx in 0..glyph_width as i32 {
+                let cx = dest_x + gx;
+                if cx < 0 || cx >= cell_w as i32 {
+                    continue;
+                }
+                let src_idx = (gy as u32 * glyph_width + gx as u32) as usize;
+                let dst_idx = cy as usize * cell_w + cx as usize;
+                // Use max to handle overlapping glyphs (shouldn't happen for single chars)
+                canvas[dst_idx] = canvas[dst_idx].max(bitmap[src_idx]);
+            }
+        }
+        
+        canvas
+    }
+
+    /// Place a colored (RGBA) glyph bitmap into a cell-sized RGBA canvas.
+    /// Used for emoji and other color glyphs.
+    fn place_color_glyph_in_cell_canvas(
+        &self,
+        bitmap: &[u8],
+        glyph_width: u32,
+        glyph_height: u32,
+        offset_x: f32,
+        offset_y: f32,
+    ) -> Vec<u8> {
+        let cell_w = self.cell_width.ceil() as usize;
+        let cell_h = self.cell_height.ceil() as usize;
+        let mut canvas = vec![0u8; cell_w * cell_h * 4]; // RGBA
+        
+        // For color glyphs, offset_y is the ascent (distance from baseline to TOP of glyph)
+        // So dest_y = baseline - offset_y positions the top of the glyph correctly
+        let dest_x = offset_x.round() as i32;
+        let dest_y = (self.baseline - offset_y).round() as i32;
+        
+        // Copy the RGBA bitmap to the canvas
+        for gy in 0..glyph_height as i32 {
+            let cy = dest_y + gy;
+            if cy < 0 || cy >= cell_h as i32 {
+                continue;
+            }
+            for gx in 0..glyph_width as i32 {
+                let cx = dest_x + gx;
+                if cx < 0 || cx >= cell_w as i32 {
+                    continue;
+                }
+                let src_idx = (gy as u32 * glyph_width + gx as u32) as usize * 4;
+                let dst_idx = (cy as usize * cell_w + cx as usize) * 4;
+                // For color glyphs, just copy the RGBA values
+                // (could do alpha blending if needed, but single glyph per cell)
+                if src_idx + 3 < bitmap.len() && dst_idx + 3 < canvas.len() {
+                    canvas[dst_idx] = bitmap[src_idx];
+                    canvas[dst_idx + 1] = bitmap[src_idx + 1];
+                    canvas[dst_idx + 2] = bitmap[src_idx + 2];
+                    canvas[dst_idx + 3] = bitmap[src_idx + 3];
+                }
+            }
+        }
+        
+        canvas
+    }
+
+    /// Upload a cell-sized grayscale canvas to the atlas.
+    /// Returns GlyphInfo with UV coordinates pointing to the uploaded sprite.
+    fn upload_cell_canvas_to_atlas(&mut self, canvas: &[u8], is_colored: bool) -> GlyphInfo {
+        let cell_w = self.cell_width.ceil() as u32;
+        let cell_h = self.cell_height.ceil() as u32;
+        
+        // Check if we need to move to next row
+        if self.atlas_cursor_x + cell_w > ATLAS_SIZE {
+            self.atlas_cursor_x = 0;
+            self.atlas_cursor_y += self.atlas_row_height + 1;
+            self.atlas_row_height = 0;
+        }
+        
+        // Check if atlas is full - reset and retry
+        if self.atlas_cursor_y + cell_h > ATLAS_SIZE {
+            self.reset_atlas();
+            if self.atlas_cursor_x + cell_w > ATLAS_SIZE {
+                self.atlas_cursor_x = 0;
+                self.atlas_cursor_y += self.atlas_row_height + 1;
+                self.atlas_row_height = 0;
+            }
+        }
+        
+        // Copy canvas to atlas
+        if is_colored {
+            // RGBA canvas - copy directly
+            for y in 0..cell_h as usize {
+                for x in 0..cell_w as usize {
+                    let src_idx = (y * cell_w as usize + x) * 4;
+                    let dst_x = self.atlas_cursor_x + x as u32;
+                    let dst_y = self.atlas_cursor_y + y as u32;
+                    let dst_idx = ((dst_y * ATLAS_SIZE + dst_x) * ATLAS_BPP) as usize;
+                    if src_idx + 3 < canvas.len() && dst_idx + 3 < self.atlas_data.len() {
+                        self.atlas_data[dst_idx] = canvas[src_idx];
+                        self.atlas_data[dst_idx + 1] = canvas[src_idx + 1];
+                        self.atlas_data[dst_idx + 2] = canvas[src_idx + 2];
+                        self.atlas_data[dst_idx + 3] = canvas[src_idx + 3];
+                    }
+                }
+            }
+        } else {
+            // Grayscale canvas - convert to RGBA (white with alpha)
+            for y in 0..cell_h as usize {
+                for x in 0..cell_w as usize {
+                    let src_idx = y * cell_w as usize + x;
+                    let dst_x = self.atlas_cursor_x + x as u32;
+                    let dst_y = self.atlas_cursor_y + y as u32;
+                    let dst_idx = ((dst_y * ATLAS_SIZE + dst_x) * ATLAS_BPP) as usize;
+                    if src_idx < canvas.len() && dst_idx + 3 < self.atlas_data.len() {
+                        self.atlas_data[dst_idx] = 255;     // R
+                        self.atlas_data[dst_idx + 1] = 255; // G
+                        self.atlas_data[dst_idx + 2] = 255; // B
+                        self.atlas_data[dst_idx + 3] = canvas[src_idx]; // A
+                    }
+                }
+            }
+        }
+        self.atlas_dirty = true;
+        
+        // Calculate UV coordinates
+        let uv_x = self.atlas_cursor_x as f32 / ATLAS_SIZE as f32;
+        let uv_y = self.atlas_cursor_y as f32 / ATLAS_SIZE as f32;
+        let uv_w = cell_w as f32 / ATLAS_SIZE as f32;
+        let uv_h = cell_h as f32 / ATLAS_SIZE as f32;
+        
+        // Update atlas cursor
+        self.atlas_cursor_x += cell_w + 1;
+        self.atlas_row_height = self.atlas_row_height.max(cell_h);
+        
+        GlyphInfo {
+            uv: [uv_x, uv_y, uv_w, uv_h],
+            size: [cell_w as f32, cell_h as f32],
+            is_colored,
+        }
+    }
+
     /// Get or rasterize a glyph by its glyph ID from the primary font.
     /// Used for ligatures where we have the glyph ID from rustybuzz.
     /// Note: Kept for potential fallback use. Use get_glyph_by_id_with_style for styled text.
@@ -3598,8 +6443,8 @@ impl Renderer {
             // Empty glyph (e.g., space)
             let info = GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
-                offset: [0.0, 0.0],
                 size: [0.0, 0.0],
+                is_colored: false,
             };
             self.glyph_cache.insert(cache_key, info);
             return info;
@@ -3609,59 +6454,18 @@ impl Renderer {
             // Empty glyph (e.g., space)
             let info = GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
-                offset: [0.0, 0.0],
                 size: [0.0, 0.0],
+                is_colored: false,
             };
             self.glyph_cache.insert(cache_key, info);
             return info;
         }
 
-        // Check if we need to move to next row
-        if self.atlas_cursor_x + glyph_width > ATLAS_SIZE {
-            self.atlas_cursor_x = 0;
-            self.atlas_cursor_y += self.atlas_row_height + 1;
-            self.atlas_row_height = 0;
-        }
-
-        // Check if atlas is full
-        if self.atlas_cursor_y + glyph_height > ATLAS_SIZE {
-            log::warn!("Glyph atlas is full!");
-            let info = GlyphInfo {
-                uv: [0.0, 0.0, 0.0, 0.0],
-                offset: [0.0, 0.0],
-                size: [0.0, 0.0],
-            };
-            self.glyph_cache.insert(cache_key, info);
-            return info;
-        }
-
-        // Copy bitmap to atlas
-        for y in 0..glyph_height as usize {
-            for x in 0..glyph_width as usize {
-                let src_idx = y * glyph_width as usize + x;
-                let dst_x = self.atlas_cursor_x + x as u32;
-                let dst_y = self.atlas_cursor_y + y as u32;
-                let dst_idx = (dst_y * ATLAS_SIZE + dst_x) as usize;
-                self.atlas_data[dst_idx] = bitmap[src_idx];
-            }
-        }
-        self.atlas_dirty = true;
-
-        // Calculate UV coordinates
-        let uv_x = self.atlas_cursor_x as f32 / ATLAS_SIZE as f32;
-        let uv_y = self.atlas_cursor_y as f32 / ATLAS_SIZE as f32;
-        let uv_w = glyph_width as f32 / ATLAS_SIZE as f32;
-        let uv_h = glyph_height as f32 / ATLAS_SIZE as f32;
-
-        let info = GlyphInfo {
-            uv: [uv_x, uv_y, uv_w, uv_h],
-            offset: [offset_x, offset_y],
-            size: [glyph_width as f32, glyph_height as f32],
-        };
-
-        // Update atlas cursor
-        self.atlas_cursor_x += glyph_width + 1;
-        self.atlas_row_height = self.atlas_row_height.max(glyph_height);
+        // Place the glyph in a cell-sized canvas at the correct baseline position
+        let canvas = self.place_glyph_in_cell_canvas(
+            &bitmap, glyph_width, glyph_height, offset_x, offset_y
+        );
+        let info = self.upload_cell_canvas_to_atlas(&canvas, false);
 
         self.glyph_cache.insert(cache_key, info);
         info
@@ -3695,8 +6499,8 @@ impl Renderer {
             // Empty glyph (e.g., space)
             let info = GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
-                offset: [0.0, 0.0],
                 size: [0.0, 0.0],
+                is_colored: false,
             };
             self.glyph_cache.insert(cache_key, info);
             return info;
@@ -3706,59 +6510,18 @@ impl Renderer {
             // Empty glyph (e.g., space)
             let info = GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
-                offset: [0.0, 0.0],
                 size: [0.0, 0.0],
+                is_colored: false,
             };
             self.glyph_cache.insert(cache_key, info);
             return info;
         }
 
-        // Check if we need to move to next row
-        if self.atlas_cursor_x + glyph_width > ATLAS_SIZE {
-            self.atlas_cursor_x = 0;
-            self.atlas_cursor_y += self.atlas_row_height + 1;
-            self.atlas_row_height = 0;
-        }
-
-        // Check if atlas is full
-        if self.atlas_cursor_y + glyph_height > ATLAS_SIZE {
-            log::warn!("Glyph atlas is full!");
-            let info = GlyphInfo {
-                uv: [0.0, 0.0, 0.0, 0.0],
-                offset: [0.0, 0.0],
-                size: [0.0, 0.0],
-            };
-            self.glyph_cache.insert(cache_key, info);
-            return info;
-        }
-
-        // Copy bitmap to atlas
-        for y in 0..glyph_height as usize {
-            for x in 0..glyph_width as usize {
-                let src_idx = y * glyph_width as usize + x;
-                let dst_x = self.atlas_cursor_x + x as u32;
-                let dst_y = self.atlas_cursor_y + y as u32;
-                let dst_idx = (dst_y * ATLAS_SIZE + dst_x) as usize;
-                self.atlas_data[dst_idx] = bitmap[src_idx];
-            }
-        }
-        self.atlas_dirty = true;
-
-        // Calculate UV coordinates
-        let uv_x = self.atlas_cursor_x as f32 / ATLAS_SIZE as f32;
-        let uv_y = self.atlas_cursor_y as f32 / ATLAS_SIZE as f32;
-        let uv_w = glyph_width as f32 / ATLAS_SIZE as f32;
-        let uv_h = glyph_height as f32 / ATLAS_SIZE as f32;
-
-        let info = GlyphInfo {
-            uv: [uv_x, uv_y, uv_w, uv_h],
-            offset: [offset_x, offset_y],
-            size: [glyph_width as f32, glyph_height as f32],
-        };
-
-        // Update atlas cursor
-        self.atlas_cursor_x += glyph_width + 1;
-        self.atlas_row_height = self.atlas_row_height.max(glyph_height);
+        // Place the glyph in a cell-sized canvas at the correct baseline position
+        let canvas = self.place_glyph_in_cell_canvas(
+            &bitmap, glyph_width, glyph_height, offset_x, offset_y
+        );
+        let info = self.upload_cell_canvas_to_atlas(&canvas, false);
 
         self.glyph_cache.insert(cache_key, info);
         info
@@ -3854,273 +6617,6 @@ impl Renderer {
         shaped
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // KITTY-STYLE TEXTURE HEALING: CANVAS-BASED TEXT RUN RENDERING
-    // ═══════════════════════════════════════════════════════════════════════════
-    //
-    // This implements Kitty's approach to texture healing:
-    // 1. Render all glyphs in a text run into a single multi-cell canvas
-    // 2. Use HarfBuzz x_offset and x_advance for glyph positioning
-    // 3. Extract individual cell-sized sprites from the canvas
-    // 4. Upload each cell sprite to the atlas
-    //
-    // This allows narrow characters (like 'i') to leave space for adjacent
-    // wider characters (like 'm'), creating more balanced text appearance.
-
-    /// Ensure the canvas buffer is large enough for the given number of cells.
-    fn ensure_canvas_size(&mut self, num_cells: usize) {
-        let required_width = (self.cell_width as usize) * num_cells;
-        let required_height = self.cell_height as usize;
-        let required_size = required_width * required_height;
-        
-        if self.canvas_buffer.len() < required_size {
-            self.canvas_buffer.resize(required_size, 0);
-        }
-        self.canvas_size = (required_width as u32, required_height as u32);
-    }
-
-    /// Clear the canvas buffer to transparent.
-    fn clear_canvas(&mut self, num_cells: usize) {
-        let canvas_width = (self.cell_width as usize) * num_cells;
-        let canvas_height = self.cell_height as usize;
-        let size = canvas_width * canvas_height;
-        // Only clear the portion we're using
-        self.canvas_buffer[..size].fill(0);
-    }
-
-    /// Render shaped glyphs into the canvas buffer using HarfBuzz positions.
-    /// This is the core of Kitty's texture healing approach.
-    /// Note: Kept for potential fallback use. Use render_glyphs_to_canvas_with_style for styled text.
-    /// 
-    /// Arguments:
-    /// - `shaped`: The shaped glyph data from HarfBuzz
-    /// - `num_cells`: Number of cells this text run spans
-    /// - `baseline_offset`: Offset from top of cell to baseline (typically cell_height * 0.8)
-    #[allow(dead_code)]
-    fn render_glyphs_to_canvas(&mut self, shaped: &ShapedGlyphs, num_cells: usize, baseline_offset: f32) {
-        let canvas_width = (self.cell_width as usize) * num_cells;
-        let canvas_height = self.cell_height as usize;
-        
-        // Track cursor position in canvas coordinates
-        let mut cursor_x: f32 = 0.0;
-        
-        for &(glyph_id, x_advance, x_offset, y_offset, _cluster) in &shaped.glyphs {
-            // Get the rasterized glyph bitmap
-            let glyph = self.get_glyph_by_id(glyph_id);
-            
-            if glyph.size[0] <= 0.0 || glyph.size[1] <= 0.0 {
-                // Empty glyph (e.g., space) - just advance cursor
-                cursor_x += x_advance;
-                continue;
-            }
-            
-            // Calculate glyph position in canvas:
-            // - cursor_x: accumulated from x_advance
-            // - x_offset: HarfBuzz adjustment for texture healing
-            // - glyph.offset[0]: left bearing from the font
-            let glyph_x = cursor_x + x_offset + glyph.offset[0];
-            
-            // Y position: baseline_offset is from top to baseline
-            // glyph.offset[1] is distance from baseline to glyph bottom (negative = below baseline)
-            // For canvas coords (y=0 at top), we need: baseline_offset - glyph_top
-            // glyph_top = glyph.offset[1] + glyph.size[1] (since offset is to bottom)
-            let glyph_y = baseline_offset + y_offset - glyph.offset[1] - glyph.size[1];
-            
-            // Round to integers for pixel placement
-            let dest_x = glyph_x.round() as i32;
-            let dest_y = glyph_y.round() as i32;
-            
-            // Get glyph bitmap from atlas
-            // The glyph.uv gives us the location in the atlas
-            let atlas_x = (glyph.uv[0] * ATLAS_SIZE as f32) as u32;
-            let atlas_y = (glyph.uv[1] * ATLAS_SIZE as f32) as u32;
-            let glyph_w = glyph.size[0] as u32;
-            let glyph_h = glyph.size[1] as u32;
-            
-            // Copy glyph bitmap from atlas to canvas, with bounds checking
-            for gy in 0..glyph_h {
-                let canvas_y = dest_y + gy as i32;
-                if canvas_y < 0 || canvas_y >= canvas_height as i32 {
-                    continue;
-                }
-                
-                for gx in 0..glyph_w {
-                    let canvas_x = dest_x + gx as i32;
-                    if canvas_x < 0 || canvas_x >= canvas_width as i32 {
-                        continue;
-                    }
-                    
-                    // Source in atlas
-                    let src_idx = ((atlas_y + gy) * ATLAS_SIZE + (atlas_x + gx)) as usize;
-                    // Destination in canvas
-                    let dst_idx = (canvas_y as usize) * canvas_width + (canvas_x as usize);
-                    
-                    // Blend: use max for overlapping glyphs (simple compositing)
-                    let src_alpha = self.atlas_data[src_idx];
-                    let dst_alpha = self.canvas_buffer[dst_idx];
-                    self.canvas_buffer[dst_idx] = src_alpha.max(dst_alpha);
-                }
-            }
-            
-            // Advance cursor by glyph's advance width.
-            // Round the advance to ensure it aligns with cell boundaries for monospace fonts.
-            // This matches Kitty's approach: x += roundf(x_advance)
-            cursor_x += x_advance.round();
-        }
-    }
-
-    /// Render shaped glyphs into the canvas buffer using a specific font style.
-    /// This version uses the appropriate font variant for bold/italic text.
-    fn render_glyphs_to_canvas_with_style(&mut self, shaped: &ShapedGlyphs, num_cells: usize, baseline_offset: f32, style: FontStyle) {
-        let canvas_width = (self.cell_width as usize) * num_cells;
-        let canvas_height = self.cell_height as usize;
-        
-        // Track cursor position in canvas coordinates
-        let mut cursor_x: f32 = 0.0;
-        
-        for &(glyph_id, x_advance, x_offset, y_offset, _cluster) in &shaped.glyphs {
-            // Get the rasterized glyph bitmap using the correct font variant
-            let glyph = self.get_glyph_by_id_with_style(glyph_id, style);
-            
-            if glyph.size[0] <= 0.0 || glyph.size[1] <= 0.0 {
-                // Empty glyph (e.g., space) - just advance cursor
-                cursor_x += x_advance;
-                continue;
-            }
-            
-            // Calculate glyph position in canvas:
-            // - cursor_x: accumulated from x_advance
-            // - x_offset: HarfBuzz adjustment for texture healing
-            // - glyph.offset[0]: left bearing from the font
-            let glyph_x = cursor_x + x_offset + glyph.offset[0];
-            
-            // Y position: baseline_offset is from top to baseline
-            // glyph.offset[1] is distance from baseline to glyph bottom (negative = below baseline)
-            // For canvas coords (y=0 at top), we need: baseline_offset - glyph_top
-            // glyph_top = glyph.offset[1] + glyph.size[1] (since offset is to bottom)
-            let glyph_y = baseline_offset + y_offset - glyph.offset[1] - glyph.size[1];
-            
-            // Round to integers for pixel placement
-            let dest_x = glyph_x.round() as i32;
-            let dest_y = glyph_y.round() as i32;
-            
-            // Get glyph bitmap from atlas
-            // The glyph.uv gives us the location in the atlas
-            let atlas_x = (glyph.uv[0] * ATLAS_SIZE as f32) as u32;
-            let atlas_y = (glyph.uv[1] * ATLAS_SIZE as f32) as u32;
-            let glyph_w = glyph.size[0] as u32;
-            let glyph_h = glyph.size[1] as u32;
-            
-            // Copy glyph bitmap from atlas to canvas, with bounds checking
-            for gy in 0..glyph_h {
-                let canvas_y = dest_y + gy as i32;
-                if canvas_y < 0 || canvas_y >= canvas_height as i32 {
-                    continue;
-                }
-                
-                for gx in 0..glyph_w {
-                    let canvas_x = dest_x + gx as i32;
-                    if canvas_x < 0 || canvas_x >= canvas_width as i32 {
-                        continue;
-                    }
-                    
-                    // Source in atlas
-                    let src_idx = ((atlas_y + gy) * ATLAS_SIZE + (atlas_x + gx)) as usize;
-                    // Destination in canvas
-                    let dst_idx = (canvas_y as usize) * canvas_width + (canvas_x as usize);
-                    
-                    // Blend: use max for overlapping glyphs (simple compositing)
-                    let src_alpha = self.atlas_data[src_idx];
-                    let dst_alpha = self.canvas_buffer[dst_idx];
-                    self.canvas_buffer[dst_idx] = src_alpha.max(dst_alpha);
-                }
-            }
-            
-            // Advance cursor by glyph's advance width.
-            // Round the advance to ensure it aligns with cell boundaries for monospace fonts.
-            cursor_x += x_advance.round();
-        }
-    }
-
-    /// Extract a single cell from the canvas and upload it to the atlas.
-    /// Returns the GlyphInfo for this cell's sprite.
-    fn extract_cell_from_canvas(&mut self, cell_index: usize, num_cells: usize) -> [f32; 4] {
-        let cell_width = self.cell_width as u32;
-        let cell_height = self.cell_height as u32;
-        let canvas_width = cell_width * num_cells as u32;
-        
-        // Check if we need to move to next row in atlas
-        if self.atlas_cursor_x + cell_width > ATLAS_SIZE {
-            self.atlas_cursor_x = 0;
-            self.atlas_cursor_y += self.atlas_row_height + 1;
-            self.atlas_row_height = 0;
-        }
-        
-        // Check if atlas is full
-        if self.atlas_cursor_y + cell_height > ATLAS_SIZE {
-            log::warn!("Glyph atlas is full during text run rendering!");
-            return [0.0, 0.0, 0.0, 0.0];
-        }
-        
-        // Copy cell region from canvas to atlas
-        let src_x_start = cell_index as u32 * cell_width;
-        for y in 0..cell_height {
-            for x in 0..cell_width {
-                let src_idx = (y * canvas_width + src_x_start + x) as usize;
-                let dst_x = self.atlas_cursor_x + x;
-                let dst_y = self.atlas_cursor_y + y;
-                let dst_idx = (dst_y * ATLAS_SIZE + dst_x) as usize;
-                self.atlas_data[dst_idx] = self.canvas_buffer[src_idx];
-            }
-        }
-        self.atlas_dirty = true;
-        
-        // Calculate UV coordinates
-        let uv_x = self.atlas_cursor_x as f32 / ATLAS_SIZE as f32;
-        let uv_y = self.atlas_cursor_y as f32 / ATLAS_SIZE as f32;
-        let uv_w = cell_width as f32 / ATLAS_SIZE as f32;
-        let uv_h = cell_height as f32 / ATLAS_SIZE as f32;
-        
-        // Update atlas cursor
-        self.atlas_cursor_x += cell_width + 1;
-        self.atlas_row_height = self.atlas_row_height.max(cell_height);
-        
-        [uv_x, uv_y, uv_w, uv_h]
-    }
-
-    /// Render a text run using Kitty's canvas-based approach for texture healing.
-    /// Returns TextRunSprites containing UV coordinates for each cell.
-    fn render_text_run(&mut self, text: &str, num_cells: usize, style: FontStyle) -> TextRunSprites {
-        // Check cache first - include font style in cache key
-        let cache_key = format!("{}\x00{}", style as usize, text);
-        if let Some(cached) = self.text_run_cache.get(&cache_key) {
-            return cached.clone();
-        }
-        
-        // Shape the text using the appropriate font variant
-        let shaped = self.shape_text_with_style(text, style);
-        
-        // Ensure canvas is big enough
-        self.ensure_canvas_size(num_cells);
-        self.clear_canvas(num_cells);
-        
-        // Calculate baseline offset (typically ~80% down from top of cell)
-        let baseline_offset = self.cell_height * 0.8;
-        
-        // Render all glyphs into the canvas using the appropriate font variant
-        self.render_glyphs_to_canvas_with_style(&shaped, num_cells, baseline_offset, style);
-        
-        // Extract each cell from the canvas
-        let mut cells = Vec::with_capacity(num_cells);
-        for i in 0..num_cells {
-            let uv = self.extract_cell_from_canvas(i, num_cells);
-            cells.push(uv);
-        }
-        
-        let sprites = TextRunSprites { cells };
-        self.text_run_cache.insert(cache_key, sprites.clone());
-        sprites
-    }
 
     /// Convert sRGB component (0.0-1.0) to linear RGB.
     /// This is needed because we're rendering to an sRGB surface.
@@ -4147,630 +6643,31 @@ impl Renderer {
         1.0 - (snapped / screen_height) * 2.0
     }
 
-    /// Render a single pane's terminal content at a given position.
-    /// This is a helper method for multi-pane rendering.
-    ///
-    /// Arguments:
-    /// - `terminal`: The terminal state for this pane
-    /// - `pane_x`: Left edge of pane in pixels
-    /// - `pane_y`: Top edge of pane in pixels
-    /// - `pane_width`: Width of pane in pixels
-    /// - `pane_height`: Height of pane in pixels
-    /// - `is_active`: Whether this is the active pane (for cursor rendering)
-    /// - `selection`: Optional selection range (start_col, start_row, end_col, end_row)
-    /// - `dim_factor`: Dimming factor (0.0 = fully dimmed, 1.0 = fully bright) - used for overlay
-    fn render_pane_content(
-        &mut self,
-        terminal: &Terminal,
-        pane_x: f32,
-        pane_y: f32,
-        pane_width: f32,
-        pane_height: f32,
-        is_active: bool,
-        selection: Option<(usize, usize, usize, usize)>,
-        _dim_factor: f32, // Dimming is now done via overlay in render_panes
-    ) {
-        let width = self.width as f32;
-        let height = self.height as f32;
-
-        // Calculate pane's terminal dimensions
-        let cols = (pane_width / self.cell_width).floor() as usize;
-        let rows = (pane_height / self.cell_height).floor() as usize;
-
-        // Cache palette values
-        let palette_default_fg = self.palette.default_fg;
-        let palette_colors = self.palette.colors;
-
-        // Helper to convert Color to linear RGBA
-        let color_to_rgba = |color: &Color, is_foreground: bool| -> [f32; 4] {
-            match color {
-                Color::Default => {
-                    if is_foreground {
-                        let [r, g, b] = palette_default_fg;
-                        [
-                            Self::srgb_to_linear(r as f32 / 255.0),
-                            Self::srgb_to_linear(g as f32 / 255.0),
-                            Self::srgb_to_linear(b as f32 / 255.0),
-                            1.0,
-                        ]
-                    } else {
-                        [0.0, 0.0, 0.0, 0.0]
-                    }
-                }
-                Color::Rgb(r, g, b) => [
-                    Self::srgb_to_linear(*r as f32 / 255.0),
-                    Self::srgb_to_linear(*g as f32 / 255.0),
-                    Self::srgb_to_linear(*b as f32 / 255.0),
-                    1.0,
-                ],
-                Color::Indexed(idx) => {
-                    let [r, g, b] = palette_colors[*idx as usize];
-                    [
-                        Self::srgb_to_linear(r as f32 / 255.0),
-                        Self::srgb_to_linear(g as f32 / 255.0),
-                        Self::srgb_to_linear(b as f32 / 255.0),
-                        1.0,
-                    ]
-                }
-            }
-        };
-
-        // Helper to check if a cell is selected
-        let is_cell_selected = |col: usize, row: usize| -> bool {
-            let Some((start_col, start_row, end_col, end_row)) = selection else {
-                return false;
-            };
-            if row < start_row || row > end_row {
-                return false;
-            }
-            if start_row == end_row {
-                return col >= start_col && col <= end_col;
-            }
-            if row == start_row {
-                return col >= start_col;
-            } else if row == end_row {
-                return col <= end_col;
-            } else {
-                return true;
-            }
-        };
-
-        // Get visible rows (accounts for scroll offset)
-        let visible_rows = terminal.visible_rows();
-
-        // Render each row
-        for (row_idx, row) in visible_rows.iter().enumerate() {
-            if row_idx >= rows {
-                break;
-            }
-
-            // Find the last non-empty cell for selection clipping
-            // Note: U+10EEEE is Kitty graphics placeholder, treat as empty
-            const KITTY_PLACEHOLDER_CHAR: char = '\u{10EEEE}';
-            let last_content_col = row.iter()
-                .enumerate()
-                .rev()
-                .find(|(_, cell)| cell.character != ' ' && cell.character != '\0' && cell.character != KITTY_PLACEHOLDER_CHAR)
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
-
-            // ═══════════════════════════════════════════════════════════════════════════
-            // TEXT RUN SHAPING FOR TEXTURE HEALING
-            // ═══════════════════════════════════════════════════════════════════════════
-            // Instead of rendering character-by-character, we group consecutive cells
-            // with the same styling into "text runs" and shape them together. This allows
-            // the font's calt (contextual alternates) feature to apply texture healing,
-            // which adjusts character positions based on their neighbors.
-            
-            let cell_y = pane_y + row_idx as f32 * self.cell_height;
-            
-            let mut col_idx = 0;
-            while col_idx < row.len() && col_idx < cols {
-                let cell = &row[col_idx];
-                
-                // Determine colors for this cell (with selection override)
-                let (base_fg, base_bg) = if is_cell_selected(col_idx, row_idx) && col_idx <= last_content_col {
-                    ([0.0f32, 0.0, 0.0, 1.0], [1.0f32, 1.0, 1.0, 1.0])
-                } else {
-                    (color_to_rgba(&cell.fg_color, true), color_to_rgba(&cell.bg_color, false))
-                };
-                
-                // Track font style for bold/italic rendering
-                let base_style = FontStyle::from_flags(cell.bold, cell.italic);
-                
-                // Collect a run of cells with the same fg/bg colors AND font style
-                let mut run_text = String::new();
-                let mut run_cells: Vec<(usize, char, bool)> = Vec::new(); // (col, char, is_box_drawing)
-                
-                while col_idx < row.len() && col_idx < cols {
-                    let run_cell = &row[col_idx];
-                    
-                    // Check if this cell has the same colors
-                    let (cell_fg, cell_bg) = if is_cell_selected(col_idx, row_idx) && col_idx <= last_content_col {
-                        ([0.0f32, 0.0, 0.0, 1.0], [1.0f32, 1.0, 1.0, 1.0])
-                    } else {
-                        (color_to_rgba(&run_cell.fg_color, true), color_to_rgba(&run_cell.bg_color, false))
-                    };
-                    
-                    // Check if font style (bold/italic) matches
-                    let cell_style = FontStyle::from_flags(run_cell.bold, run_cell.italic);
-                    
-                    if cell_fg != base_fg || cell_bg != base_bg || cell_style != base_style {
-                        break; // Different colors or font style, end this run
-                    }
-                    
-                    let c = run_cell.character;
-                    const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
-                    let is_renderable = c != ' ' && c != '\0' && c != KITTY_PLACEHOLDER;
-                    let is_box = Self::is_box_drawing(c);
-                    
-                    run_cells.push((col_idx, c, is_box));
-                    if is_renderable && !is_box {
-                        run_text.push(c);
-                    } else {
-                        // Use a placeholder that won't affect shaping
-                        run_text.push(' ');
-                    }
-                    
-                    col_idx += 1;
-                }
-                
-                // Render backgrounds for all cells in the run
-                for &(cell_col, _, _) in &run_cells {
-                    let cell_x = pane_x + cell_col as f32 * self.cell_width;
-                    let cell_left = Self::pixel_to_ndc_x(cell_x, width);
-                    let cell_right = Self::pixel_to_ndc_x(cell_x + self.cell_width, width);
-                    let cell_top = Self::pixel_to_ndc_y(cell_y, height);
-                    let cell_bottom = Self::pixel_to_ndc_y(cell_y + self.cell_height, height);
-                    
-                    let base_idx = self.bg_vertices.len() as u32;
-                    self.bg_vertices.push(GlyphVertex {
-                        position: [cell_left, cell_top],
-                        uv: [0.0, 0.0],
-                        color: base_fg,
-                        bg_color: base_bg,
-                    });
-                    self.bg_vertices.push(GlyphVertex {
-                        position: [cell_right, cell_top],
-                        uv: [0.0, 0.0],
-                        color: base_fg,
-                        bg_color: base_bg,
-                    });
-                    self.bg_vertices.push(GlyphVertex {
-                        position: [cell_right, cell_bottom],
-                        uv: [0.0, 0.0],
-                        color: base_fg,
-                        bg_color: base_bg,
-                    });
-                    self.bg_vertices.push(GlyphVertex {
-                        position: [cell_left, cell_bottom],
-                        uv: [0.0, 0.0],
-                        color: base_fg,
-                        bg_color: base_bg,
-                    });
-                    self.bg_indices.extend_from_slice(&[
-                        base_idx, base_idx + 1, base_idx + 2,
-                        base_idx, base_idx + 2, base_idx + 3,
-                    ]);
-                }
-                
-                // ═══════════════════════════════════════════════════════════════
-                // RENDER TEXT RUN USING KITTY'S CANVAS-BASED APPROACH
-                // ═══════════════════════════════════════════════════════════════
-                // Use canvas-based rendering for texture healing:
-                // 1. Render all glyphs into a multi-cell canvas using HarfBuzz positions
-                // 2. Extract each cell's portion as a sprite
-                // 3. Render sprites at cell positions
-                
-                // First, collect renderable (non-box-drawing) characters for shaping
-                let mut shape_text = String::new();
-                let mut shape_indices: Vec<usize> = Vec::new(); // Maps shape_text position to run_cells index
-                
-                for (i, &(_, c, is_box)) in run_cells.iter().enumerate() {
-                    const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
-                    if c != ' ' && c != '\0' && c != KITTY_PLACEHOLDER && !is_box {
-                        shape_text.push(c);
-                        shape_indices.push(i);
-                    }
-                }
-                
-                // Render the text run using canvas approach if there's text to shape
-                let sprites = if !shape_text.is_empty() && shape_indices.len() == run_cells.len() {
-                    // All cells are shapeable text - use canvas rendering
-                    Some(self.render_text_run(&run_text, run_cells.len(), base_style))
-                } else {
-                    None
-                };
-                
-                // Render each cell
-                for (run_idx, &(cell_col, c, is_box)) in run_cells.iter().enumerate() {
-                    let cell_x = pane_x + cell_col as f32 * self.cell_width;
-                    
-                    const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
-                    if c == ' ' || c == '\0' || c == KITTY_PLACEHOLDER {
-                        // Empty cell - nothing to render
-                        continue;
-                    }
-                    
-                    if is_box {
-                        // Box drawing - render without shaping/canvas
-                        let glyph = self.rasterize_char(c);
-                        if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
-                            let glyph_x = cell_x;
-                            let glyph_y = cell_y;
-                            
-                            let left = Self::pixel_to_ndc_x(glyph_x, width);
-                            let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
-                            let top = Self::pixel_to_ndc_y(glyph_y, height);
-                            let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
-                            
-                            let base_idx = self.glyph_vertices.len() as u32;
-                            self.glyph_vertices.push(GlyphVertex {
-                                position: [left, top],
-                                uv: [glyph.uv[0], glyph.uv[1]],
-                                color: base_fg,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            self.glyph_vertices.push(GlyphVertex {
-                                position: [right, top],
-                                uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
-                                color: base_fg,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            self.glyph_vertices.push(GlyphVertex {
-                                position: [right, bottom],
-                                uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
-                                color: base_fg,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            self.glyph_vertices.push(GlyphVertex {
-                                position: [left, bottom],
-                                uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
-                                color: base_fg,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            self.glyph_indices.extend_from_slice(&[
-                                base_idx, base_idx + 1, base_idx + 2,
-                                base_idx, base_idx + 2, base_idx + 3,
-                            ]);
-                        }
-                    } else if let Some(ref run_sprites) = sprites {
-                        // Use pre-rendered sprite from canvas
-                        if run_idx < run_sprites.cells.len() {
-                            let uv = run_sprites.cells[run_idx];
-                            if uv[2] > 0.0 && uv[3] > 0.0 {
-                                let left = Self::pixel_to_ndc_x(cell_x, width);
-                                let right = Self::pixel_to_ndc_x(cell_x + self.cell_width, width);
-                                let top = Self::pixel_to_ndc_y(cell_y, height);
-                                let bottom = Self::pixel_to_ndc_y(cell_y + self.cell_height, height);
-                                
-                                let base_idx = self.glyph_vertices.len() as u32;
-                                self.glyph_vertices.push(GlyphVertex {
-                                    position: [left, top],
-                                    uv: [uv[0], uv[1]],
-                                    color: base_fg,
-                                    bg_color: [0.0, 0.0, 0.0, 0.0],
-                                });
-                                self.glyph_vertices.push(GlyphVertex {
-                                    position: [right, top],
-                                    uv: [uv[0] + uv[2], uv[1]],
-                                    color: base_fg,
-                                    bg_color: [0.0, 0.0, 0.0, 0.0],
-                                });
-                                self.glyph_vertices.push(GlyphVertex {
-                                    position: [right, bottom],
-                                    uv: [uv[0] + uv[2], uv[1] + uv[3]],
-                                    color: base_fg,
-                                    bg_color: [0.0, 0.0, 0.0, 0.0],
-                                });
-                                self.glyph_vertices.push(GlyphVertex {
-                                    position: [left, bottom],
-                                    uv: [uv[0], uv[1] + uv[3]],
-                                    color: base_fg,
-                                    bg_color: [0.0, 0.0, 0.0, 0.0],
-                                });
-                                self.glyph_indices.extend_from_slice(&[
-                                    base_idx, base_idx + 1, base_idx + 2,
-                                    base_idx, base_idx + 2, base_idx + 3,
-                                ]);
-                            }
-                        }
-                    } else {
-                        // Fallback: render character individually
-                        let glyph = self.rasterize_char(c);
-                        if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
-                            let glyph_x = (cell_x + glyph.offset[0]).round();
-                            let glyph_y = (cell_y + self.cell_height * 0.8 - glyph.offset[1] - glyph.size[1]).round();
-                            
-                            let left = Self::pixel_to_ndc_x(glyph_x, width);
-                            let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
-                            let top = Self::pixel_to_ndc_y(glyph_y, height);
-                            let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
-                            
-                            let base_idx = self.glyph_vertices.len() as u32;
-                            self.glyph_vertices.push(GlyphVertex {
-                                position: [left, top],
-                                uv: [glyph.uv[0], glyph.uv[1]],
-                                color: base_fg,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            self.glyph_vertices.push(GlyphVertex {
-                                position: [right, top],
-                                uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
-                                color: base_fg,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            self.glyph_vertices.push(GlyphVertex {
-                                position: [right, bottom],
-                                uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
-                                color: base_fg,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            self.glyph_vertices.push(GlyphVertex {
-                                position: [left, bottom],
-                                uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
-                                color: base_fg,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            self.glyph_indices.extend_from_slice(&[
-                                base_idx, base_idx + 1, base_idx + 2,
-                                base_idx, base_idx + 2, base_idx + 3,
-                            ]);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Render cursor only for active pane
-        if is_active && terminal.cursor_visible && terminal.scroll_offset == 0
-           && terminal.cursor_row < rows && terminal.cursor_col < cols {
-            let cursor_col = terminal.cursor_col;
-            let cursor_row = terminal.cursor_row;
-            let cursor_x = pane_x + cursor_col as f32 * self.cell_width;
-            let cursor_y = pane_y + cursor_row as f32 * self.cell_height;
-
-            // Get cell under cursor
-            let cursor_cell = visible_rows.get(cursor_row).and_then(|row| row.get(cursor_col));
-
-            let (cell_fg, cell_bg, cell_char) = if let Some(cell) = cursor_cell {
-                let fg = color_to_rgba(&cell.fg_color, true);
-                let bg = color_to_rgba(&cell.bg_color, false);
-                (fg, bg, cell.character)
-            } else {
-                let fg = {
-                    let [r, g, b] = self.palette.default_fg;
-                    [
-                        Self::srgb_to_linear(r as f32 / 255.0),
-                        Self::srgb_to_linear(g as f32 / 255.0),
-                        Self::srgb_to_linear(b as f32 / 255.0),
-                        1.0,
-                    ]
-                };
-                (fg, [0.0, 0.0, 0.0, 0.0], ' ')
-            };
-
-            // Kitty graphics Unicode placeholder should be treated as empty
-            const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
-            let has_character = cell_char != ' ' && cell_char != '\0' && cell_char != KITTY_PLACEHOLDER;
-
-            let cursor_bg_color = if has_character {
-                [cell_fg[0], cell_fg[1], cell_fg[2], 1.0]
-            } else {
-                if cell_bg[3] < 0.01 {
-                    let white = Self::srgb_to_linear(0.9);
-                    [white, white, white, 1.0]
-                } else {
-                    [1.0 - cell_bg[0], 1.0 - cell_bg[1], 1.0 - cell_bg[2], 1.0]
-                }
-            };
-
-            let cursor_style = match terminal.cursor_shape {
-                CursorShape::BlinkingBlock | CursorShape::SteadyBlock => 0,
-                CursorShape::BlinkingUnderline | CursorShape::SteadyUnderline => 1,
-                CursorShape::BlinkingBar | CursorShape::SteadyBar => 2,
-            };
-
-            let (left, right, top, bottom) = match cursor_style {
-                0 => (
-                    cursor_x,
-                    cursor_x + self.cell_width,
-                    cursor_y,
-                    cursor_y + self.cell_height,
-                ),
-                1 => {
-                    let underline_height = 2.0_f32.max(self.cell_height * 0.1);
-                    (
-                        cursor_x,
-                        cursor_x + self.cell_width,
-                        cursor_y + self.cell_height - underline_height,
-                        cursor_y + self.cell_height,
-                    )
-                }
-                _ => {
-                    let bar_width = 2.0_f32.max(self.cell_width * 0.1);
-                    (
-                        cursor_x,
-                        cursor_x + bar_width,
-                        cursor_y,
-                        cursor_y + self.cell_height,
-                    )
-                }
-            };
-
-            let cursor_left = Self::pixel_to_ndc_x(left, width);
-            let cursor_right = Self::pixel_to_ndc_x(right, width);
-            let cursor_top = Self::pixel_to_ndc_y(top, height);
-            let cursor_bottom = Self::pixel_to_ndc_y(bottom, height);
-
-            let base_idx = self.glyph_vertices.len() as u32;
-            self.glyph_vertices.push(GlyphVertex {
-                position: [cursor_left, cursor_top],
-                uv: [0.0, 0.0],
-                color: cursor_bg_color,
-                bg_color: cursor_bg_color,
-            });
-            self.glyph_vertices.push(GlyphVertex {
-                position: [cursor_right, cursor_top],
-                uv: [0.0, 0.0],
-                color: cursor_bg_color,
-                bg_color: cursor_bg_color,
-            });
-            self.glyph_vertices.push(GlyphVertex {
-                position: [cursor_right, cursor_bottom],
-                uv: [0.0, 0.0],
-                color: cursor_bg_color,
-                bg_color: cursor_bg_color,
-            });
-            self.glyph_vertices.push(GlyphVertex {
-                position: [cursor_left, cursor_bottom],
-                uv: [0.0, 0.0],
-                color: cursor_bg_color,
-                bg_color: cursor_bg_color,
-            });
-            self.glyph_indices.extend_from_slice(&[
-                base_idx, base_idx + 1, base_idx + 2,
-                base_idx, base_idx + 2, base_idx + 3,
-            ]);
-
-            // If block cursor with character, render it inverted
-            if cursor_style == 0 && has_character {
-                let char_color = if cell_bg[3] < 0.01 {
-                    [0.0, 0.0, 0.0, 1.0]
-                } else {
-                    [cell_bg[0], cell_bg[1], cell_bg[2], 1.0]
-                };
-
-                let glyph = self.rasterize_char(cell_char);
-                if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
-                    let (glyph_x, glyph_y) = if Self::is_box_drawing(cell_char) {
-                        (cursor_x, cursor_y)
-                    } else {
-                        let baseline_y = (cursor_y + self.cell_height * 0.8).round();
-                        let gx = (cursor_x + glyph.offset[0]).round();
-                        let gy = (baseline_y - glyph.offset[1] - glyph.size[1]).round();
-                        (gx, gy)
-                    };
-
-                    let g_left = Self::pixel_to_ndc_x(glyph_x, width);
-                    let g_right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
-                    let g_top = Self::pixel_to_ndc_y(glyph_y, height);
-                    let g_bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
-
-                    let base_idx = self.glyph_vertices.len() as u32;
-                    self.glyph_vertices.push(GlyphVertex {
-                        position: [g_left, g_top],
-                        uv: [glyph.uv[0], glyph.uv[1]],
-                        color: char_color,
-                        bg_color: [0.0, 0.0, 0.0, 0.0],
-                    });
-                    self.glyph_vertices.push(GlyphVertex {
-                        position: [g_right, g_top],
-                        uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
-                        color: char_color,
-                        bg_color: [0.0, 0.0, 0.0, 0.0],
-                    });
-                    self.glyph_vertices.push(GlyphVertex {
-                        position: [g_right, g_bottom],
-                        uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
-                        color: char_color,
-                        bg_color: [0.0, 0.0, 0.0, 0.0],
-                    });
-                    self.glyph_vertices.push(GlyphVertex {
-                        position: [g_left, g_bottom],
-                        uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
-                        color: char_color,
-                        bg_color: [0.0, 0.0, 0.0, 0.0],
-                    });
-                    self.glyph_indices.extend_from_slice(&[
-                        base_idx, base_idx + 1, base_idx + 2,
-                        base_idx, base_idx + 2, base_idx + 3,
-                    ]);
-                }
-            }
-        }
-    }
 
     /// Draw a filled rectangle.
     fn render_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
-        let width = self.width as f32;
-        let height = self.height as f32;
-
-        let left = Self::pixel_to_ndc_x(x, width);
-        let right = Self::pixel_to_ndc_x(x + w, width);
-        let top = Self::pixel_to_ndc_y(y, height);
-        let bottom = Self::pixel_to_ndc_y(y + h, height);
-
-        let base_idx = self.bg_vertices.len() as u32;
-        self.bg_vertices.push(GlyphVertex {
-            position: [left, top],
-            uv: [0.0, 0.0],
-            color,
-            bg_color: color,
-        });
-        self.bg_vertices.push(GlyphVertex {
-            position: [right, top],
-            uv: [0.0, 0.0],
-            color,
-            bg_color: color,
-        });
-        self.bg_vertices.push(GlyphVertex {
-            position: [right, bottom],
-            uv: [0.0, 0.0],
-            color,
-            bg_color: color,
-        });
-        self.bg_vertices.push(GlyphVertex {
-            position: [left, bottom],
-            uv: [0.0, 0.0],
-            color,
-            bg_color: color,
-        });
-        self.bg_indices.extend_from_slice(&[
-            base_idx, base_idx + 1, base_idx + 2,
-            base_idx, base_idx + 2, base_idx + 3,
-        ]);
+        // Add quad to the batch for instanced rendering
+        if self.quads.len() < self.max_quads {
+            self.quads.push(Quad {
+                x,
+                y,
+                width: w,
+                height: h,
+                color,
+            });
+        }
     }
 
     /// Draw a filled rectangle to the overlay layer (rendered on top of everything).
     fn render_overlay_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
-        let width = self.width as f32;
-        let height = self.height as f32;
-
-        let left = Self::pixel_to_ndc_x(x, width);
-        let right = Self::pixel_to_ndc_x(x + w, width);
-        let top = Self::pixel_to_ndc_y(y, height);
-        let bottom = Self::pixel_to_ndc_y(y + h, height);
-
-        let base_idx = self.overlay_vertices.len() as u32;
-        self.overlay_vertices.push(GlyphVertex {
-            position: [left, top],
-            uv: [0.0, 0.0],
+        // Add quad to the overlay batch for instanced rendering (rendered last)
+        self.overlay_quads.push(Quad {
+            x,
+            y,
+            width: w,
+            height: h,
             color,
-            bg_color: color,
         });
-        self.overlay_vertices.push(GlyphVertex {
-            position: [right, top],
-            uv: [0.0, 0.0],
-            color,
-            bg_color: color,
-        });
-        self.overlay_vertices.push(GlyphVertex {
-            position: [right, bottom],
-            uv: [0.0, 0.0],
-            color,
-            bg_color: color,
-        });
-        self.overlay_vertices.push(GlyphVertex {
-            position: [left, bottom],
-            uv: [0.0, 0.0],
-            color,
-            bg_color: color,
-        });
-        self.overlay_indices.extend_from_slice(&[
-            base_idx, base_idx + 1, base_idx + 2,
-            base_idx, base_idx + 2, base_idx + 3,
-        ]);
     }
 
     /// Prepare edge glow uniform data for shader-based rendering.
@@ -4868,13 +6765,24 @@ impl Renderer {
         self.bg_indices.clear();
         self.glyph_vertices.clear();
         self.glyph_indices.clear();
-        self.overlay_vertices.clear();
-        self.overlay_indices.clear();
+        self.quads.clear();
+        self.overlay_quads.clear();
+
+        // Check if atlas is getting full and reset proactively
+        // This prevents mid-render failures and ensures all glyphs can be rendered
+        let atlas_usage = self.atlas_cursor_y as f32 / ATLAS_SIZE as f32;
+        if atlas_usage > 0.9 {
+            self.reset_atlas();
+        }
 
         let width = self.width as f32;
         let height = self.height as f32;
         let tab_bar_height = self.tab_bar_height();
         let terminal_y_offset = self.terminal_y_offset();
+        
+        // Grid centering offsets - center the cell grid in the window
+        let grid_x_offset = self.grid_x_offset();
+        let grid_y_offset = self.grid_y_offset();
 
         // ═══════════════════════════════════════════════════════════════════
         // RENDER TAB BAR (same as render_from_terminal)
@@ -4947,10 +6855,10 @@ impl Renderer {
                     }
                     let glyph = self.rasterize_char(c);
                     if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
+                        // In Kitty's model, glyphs are cell-sized and positioned at (0,0)
                         let char_x = text_x + char_idx as f32 * self.cell_width;
-                        let baseline_y = (text_y + self.cell_height * 0.8).round();
-                        let glyph_x = (char_x + glyph.offset[0]).round();
-                        let glyph_y = (baseline_y - glyph.offset[1] - glyph.size[1]).round();
+                        let glyph_x = char_x.round();
+                        let glyph_y = text_y.round();
 
                         let left = Self::pixel_to_ndc_x(glyph_x, width);
                         let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
@@ -4994,225 +6902,6 @@ impl Renderer {
         }
 
         // ═══════════════════════════════════════════════════════════════════
-        // RENDER STATUSLINE
-        // ═══════════════════════════════════════════════════════════════════
-        {
-            let statusline_y = self.statusline_y();
-            let statusline_height = self.statusline_height();
-            
-            // Statusline background (slightly different shade than tab bar)
-            let statusline_bg = {
-                let [r, g, b] = self.palette.default_bg;
-                let factor = 0.9_f32;
-                [
-                    Self::srgb_to_linear((r as f32 / 255.0) * factor),
-                    Self::srgb_to_linear((g as f32 / 255.0) * factor),
-                    Self::srgb_to_linear((b as f32 / 255.0) * factor),
-                    1.0,
-                ]
-            };
-            
-            // Draw statusline background
-            self.render_rect(0.0, statusline_y, width, statusline_height, statusline_bg);
-            
-            // Render statusline sections
-            let text_y = statusline_y + (statusline_height - self.cell_height) / 2.0;
-            let mut cursor_x = 0.0_f32;
-            
-            // Helper to convert StatuslineColor to linear RGBA
-            let color_to_rgba = |color: StatuslineColor, palette: &crate::terminal::ColorPalette| -> [f32; 4] {
-                match color {
-                    StatuslineColor::Default => {
-                        let [r, g, b] = palette.default_fg;
-                        [
-                            Self::srgb_to_linear(r as f32 / 255.0),
-                            Self::srgb_to_linear(g as f32 / 255.0),
-                            Self::srgb_to_linear(b as f32 / 255.0),
-                            1.0,
-                        ]
-                    }
-                    StatuslineColor::Indexed(idx) => {
-                        let [r, g, b] = palette.colors[idx as usize];
-                        [
-                            Self::srgb_to_linear(r as f32 / 255.0),
-                            Self::srgb_to_linear(g as f32 / 255.0),
-                            Self::srgb_to_linear(b as f32 / 255.0),
-                            1.0,
-                        ]
-                    }
-                    StatuslineColor::Rgb(r, g, b) => {
-                        [
-                            Self::srgb_to_linear(r as f32 / 255.0),
-                            Self::srgb_to_linear(g as f32 / 255.0),
-                            Self::srgb_to_linear(b as f32 / 255.0),
-                            1.0,
-                        ]
-                    }
-                }
-            };
-            
-            match statusline_content {
-                StatuslineContent::Raw(ansi_content) => {
-                    // Render raw ANSI content directly without section styling
-                    self.render_raw_ansi_statusline(
-                        ansi_content,
-                        statusline_y,
-                        statusline_height,
-                        text_y,
-                        width,
-                        height,
-                    );
-                }
-                StatuslineContent::Sections(statusline_sections) => {
-                    for (section_idx, section) in statusline_sections.iter().enumerate() {
-                let section_start_x = cursor_x;
-                
-                // Calculate section width by counting characters
-                let mut section_char_count = 0usize;
-                for component in &section.components {
-                    section_char_count += component.text.chars().count();
-                }
-                let section_width = section_char_count as f32 * self.cell_width;
-                
-                // Draw section background if it has a color (Indexed or Rgb)
-                let has_bg = matches!(section.bg, StatuslineColor::Indexed(_) | StatuslineColor::Rgb(_, _, _));
-                if has_bg {
-                    let section_bg_color = color_to_rgba(section.bg, &self.palette);
-                    self.render_rect(section_start_x, statusline_y, section_width, statusline_height, section_bg_color);
-                }
-                
-                // Render components within this section
-                for component in &section.components {
-                    let component_fg = color_to_rgba(component.fg, &self.palette);
-                    
-                    for c in component.text.chars() {
-                        if cursor_x + self.cell_width > width {
-                            break;
-                        }
-                        
-                        if c == ' ' {
-                            cursor_x += self.cell_width;
-                            continue;
-                        }
-                        
-                        let glyph = self.rasterize_char(c);
-                        if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
-                            let is_powerline_char = ('\u{E0B0}'..='\u{E0BF}').contains(&c);
-                            
-                            let glyph_x = (cursor_x + glyph.offset[0]).round();
-                            let glyph_y = if is_powerline_char {
-                                statusline_y
-                            } else {
-                                let baseline_y = (text_y + self.cell_height * 0.8).round();
-                                (baseline_y - glyph.offset[1] - glyph.size[1]).round()
-                            };
-
-                            let left = Self::pixel_to_ndc_x(glyph_x, width);
-                            let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
-                            let top = Self::pixel_to_ndc_y(glyph_y, height);
-                            let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
-
-                            let base_idx = self.glyph_vertices.len() as u32;
-                            self.glyph_vertices.push(GlyphVertex {
-                                position: [left, top],
-                                uv: [glyph.uv[0], glyph.uv[1]],
-                                color: component_fg,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            self.glyph_vertices.push(GlyphVertex {
-                                position: [right, top],
-                                uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
-                                color: component_fg,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            self.glyph_vertices.push(GlyphVertex {
-                                position: [right, bottom],
-                                uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
-                                color: component_fg,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            self.glyph_vertices.push(GlyphVertex {
-                                position: [left, bottom],
-                                uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
-                                color: component_fg,
-                                bg_color: [0.0, 0.0, 0.0, 0.0],
-                            });
-                            self.glyph_indices.extend_from_slice(&[
-                                base_idx, base_idx + 1, base_idx + 2,
-                                base_idx, base_idx + 2, base_idx + 3,
-                            ]);
-                        }
-                        
-                        cursor_x += self.cell_width;
-                    }
-                }
-                
-                // Draw powerline transition arrow at end of section (if section has a background)
-                if has_bg {
-                    // Determine the next section's background color (or statusline bg if last section)
-                    let next_bg = if section_idx + 1 < statusline_sections.len() {
-                        color_to_rgba(statusline_sections[section_idx + 1].bg, &self.palette)
-                    } else {
-                        statusline_bg
-                    };
-                    
-                    // The arrow's foreground is this section's background
-                    let arrow_fg = color_to_rgba(section.bg, &self.palette);
-                    
-                    // Render the powerline arrow (U+E0B0)
-                    let arrow_char = '\u{E0B0}';
-                    let glyph = self.rasterize_char(arrow_char);
-                    if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
-                        let glyph_x = (cursor_x + glyph.offset[0]).round();
-                        let glyph_y = statusline_y; // Powerline chars at top
-                        
-                        // Draw background rectangle for the arrow cell
-                        self.render_rect(cursor_x, statusline_y, self.cell_width, statusline_height, next_bg);
-
-                        let left = Self::pixel_to_ndc_x(glyph_x, width);
-                        let right = Self::pixel_to_ndc_x(glyph_x + glyph.size[0], width);
-                        let top = Self::pixel_to_ndc_y(glyph_y, height);
-                        let bottom = Self::pixel_to_ndc_y(glyph_y + glyph.size[1], height);
-
-                        let base_idx = self.glyph_vertices.len() as u32;
-                        self.glyph_vertices.push(GlyphVertex {
-                            position: [left, top],
-                            uv: [glyph.uv[0], glyph.uv[1]],
-                            color: arrow_fg,
-                            bg_color: [0.0, 0.0, 0.0, 0.0],
-                        });
-                        self.glyph_vertices.push(GlyphVertex {
-                            position: [right, top],
-                            uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1]],
-                            color: arrow_fg,
-                            bg_color: [0.0, 0.0, 0.0, 0.0],
-                        });
-                        self.glyph_vertices.push(GlyphVertex {
-                            position: [right, bottom],
-                            uv: [glyph.uv[0] + glyph.uv[2], glyph.uv[1] + glyph.uv[3]],
-                            color: arrow_fg,
-                            bg_color: [0.0, 0.0, 0.0, 0.0],
-                        });
-                        self.glyph_vertices.push(GlyphVertex {
-                            position: [left, bottom],
-                            uv: [glyph.uv[0], glyph.uv[1] + glyph.uv[3]],
-                            color: arrow_fg,
-                            bg_color: [0.0, 0.0, 0.0, 0.0],
-                        });
-                        self.glyph_indices.extend_from_slice(&[
-                            base_idx, base_idx + 1, base_idx + 2,
-                            base_idx, base_idx + 2, base_idx + 3,
-                        ]);
-                    }
-                    
-                    cursor_x += self.cell_width;
-                }
-            }
-                }
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════════════
         // RENDER PANE BORDERS (only between adjacent panes)
         // ═══════════════════════════════════════════════════════════════════
         let border_thickness = 2.0;
@@ -5239,12 +6928,13 @@ impl Renderer {
         };
 
         // Only draw borders if there's more than one pane
-        // The layout leaves a gap between panes, so we look for gaps and draw borders there
+        // Panes are now flush against each other, so we draw borders at shared edges
+        // Borders are rendered as overlays so they appear on top of pane content
         if panes.len() > 1 {
-            // Maximum gap size to consider as "adjacent" (layout uses border_width gap)
-            let max_gap = 20.0;
+            // Tolerance for detecting adjacent panes (should be touching or very close)
+            let adjacency_tolerance = 1.0;
 
-            // Check each pair of panes to find adjacent ones with gaps
+            // Check each pair of panes to find adjacent ones
             for i in 0..panes.len() {
                 for j in (i + 1)..panes.len() {
                     let (_, info_a, _) = &panes[i];
@@ -5257,62 +6947,58 @@ impl Renderer {
                         inactive_border_color
                     };
 
-                    // Calculate absolute positions (with terminal_y_offset)
-                    let a_x = info_a.x;
-                    let a_y = terminal_y_offset + info_a.y;
+                    // Calculate absolute positions (with terminal_y_offset and grid centering)
+                    let a_x = grid_x_offset + info_a.x;
+                    let a_y = terminal_y_offset + grid_y_offset + info_a.y;
                     let a_right = a_x + info_a.width;
                     let a_bottom = a_y + info_a.height;
 
-                    let b_x = info_b.x;
-                    let b_y = terminal_y_offset + info_b.y;
+                    let b_x = grid_x_offset + info_b.x;
+                    let b_y = terminal_y_offset + grid_y_offset + info_b.y;
                     let b_right = b_x + info_b.width;
                     let b_bottom = b_y + info_b.height;
 
-                    // Check for vertical adjacency (horizontal gap between panes)
-                    // Pane A is to the left of pane B
-                    let h_gap_ab = b_x - a_right;
-                    if h_gap_ab > 0.0 && h_gap_ab < max_gap {
+                    // Check for vertical adjacency (panes side by side)
+                    // Pane A is to the left of pane B (A's right edge touches B's left edge)
+                    if (a_right - b_x).abs() < adjacency_tolerance {
                         // Check if they overlap vertically
                         let top = a_y.max(b_y);
                         let bottom = a_bottom.min(b_bottom);
                         if bottom > top {
-                            // Draw vertical border in the gap
-                            let border_x = a_right + (h_gap_ab - border_thickness) / 2.0;
-                            self.render_rect(border_x, top, border_thickness, bottom - top, border_color);
+                            // Draw vertical border centered on their shared edge
+                            let border_x = a_right - border_thickness / 2.0;
+                            self.render_overlay_rect(border_x, top, border_thickness, bottom - top, border_color);
                         }
                     }
                     // Pane B is to the left of pane A
-                    let h_gap_ba = a_x - b_right;
-                    if h_gap_ba > 0.0 && h_gap_ba < max_gap {
+                    if (b_right - a_x).abs() < adjacency_tolerance {
                         let top = a_y.max(b_y);
                         let bottom = a_bottom.min(b_bottom);
                         if bottom > top {
-                            let border_x = b_right + (h_gap_ba - border_thickness) / 2.0;
-                            self.render_rect(border_x, top, border_thickness, bottom - top, border_color);
+                            let border_x = b_right - border_thickness / 2.0;
+                            self.render_overlay_rect(border_x, top, border_thickness, bottom - top, border_color);
                         }
                     }
 
-                    // Check for horizontal adjacency (vertical gap between panes)
-                    // Pane A is above pane B
-                    let v_gap_ab = b_y - a_bottom;
-                    if v_gap_ab > 0.0 && v_gap_ab < max_gap {
+                    // Check for horizontal adjacency (panes stacked)
+                    // Pane A is above pane B (A's bottom edge touches B's top edge)
+                    if (a_bottom - b_y).abs() < adjacency_tolerance {
                         // Check if they overlap horizontally
                         let left = a_x.max(b_x);
                         let right = a_right.min(b_right);
                         if right > left {
-                            // Draw horizontal border in the gap
-                            let border_y = a_bottom + (v_gap_ab - border_thickness) / 2.0;
-                            self.render_rect(left, border_y, right - left, border_thickness, border_color);
+                            // Draw horizontal border centered on their shared edge
+                            let border_y = a_bottom - border_thickness / 2.0;
+                            self.render_overlay_rect(left, border_y, right - left, border_thickness, border_color);
                         }
                     }
                     // Pane B is above pane A
-                    let v_gap_ba = a_y - b_bottom;
-                    if v_gap_ba > 0.0 && v_gap_ba < max_gap {
+                    if (b_bottom - a_y).abs() < adjacency_tolerance {
                         let left = a_x.max(b_x);
                         let right = a_right.min(b_right);
                         if right > left {
-                            let border_y = b_bottom + (v_gap_ba - border_thickness) / 2.0;
-                            self.render_rect(left, border_y, right - left, border_thickness, border_color);
+                            let border_y = b_bottom - border_thickness / 2.0;
+                            self.render_overlay_rect(left, border_y, right - left, border_thickness, border_color);
                         }
                     }
                 }
@@ -5320,33 +7006,283 @@ impl Renderer {
         }
 
         // ═══════════════════════════════════════════════════════════════════
-        // RENDER EACH PANE'S CONTENT
+        // RENDER EACH PANE'S CONTENT (Like Kitty's per-window VAO approach)
         // ═══════════════════════════════════════════════════════════════════
+        // Each pane gets its own GPU buffers and bind group.
+        // We upload all pane data BEFORE starting the render pass,
+        // then use each pane's bind group during rendering.
+        struct PaneRenderData {
+            pane_id: u64,
+            cols: u32,
+            rows: u32,
+            dim_overlay: Option<(f32, f32, f32, f32, [f32; 4])>, // (x, y, w, h, color)
+        }
+        let mut pane_render_list: Vec<PaneRenderData> = Vec::new();
+        
+        // First pass: collect pane data, ensure GPU resources exist, and upload data
         for (terminal, info, selection) in panes {
-            // No content offset needed - borders are drawn at shared edges only
-            let pane_x = info.x;
-            let pane_y = terminal_y_offset + info.y;
+            // Apply grid centering offsets to pane position
+            let pane_x = grid_x_offset + info.x;
+            let pane_y = terminal_y_offset + grid_y_offset + info.y;
             let pane_width = info.width;
             let pane_height = info.height;
 
-            self.render_pane_content(
-                terminal,
-                pane_x,
-                pane_y,
-                pane_width,
-                pane_height,
-                info.is_active,
-                *selection,
-                info.dim_factor,
-            );
-
-            // Draw dimming overlay for inactive panes
-            // dim_factor of 1.0 = no dimming, dim_factor of 0.6 = 40% dark overlay
-            if info.dim_factor < 1.0 {
+            // Update GPU cells for this terminal (populates self.gpu_cells)
+            self.update_gpu_cells(terminal);
+            
+            // Calculate pane dimensions in cells
+            let cols = (pane_width / self.cell_width).floor() as u32;
+            let rows = (pane_height / self.cell_height).floor() as u32;
+            
+            // Use the actual gpu_cells size for buffer allocation (terminal.cols * terminal.rows)
+            // This may differ from pane pixel dimensions due to rounding
+            let actual_cells = self.gpu_cells.len();
+            
+            // Ensure this pane has GPU resources (like Kitty's create_cell_vao)
+            // This creates or resizes buffers as needed
+            let _pane_res = self.get_or_create_pane_resources(info.pane_id, actual_cells);
+            
+            // Build grid params for this pane
+            let (sel_start_col, sel_start_row, sel_end_col, sel_end_row) = match selection {
+                Some((sc, sr, ec, er)) => (*sc as i32, *sr as i32, *ec as i32, *er as i32),
+                None => (-1, -1, -1, -1),
+            };
+            let grid_params = GridParams {
+                cols,
+                rows,
+                cell_width: self.cell_width,
+                cell_height: self.cell_height,
+                screen_width: self.width as f32,
+                screen_height: self.height as f32,
+                x_offset: pane_x,
+                y_offset: pane_y,
+                cursor_col: if terminal.cursor_visible { terminal.cursor_col as i32 } else { -1 },
+                cursor_row: if terminal.cursor_visible { terminal.cursor_row as i32 } else { -1 },
+                cursor_style: match terminal.cursor_shape {
+                    CursorShape::BlinkingBlock | CursorShape::SteadyBlock => 0,
+                    CursorShape::BlinkingUnderline | CursorShape::SteadyUnderline => 1,
+                    CursorShape::BlinkingBar | CursorShape::SteadyBar => 2,
+                },
+                background_opacity: self.background_opacity,
+                selection_start_col: sel_start_col,
+                selection_start_row: sel_start_row,
+                selection_end_col: sel_end_col,
+                selection_end_row: sel_end_row,
+            };
+            
+            // Upload this pane's cell data to its own buffer (like Kitty's send_cell_data_to_gpu)
+            // This happens BEFORE the render pass, so each pane has its own data
+            if let Some(pane_res) = self.pane_resources.get(&info.pane_id) {
+                // Safety check: verify buffer can hold the data
+                let data_size = self.gpu_cells.len() * std::mem::size_of::<GPUCell>();
+                let buffer_size = pane_res.capacity * std::mem::size_of::<GPUCell>();
+                if data_size > buffer_size {
+                    // This shouldn't happen if get_or_create_pane_resources worked correctly
+                    eprintln!(
+                        "BUG: Buffer size mismatch for pane {}: data={} bytes, buffer={} bytes, gpu_cells.len()={}, capacity={}",
+                        info.pane_id, data_size, buffer_size, self.gpu_cells.len(), pane_res.capacity
+                    );
+                    // Skip this pane to avoid crash - will be fixed next frame
+                    continue;
+                }
+                
+                self.queue.write_buffer(
+                    &pane_res.cell_buffer,
+                    0,
+                    bytemuck::cast_slice(&self.gpu_cells),
+                );
+                self.queue.write_buffer(
+                    &pane_res.grid_params_buffer,
+                    0,
+                    bytemuck::bytes_of(&grid_params),
+                );
+            }
+            
+            // Build dim overlay if needed
+            let dim_overlay = if info.dim_factor < 1.0 {
                 let overlay_alpha = 1.0 - info.dim_factor;
                 let overlay_color = [0.0, 0.0, 0.0, overlay_alpha];
-                self.render_overlay_rect(pane_x, pane_y, pane_width, pane_height, overlay_color);
+                Some((pane_x, pane_y, pane_width, pane_height, overlay_color))
+            } else {
+                None
+            };
+            
+            pane_render_list.push(PaneRenderData {
+                pane_id: info.pane_id,
+                cols,
+                rows,
+                dim_overlay,
+            });
+        }
+        
+        // Clean up resources for panes that no longer exist (like Kitty's remove_vao)
+        let active_pane_ids: std::collections::HashSet<u64> = pane_render_list.iter().map(|p| p.pane_id).collect();
+        self.cleanup_unused_pane_resources(&active_pane_ids);
+
+        // ═══════════════════════════════════════════════════════════════════
+        // UPLOAD SHARED DATA (color table)
+        // ═══════════════════════════════════════════════════════════════════
+        {
+            let mut color_table_data = [[0.0f32; 4]; 258];
+            for i in 0..256 {
+                let [r, g, b] = self.palette.colors[i];
+                color_table_data[i] = [
+                    Self::srgb_to_linear(r as f32 / 255.0),
+                    Self::srgb_to_linear(g as f32 / 255.0),
+                    Self::srgb_to_linear(b as f32 / 255.0),
+                    1.0,
+                ];
             }
+            let [fg_r, fg_g, fg_b] = self.palette.default_fg;
+            color_table_data[256] = [
+                Self::srgb_to_linear(fg_r as f32 / 255.0),
+                Self::srgb_to_linear(fg_g as f32 / 255.0),
+                Self::srgb_to_linear(fg_b as f32 / 255.0),
+                1.0,
+            ];
+            let [bg_r, bg_g, bg_b] = self.palette.default_bg;
+            color_table_data[257] = [
+                Self::srgb_to_linear(bg_r as f32 / 255.0),
+                Self::srgb_to_linear(bg_g as f32 / 255.0),
+                Self::srgb_to_linear(bg_b as f32 / 255.0),
+                1.0,
+            ];
+            self.queue.write_buffer(&self.color_table_buffer, 0, bytemuck::cast_slice(&color_table_data));
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // PREPARE STATUSLINE FOR RENDERING (dedicated shader)
+        // Must happen AFTER pane content rendering so sprite indices are correct
+        // ═══════════════════════════════════════════════════════════════════
+        let statusline_cols = {
+            let statusline_y = self.statusline_y();
+            
+            // Update statusline GPU cells from content, passing window width for gap expansion
+            let cols = self.update_statusline_cells(statusline_content, width);
+            
+            if cols > 0 {
+                // Upload statusline cells to GPU
+                self.queue.write_buffer(
+                    &self.statusline_cell_buffer,
+                    0,
+                    bytemuck::cast_slice(&self.statusline_gpu_cells),
+                );
+                
+                // Create params for statusline shader
+                let statusline_params = StatuslineParams {
+                    char_count: cols as u32,
+                    cell_width: self.cell_width,
+                    cell_height: self.cell_height,
+                    screen_width: width,
+                    screen_height: height,
+                    y_offset: statusline_y,
+                    _padding: [0.0, 0.0],
+                };
+                
+                // Upload statusline params
+                self.queue.write_buffer(
+                    &self.statusline_params_buffer,
+                    0,
+                    bytemuck::cast_slice(&[statusline_params]),
+                );
+            }
+            
+            cols
+        };
+        
+        // Upload terminal sprites (shared between all panes)
+        // Must happen after all sprites have been created
+        // Resize sprite buffer if needed
+        if !self.sprite_info.is_empty() {
+            let required_sprites = self.sprite_info.len();
+            if required_sprites > self.sprite_buffer_capacity {
+                // Need to resize - create a new larger buffer
+                let new_capacity = (required_sprites * 3 / 2).max(self.sprite_buffer_capacity * 2);
+                self.sprite_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Sprite Storage Buffer"),
+                    size: (new_capacity * std::mem::size_of::<SpriteInfo>()) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.sprite_buffer_capacity = new_capacity;
+                
+                // Recreate all per-pane bind groups since they reference the sprite buffer
+                let pane_ids: Vec<u64> = self.pane_resources.keys().cloned().collect();
+                for pane_id in pane_ids {
+                    if let Some(pane_res) = self.pane_resources.get(&pane_id) {
+                        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some(&format!("Pane {} Bind Group", pane_id)),
+                            layout: &self.instanced_bind_group_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: self.color_table_buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: pane_res.grid_params_buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: pane_res.cell_buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: self.sprite_buffer.as_entire_binding(),
+                                },
+                            ],
+                        });
+                        // Update the bind group in pane_resources
+                        if let Some(pane_res_mut) = self.pane_resources.get_mut(&pane_id) {
+                            pane_res_mut.bind_group = bind_group;
+                        }
+                    }
+                }
+            }
+            
+            self.queue.write_buffer(&self.sprite_buffer, 0, bytemuck::cast_slice(&self.sprite_info));
+        }
+        
+        // Upload statusline sprites (separate buffer from terminal)
+        if !self.statusline_sprite_info.is_empty() {
+            let required_sprites = self.statusline_sprite_info.len();
+            if required_sprites > self.statusline_sprite_buffer_capacity {
+                // Need to resize - create a new larger buffer
+                let new_capacity = (required_sprites * 3 / 2).max(self.statusline_sprite_buffer_capacity * 2);
+                self.statusline_sprite_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Statusline Sprite Buffer"),
+                    size: (new_capacity * std::mem::size_of::<SpriteInfo>()) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.statusline_sprite_buffer_capacity = new_capacity;
+                
+                // Recreate statusline bind group since it references the sprite buffer
+                self.statusline_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Statusline Bind Group"),
+                    layout: &self.statusline_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.color_table_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.statusline_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.statusline_cell_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.statusline_sprite_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+            }
+            
+            self.queue.write_buffer(&self.statusline_sprite_buffer, 0, bytemuck::cast_slice(&self.statusline_sprite_info));
         }
 
         // ═══════════════════════════════════════════════════════════════════
@@ -5354,8 +7290,9 @@ impl Renderer {
         // ═══════════════════════════════════════════════════════════════════
         let mut image_renders: Vec<(u32, ImageUniforms)> = Vec::new();
         for (terminal, info, _) in panes {
-            let pane_x = info.x;
-            let pane_y = terminal_y_offset + info.y;
+            // Apply grid centering offsets to pane position
+            let pane_x = grid_x_offset + info.x;
+            let pane_y = terminal_y_offset + grid_y_offset + info.y;
 
             let renders = self.prepare_image_renders(
                 terminal.image_storage.placements(),
@@ -5386,9 +7323,8 @@ impl Renderer {
         // ═══════════════════════════════════════════════════════════════════
         let bg_vertex_count = self.bg_vertices.len();
         let glyph_vertex_count = self.glyph_vertices.len();
-        let overlay_vertex_count = self.overlay_vertices.len();
-        let total_vertex_count = bg_vertex_count + glyph_vertex_count + overlay_vertex_count;
-        let total_index_count = self.bg_indices.len() + self.glyph_indices.len() + self.overlay_indices.len();
+        let total_vertex_count = bg_vertex_count + glyph_vertex_count;
+        let total_index_count = self.bg_indices.len() + self.glyph_indices.len();
 
         // Resize buffers if needed
         if total_vertex_count > self.vertex_capacity {
@@ -5411,7 +7347,7 @@ impl Renderer {
             });
         }
 
-        // Upload vertices: bg, then glyph, then overlay
+        // Upload vertices: bg, then glyph
         self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.bg_vertices));
         self.queue.write_buffer(
             &self.vertex_buffer,
@@ -5419,15 +7355,7 @@ impl Renderer {
             bytemuck::cast_slice(&self.glyph_vertices),
         );
 
-        if !self.overlay_vertices.is_empty() {
-            self.queue.write_buffer(
-                &self.vertex_buffer,
-                ((bg_vertex_count + glyph_vertex_count) * std::mem::size_of::<GlyphVertex>()) as u64,
-                bytemuck::cast_slice(&self.overlay_vertices),
-            );
-        }
-
-        // Upload indices: bg, then glyph (adjusted), then overlay (adjusted)
+        // Upload indices: bg, then glyph (adjusted)
         self.queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&self.bg_indices));
 
         let glyph_vertex_offset = bg_vertex_count as u32;
@@ -5444,19 +7372,21 @@ impl Renderer {
             );
         }
 
-        let overlay_vertex_offset = (bg_vertex_count + glyph_vertex_count) as u32;
-        let glyph_index_bytes = self.glyph_indices.len() * std::mem::size_of::<u32>();
-
-        if !self.overlay_indices.is_empty() {
-            let adjusted_indices: Vec<u32> = self.overlay_indices.iter()
-                .map(|i| i + overlay_vertex_offset)
-                .collect();
-            self.queue.write_buffer(
-                &self.index_buffer,
-                (bg_index_bytes + glyph_index_bytes) as u64,
-                bytemuck::cast_slice(&adjusted_indices),
-            );
+        // Upload quad params and instances for instanced quad rendering
+        let quad_params = QuadParams {
+            screen_width: width,
+            screen_height: height,
+            _padding: [0.0, 0.0],
+        };
+        self.queue.write_buffer(&self.quad_params_buffer, 0, bytemuck::cast_slice(&[quad_params]));
+        
+        // Upload quads if we have any
+        if !self.quads.is_empty() {
+            self.queue.write_buffer(&self.quad_buffer, 0, bytemuck::cast_slice(&self.quads));
         }
+        
+        // Upload overlay quads if we have any (will be rendered after main quads)
+        // We reuse the same buffer, uploading overlay quads when needed during rendering
 
         if self.atlas_dirty {
             self.queue.write_texture(
@@ -5469,7 +7399,7 @@ impl Renderer {
                 &self.atlas_data,
                 wgpu::ImageDataLayout {
                     offset: 0,
-                    bytes_per_row: Some(ATLAS_SIZE),
+                    bytes_per_row: Some(ATLAS_SIZE * ATLAS_BPP),
                     rows_per_image: Some(ATLAS_SIZE),
                 },
                 wgpu::Extent3d {
@@ -5516,7 +7446,84 @@ impl Renderer {
             render_pass.set_bind_group(0, &self.glyph_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            
+            // Draw bg + glyph indices (tab bar text uses legacy vertex rendering)
             render_pass.draw_indexed(0..total_index_count as u32, 0, 0..1);
+
+            // ═══════════════════════════════════════════════════════════════════
+            // INSTANCED QUAD RENDERING (tab bar backgrounds, borders, etc.)
+            // Rendered before cell content so backgrounds appear behind cells
+            // ═══════════════════════════════════════════════════════════════════
+            if !self.quads.is_empty() {
+                render_pass.set_pipeline(&self.quad_pipeline);
+                render_pass.set_bind_group(0, &self.quad_bind_group, &[]);
+                render_pass.draw(0..4, 0..self.quads.len() as u32);
+            }
+
+            // ═══════════════════════════════════════════════════════════════════
+            // INSTANCED CELL RENDERING (Like Kitty's per-window VAO approach)
+            // Each pane has its own bind group with its own buffers.
+            // Data was already uploaded before the render pass started.
+            // ═══════════════════════════════════════════════════════════════════
+            for pane_data in &pane_render_list {
+                let instance_count = pane_data.cols * pane_data.rows;
+                
+                // Get this pane's bind group (data already uploaded)
+                if let Some(pane_res) = self.pane_resources.get(&pane_data.pane_id) {
+                    // Draw cell backgrounds
+                    render_pass.set_pipeline(&self.cell_bg_pipeline);
+                    render_pass.set_bind_group(0, &self.glyph_bind_group, &[]); // Atlas (shared)
+                    render_pass.set_bind_group(1, &pane_res.bind_group, &[]); // This pane's data
+                    render_pass.draw(0..4, 0..instance_count); // 4 vertices per quad, N instances
+                    
+                    // Draw cell glyphs
+                    render_pass.set_pipeline(&self.cell_glyph_pipeline);
+                    render_pass.set_bind_group(0, &self.glyph_bind_group, &[]); // Atlas (shared)
+                    render_pass.set_bind_group(1, &pane_res.bind_group, &[]); // This pane's data
+                    render_pass.draw(0..4, 0..instance_count); // 4 vertices per quad, N instances
+                }
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // STATUSLINE RENDERING (dedicated shader)
+            // Render the statusline using its own pipelines
+            // ═══════════════════════════════════════════════════════════════════
+            if statusline_cols > 0 {
+                let instance_count = statusline_cols as u32;
+                
+                // Draw statusline backgrounds
+                render_pass.set_pipeline(&self.statusline_bg_pipeline);
+                render_pass.set_bind_group(0, &self.glyph_bind_group, &[]); // Atlas
+                render_pass.set_bind_group(1, &self.statusline_bind_group, &[]); // Statusline data
+                render_pass.draw(0..4, 0..instance_count);
+                
+                // Draw statusline glyphs
+                render_pass.set_pipeline(&self.statusline_glyph_pipeline);
+                render_pass.set_bind_group(0, &self.glyph_bind_group, &[]); // Atlas
+                render_pass.set_bind_group(1, &self.statusline_bind_group, &[]); // Statusline data
+                render_pass.draw(0..4, 0..instance_count);
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // ADD DIM OVERLAYS FOR INACTIVE PANES
+            // ═══════════════════════════════════════════════════════════════════
+            for pane_data in &pane_render_list {
+                if let Some((x, y, w, h, color)) = pane_data.dim_overlay {
+                    self.overlay_quads.push(Quad { x, y, width: w, height: h, color });
+                }
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // INSTANCED OVERLAY QUAD RENDERING (dimming overlays, borders)
+            // Rendered last so overlays appear on top of everything
+            // ═══════════════════════════════════════════════════════════════════
+            if !self.overlay_quads.is_empty() {
+                // Upload overlay quads to the buffer (reusing the same buffer)
+                self.queue.write_buffer(&self.quad_buffer, 0, bytemuck::cast_slice(&self.overlay_quads));
+                render_pass.set_pipeline(&self.quad_pipeline);
+                render_pass.set_bind_group(0, &self.quad_bind_group, &[]);
+                render_pass.draw(0..4, 0..self.overlay_quads.len() as u32);
+            }
         }
 
         // ═══════════════════════════════════════════════════════════════════
@@ -5600,6 +7607,9 @@ impl Renderer {
 
     /// Upload an image to the GPU, creating or updating its texture.
     pub fn upload_image(&mut self, image: &ImageData) {
+        // Get current frame data (handles animation frames automatically)
+        let data = image.current_frame_data();
+        
         // Check if we already have this image
         if let Some(existing) = self.image_textures.get(&image.id) {
             if existing.width == image.width && existing.height == image.height {
@@ -5611,7 +7621,7 @@ impl Renderer {
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
-                    &image.data,
+                    data,
                     wgpu::ImageDataLayout {
                         offset: 0,
                         bytes_per_row: Some(image.width * 4),
@@ -5652,7 +7662,7 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &image.data,
+            data,
             wgpu::ImageDataLayout {
                 offset: 0,
                 bytes_per_row: Some(image.width * 4),

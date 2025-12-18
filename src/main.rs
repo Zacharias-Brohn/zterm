@@ -27,102 +27,202 @@ use winit::keyboard::{Key, NamedKey};
 use winit::platform::wayland::EventLoopBuilderExtWayland;
 use winit::window::{Window, WindowId};
 
-/// Kitty-style shared buffer for PTY I/O using double-buffering.
+/// Kitty-style single-buffer for PTY I/O with zero-copy reads and writes.
 /// 
-/// Uses two buffers that swap roles:
-/// - I/O thread writes to the "write" buffer
-/// - Main thread parses from the "read" buffer  
-/// - On `swap()`, the buffers exchange roles
+/// Uses a single buffer with separate read/write regions:
+/// - I/O thread writes to `buf[write_offset..]` 
+/// - Main thread reads from `buf[0..read_len]`
+/// - After main thread consumes data, buffer compacts via memmove
+/// 
+/// When buffer is full, I/O thread waits on an eventfd. Main thread signals
+/// the eventfd after consuming data to wake up the I/O thread.
 /// 
 /// This gives us:
-/// - Zero-copy parsing (main thread reads directly from buffer)
-/// - No lock contention during parsing (each thread has its own buffer)
-/// - No memmove needed
-const PTY_BUF_SIZE: usize = 4 * 1024 * 1024; // 4MB like Kitty
+/// - Zero-copy writes (I/O reads directly into buffer)
+/// - Zero-copy reads (main thread gets slice, no allocation)
+/// - Single 1MB buffer (vs 8MB for double-buffering)
+/// - No busy-waiting when buffer is full
+const PTY_BUF_SIZE: usize = 1024 * 1024; // 1MB like Kitty
 
 struct SharedPtyBuffer {
-    inner: Mutex<DoubleBuffer>,
+    /// The actual buffer. UnsafeCell because we need disjoint mutable access:
+    /// I/O thread writes to [write_pending..], main thread reads [0..read_available]
+    buf: std::cell::UnsafeCell<Box<[u8; PTY_BUF_SIZE]>>,
+    /// Metadata protected by mutex - offsets into the buffer
+    state: Mutex<BufferState>,
+    /// Eventfd to wake up I/O thread when space becomes available
+    wakeup_fd: i32,
 }
 
-struct DoubleBuffer {
-    /// Two buffers that swap roles
-    bufs: [Vec<u8>; 2],
-    /// Which buffer the I/O thread writes to (0 or 1)
-    write_idx: usize,
-    /// How many bytes are pending in the write buffer
-    write_len: usize,
+// SAFETY: We ensure disjoint access - I/O thread only writes past read_available,
+// main thread only reads up to read_available. Mutex protects metadata updates.
+unsafe impl Sync for SharedPtyBuffer {}
+unsafe impl Send for SharedPtyBuffer {}
+
+struct BufferState {
+    /// Bytes available for main thread to read (I/O has written, main hasn't consumed)
+    read_available: usize,
+    /// Bytes written by I/O thread but not yet made available to main thread
+    write_pending: usize,
+    /// Whether the I/O thread is waiting for space
+    waiting_for_space: bool,
 }
 
 impl SharedPtyBuffer {
     fn new() -> Self {
-        // Use with_capacity to avoid zeroing memory - we only need the allocation
-        let mut buf1 = Vec::with_capacity(PTY_BUF_SIZE);
-        let mut buf2 = Vec::with_capacity(PTY_BUF_SIZE);
-        // SAFETY: We're setting length to capacity. The data is uninitialized but
-        // we only read from portions that have been written to (tracked by write_len).
-        unsafe {
-            buf1.set_len(PTY_BUF_SIZE);
-            buf2.set_len(PTY_BUF_SIZE);
+        // Create eventfd for wakeup signaling
+        let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if wakeup_fd < 0 {
+            panic!("Failed to create eventfd: {}", std::io::Error::last_os_error());
         }
+        
         Self {
-            inner: Mutex::new(DoubleBuffer {
-                bufs: [buf1, buf2],
-                write_idx: 0,
-                write_len: 0,
+            buf: std::cell::UnsafeCell::new(Box::new([0u8; PTY_BUF_SIZE])),
+            state: Mutex::new(BufferState {
+                read_available: 0,
+                write_pending: 0,
+                waiting_for_space: false,
             }),
+            wakeup_fd,
         }
     }
     
-    /// Read from PTY fd into the write buffer. Called by I/O thread.
-    /// Returns number of bytes read, 0 if no space/would block, -1 on error.
-    fn read_from_fd(&self, fd: i32) -> isize {
-        let mut inner = self.inner.lock().unwrap();
+    /// Get the wakeup fd for the I/O thread to poll on.
+    fn wakeup_fd(&self) -> i32 {
+        self.wakeup_fd
+    }
+    
+    /// Check if there's space and mark as waiting if not.
+    /// Returns true if there's space, false if waiting.
+    fn check_space_or_wait(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let has_space = state.read_available + state.write_pending < PTY_BUF_SIZE;
+        if !has_space {
+            state.waiting_for_space = true;
+        }
+        has_space
+    }
+    
+    /// Get a write buffer for the I/O thread to read PTY data into.
+    /// Returns (pointer, available_space). Caller must call commit_write() after.
+    /// 
+    /// SAFETY: The returned pointer is valid until commit_write() is called.
+    /// Only one thread should call this at a time (the I/O thread).
+    fn create_write_buffer(&self) -> (*mut u8, usize) {
+        let state = self.state.lock().unwrap();
+        let write_offset = state.read_available + state.write_pending;
+        let available = PTY_BUF_SIZE.saturating_sub(write_offset);
         
-        let available = PTY_BUF_SIZE.saturating_sub(inner.write_len);
         if available == 0 {
-            return 0; // Buffer full, need swap
+            return (std::ptr::null_mut(), 0);
         }
         
-        let write_idx = inner.write_idx;
-        let write_len = inner.write_len;
-        let buf_ptr = unsafe { inner.bufs[write_idx].as_mut_ptr().add(write_len) };
+        // SAFETY: We have exclusive write access to buf[write_offset..] because:
+        // - Main thread only reads [0..read_available]
+        // - We're the only writer past read_available + write_pending
+        let ptr = unsafe { (*self.buf.get()).as_mut_ptr().add(write_offset) };
+        (ptr, available)
+    }
+    
+    /// Commit bytes written by the I/O thread.
+    fn commit_write(&self, len: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.write_pending += len;
+    }
+    
+    /// Read from PTY fd into the buffer. Called by I/O thread.
+    /// Returns number of bytes read, 0 if no space/would block, -1 on error.
+    fn read_from_fd(&self, fd: i32) -> isize {
+        let (ptr, available) = self.create_write_buffer();
+        if available == 0 {
+            return 0; // Buffer full
+        }
         
         let result = unsafe { 
-            libc::read(fd, buf_ptr as *mut libc::c_void, available) 
+            libc::read(fd, ptr as *mut libc::c_void, available) 
         };
         
         if result > 0 {
-            inner.write_len += result as usize;
+            self.commit_write(result as usize);
         }
         result
     }
     
-    /// Check if there's space in the write buffer.
-    fn has_space(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner.write_len < PTY_BUF_SIZE
+    /// Drain the wakeup eventfd. Called by I/O thread after waking up.
+    fn drain_wakeup(&self) {
+        let mut buf = 0u64;
+        unsafe {
+            libc::read(self.wakeup_fd, &mut buf as *mut u64 as *mut libc::c_void, 8);
+        }
     }
     
-    /// Swap buffers and return data to parse. Called by main thread.
-    /// The I/O thread will start writing to the other buffer.
-    fn take_pending(&self) -> Vec<u8> {
-        let mut inner = self.inner.lock().unwrap();
+    /// Make pending writes available for reading, get slice to read.
+    /// Returns None if no data available.
+    /// 
+    /// SAFETY: The returned slice is valid until consume() is called.
+    /// Only the main thread should call this.
+    fn get_read_slice(&self) -> Option<&[u8]> {
+        let mut state = self.state.lock().unwrap();
         
-        if inner.write_len == 0 {
-            return Vec::new(); // Nothing new to parse
+        // Move pending writes to readable
+        state.read_available += state.write_pending;
+        state.write_pending = 0;
+        
+        if state.read_available == 0 {
+            return None;
         }
         
-        // Swap: the write buffer becomes the read buffer
-        let read_idx = inner.write_idx;
-        let read_len = inner.write_len;
+        // SAFETY: We have exclusive read access to [0..read_available] because:
+        // - I/O thread only writes past read_available
+        // - We're the only reader
+        let slice = unsafe { 
+            std::slice::from_raw_parts((*self.buf.get()).as_ptr(), state.read_available) 
+        };
+        Some(slice)
+    }
+    
+    /// Consume all read data, making space for new writes.
+    /// Called after parsing is complete. Wakes up I/O thread if it was waiting.
+    fn consume_all(&self) {
+        let should_wakeup;
+        {
+            let mut state = self.state.lock().unwrap();
+            
+            // If there's pending write data, we need to move it to the front
+            if state.write_pending > 0 {
+                // SAFETY: Memmove handles overlapping regions
+                unsafe {
+                    let buf = &mut *self.buf.get();
+                    std::ptr::copy(
+                        buf.as_ptr().add(state.read_available),
+                        buf.as_mut_ptr(),
+                        state.write_pending,
+                    );
+                }
+            }
+            
+            state.read_available = 0;
+            // write_pending stays the same but is now at offset 0
+            
+            should_wakeup = state.waiting_for_space;
+            state.waiting_for_space = false;
+        }
         
-        // Switch I/O thread to the other buffer
-        inner.write_idx = 1 - inner.write_idx;
-        inner.write_len = 0;
-        
-        // Return a copy of the data to parse
-        // (We have to copy because we can't return a reference with the mutex)
-        inner.bufs[read_idx][..read_len].to_vec()
+        // Wake up I/O thread if it was waiting for space
+        if should_wakeup {
+            let val = 1u64;
+            unsafe {
+                libc::write(self.wakeup_fd, &val as *const u64 as *const libc::c_void, 8);
+            }
+        }
+    }
+}
+
+impl Drop for SharedPtyBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.wakeup_fd);
+        }
     }
 }
 
@@ -331,33 +431,66 @@ impl SplitNode {
     }
     
     /// Calculate layout for all nodes given the available space.
-    fn layout(&mut self, x: f32, y: f32, width: f32, height: f32, cell_width: f32, cell_height: f32, border_width: f32) {
+    /// Returns the actual used (width, height) after cell alignment.
+    /// Note: border_width is kept for API compatibility but borders are now overlaid on panes.
+    fn layout(&mut self, x: f32, y: f32, width: f32, height: f32, cell_width: f32, cell_height: f32, _border_width: f32) -> (f32, f32) {
         match self {
             SplitNode::Leaf { geometry, .. } => {
-                let cols = ((width - border_width) / cell_width).floor() as usize;
-                let rows = ((height - border_width) / cell_height).floor() as usize;
+                // Calculate how many cells fit
+                let cols = (width / cell_width).floor() as usize;
+                let rows = (height / cell_height).floor() as usize;
+                // Store actual cell-aligned dimensions (not allocated space)
+                let actual_width = cols.max(1) as f32 * cell_width;
+                let actual_height = rows.max(1) as f32 * cell_height;
                 *geometry = PaneGeometry {
                     x,
                     y,
-                    width,
-                    height,
+                    width: actual_width,
+                    height: actual_height,
                     cols: cols.max(1),
                     rows: rows.max(1),
                 };
+                (actual_width, actual_height)
             }
             SplitNode::Split { horizontal, ratio, first, second } => {
                 if *horizontal {
-                    // Side-by-side split
-                    let first_width = (width * *ratio) - border_width / 2.0;
-                    let second_width = width - first_width - border_width;
-                    first.layout(x, y, first_width, height, cell_width, cell_height, border_width);
-                    second.layout(x + first_width + border_width, y, second_width, height, cell_width, cell_height, border_width);
+                    // Side-by-side split (horizontal means panes are side-by-side)
+                    // No border space reserved - border will be overlaid on pane edges
+                    let total_cols = (width / cell_width).floor() as usize;
+                    
+                    // Distribute columns by ratio
+                    let first_cols = ((total_cols as f32) * *ratio).round() as usize;
+                    let second_cols = total_cols.saturating_sub(first_cols);
+                    
+                    // Convert back to pixel widths
+                    let first_alloc_width = first_cols.max(1) as f32 * cell_width;
+                    let second_alloc_width = second_cols.max(1) as f32 * cell_width;
+                    
+                    // Layout panes flush against each other (border overlays the edge)
+                    let (first_actual_w, first_actual_h) = first.layout(x, y, first_alloc_width, height, cell_width, cell_height, _border_width);
+                    let (second_actual_w, second_actual_h) = second.layout(x + first_actual_w, y, second_alloc_width, height, cell_width, cell_height, _border_width);
+                    
+                    // Total used size: both panes (no border gap)
+                    (first_actual_w + second_actual_w, first_actual_h.max(second_actual_h))
                 } else {
-                    // Stacked split
-                    let first_height = (height * *ratio) - border_width / 2.0;
-                    let second_height = height - first_height - border_width;
-                    first.layout(x, y, width, first_height, cell_width, cell_height, border_width);
-                    second.layout(x, y + first_height + border_width, width, second_height, cell_width, cell_height, border_width);
+                    // Stacked split (vertical means panes are stacked)
+                    // No border space reserved - border will be overlaid on pane edges
+                    let total_rows = (height / cell_height).floor() as usize;
+                    
+                    // Distribute rows by ratio
+                    let first_rows = ((total_rows as f32) * *ratio).round() as usize;
+                    let second_rows = total_rows.saturating_sub(first_rows);
+                    
+                    // Convert back to pixel heights
+                    let first_alloc_height = first_rows.max(1) as f32 * cell_height;
+                    let second_alloc_height = second_rows.max(1) as f32 * cell_height;
+                    
+                    // Layout panes flush against each other (border overlays the edge)
+                    let (first_actual_w, first_actual_h) = first.layout(x, y, width, first_alloc_height, cell_width, cell_height, _border_width);
+                    let (second_actual_w, second_actual_h) = second.layout(x, y + first_actual_h, width, second_alloc_height, cell_width, cell_height, _border_width);
+                    
+                    // Total used size: both panes (no border gap)
+                    (first_actual_w.max(second_actual_w), first_actual_h + second_actual_h)
                 }
             }
         }
@@ -569,6 +702,9 @@ struct Tab {
     /// Tab title (from OSC or shell).
     #[allow(dead_code)]
     title: String,
+    /// Actual used grid dimensions (width, height) after cell alignment.
+    /// Used for centering the grid in the window.
+    grid_used_dimensions: (f32, f32),
 }
 
 impl Tab {
@@ -586,6 +722,7 @@ impl Tab {
             split_root: SplitNode::leaf(pane_id),
             active_pane: pane_id,
             title: String::from("zsh"),
+            grid_used_dimensions: (0.0, 0.0), // Will be set on first resize
         })
     }
     
@@ -601,8 +738,11 @@ impl Tab {
     
     /// Resize all panes based on new window dimensions.
     fn resize(&mut self, width: f32, height: f32, cell_width: f32, cell_height: f32, border_width: f32) {
-        // Recalculate layout
-        self.split_root.layout(0.0, 0.0, width, height, cell_width, cell_height, border_width);
+        // Recalculate layout - returns actual used dimensions for centering
+        let used_dims = self.split_root.layout(0.0, 0.0, width, height, cell_width, cell_height, border_width);
+        
+        // Store the used dimensions for this tab
+        self.grid_used_dimensions = used_dims;
         
         // Resize each pane's terminal based on its geometry
         let mut geometries = Vec::new();
@@ -1149,8 +1289,6 @@ struct App {
     edge_glows: Vec<EdgeGlow>,
 }
 
-const PTY_KEY: usize = 1;
-
 impl App {
     fn new() -> Self {
         let config = Config::load();
@@ -1265,11 +1403,14 @@ impl App {
     fn start_pane_io_thread_with_info(&self, pane_id: PaneId, pty_fd: i32, pty_buffer: Arc<SharedPtyBuffer>) {
         let Some(proxy) = self.event_loop_proxy.clone() else { return };
         let shutdown = self.shutdown.clone();
+        let wakeup_fd = pty_buffer.wakeup_fd();
         
         std::thread::Builder::new()
             .name(format!("pty-io-{}", pane_id.0))
             .spawn(move || {
                 const INPUT_DELAY: Duration = Duration::from_millis(3);
+                const PTY_KEY: usize = 0;
+                const WAKEUP_KEY: usize = 1;
                 
                 let poller = match Poller::new() {
                     Ok(p) => p,
@@ -1279,9 +1420,15 @@ impl App {
                     }
                 };
                 
+                // Add PTY fd
                 unsafe {
                     if let Err(e) = poller.add(pty_fd, Event::readable(PTY_KEY)) {
                         log::error!("Failed to add PTY to poller: {}", e);
+                        return;
+                    }
+                    // Add wakeup fd - used to wake us when buffer space becomes available
+                    if let Err(e) = poller.add(wakeup_fd, Event::readable(WAKEUP_KEY)) {
+                        log::error!("Failed to add wakeup fd to poller: {}", e);
                         return;
                     }
                 }
@@ -1293,52 +1440,75 @@ impl App {
                 while !shutdown.load(Ordering::Relaxed) {
                     events.clear();
                     
-                    let has_space = pty_buffer.has_space();
+                    // Check if we have space - if not, disable PTY polling until woken
+                    let has_space = pty_buffer.check_space_or_wait();
+                    
+                    // Set up poll events: always listen on wakeup_fd, only listen on pty_fd if we have space
+                    unsafe {
+                        let pty_event = if has_space { Event::readable(PTY_KEY) } else { Event::none(PTY_KEY) };
+                        let _ = poller.modify(std::os::fd::BorrowedFd::borrow_raw(pty_fd), pty_event);
+                    }
                     
                     let timeout = if has_pending_wakeup {
                         let elapsed = last_wakeup_at.elapsed();
                         Some(INPUT_DELAY.saturating_sub(elapsed))
                     } else {
-                        Some(Duration::from_millis(100))
+                        None // Block indefinitely until data or wakeup
                     };
                     
                     match poller.wait(&mut events, timeout) {
-                        Ok(_) if !events.is_empty() && has_space => {
-                            loop {
-                                let result = pty_buffer.read_from_fd(pty_fd);
-                                if result < 0 {
-                                    let err = std::io::Error::last_os_error();
-                                    if err.kind() == std::io::ErrorKind::Interrupted {
-                                        continue;
-                                    }
-                                    if err.kind() == std::io::ErrorKind::WouldBlock {
-                                        break;
-                                    }
-                                    log::debug!("PTY read error: {}", err);
-                                    break;
-                                } else if result == 0 {
-                                    break;
-                                } else {
-                                    has_pending_wakeup = true;
-                                    continue;
+                        Ok(_) => {
+                            let mut got_wakeup = false;
+                            let mut got_pty_data = false;
+                            
+                            for ev in events.iter() {
+                                if ev.key == WAKEUP_KEY {
+                                    got_wakeup = true;
+                                }
+                                if ev.key == PTY_KEY && ev.readable {
+                                    got_pty_data = true;
                                 }
                             }
                             
-                            let now = std::time::Instant::now();
-                            if now.duration_since(last_wakeup_at) >= INPUT_DELAY {
-                                let _ = proxy.send_event(UserEvent::PtyReadable(pane_id));
-                                last_wakeup_at = now;
-                                has_pending_wakeup = false;
+                            // Drain wakeup fd if signaled
+                            if got_wakeup {
+                                pty_buffer.drain_wakeup();
+                                // Re-arm wakeup fd
+                                unsafe {
+                                    let _ = poller.modify(
+                                        std::os::fd::BorrowedFd::borrow_raw(wakeup_fd),
+                                        Event::readable(WAKEUP_KEY),
+                                    );
+                                }
                             }
                             
-                            unsafe {
-                                let _ = poller.modify(
-                                    std::os::fd::BorrowedFd::borrow_raw(pty_fd),
-                                    Event::readable(PTY_KEY),
-                                );
+                            // Read PTY data if available and we have space
+                            if got_pty_data && has_space {
+                                loop {
+                                    let result = pty_buffer.read_from_fd(pty_fd);
+                                    if result < 0 {
+                                        let err = std::io::Error::last_os_error();
+                                        if err.kind() == std::io::ErrorKind::Interrupted {
+                                            continue;
+                                        }
+                                        if err.kind() == std::io::ErrorKind::WouldBlock {
+                                            break;
+                                        }
+                                        log::debug!("PTY read error: {}", err);
+                                        break;
+                                    } else if result == 0 {
+                                        break;
+                                    } else {
+                                        has_pending_wakeup = true;
+                                        // Check if buffer became full
+                                        if !pty_buffer.check_space_or_wait() {
+                                            break;
+                                        }
+                                    }
+                                }
                             }
-                        }
-                        Ok(_) => {
+                            
+                            // Send wakeup to main thread if we have pending data and enough time passed
                             if has_pending_wakeup {
                                 let now = std::time::Instant::now();
                                 if now.duration_since(last_wakeup_at) >= INPUT_DELAY {
@@ -1349,8 +1519,10 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            log::error!("PTY poll error: {}", e);
-                            break;
+                            if e.kind() != std::io::ErrorKind::Interrupted {
+                                log::error!("PTY poll error: {}", e);
+                                break;
+                            }
                         }
                     }
                 }
@@ -1409,20 +1581,32 @@ impl App {
     
     /// Resize all panes in all tabs based on renderer dimensions.
     fn resize_all_panes(&mut self) {
-        let Some(renderer) = &self.renderer else { return };
+        // Extract values we need from renderer first
+        // Use raw available pixel space so layout can handle cell alignment properly
+        let (cell_width, cell_height, available_width, available_height) = {
+            let Some(renderer) = &self.renderer else { return };
+            let cell_width = renderer.cell_width;
+            let cell_height = renderer.cell_height;
+            let (available_width, available_height) = renderer.available_grid_space();
+            (cell_width, cell_height, available_width, available_height)
+        };
         
-        let cell_width = renderer.cell_width;
-        let cell_height = renderer.cell_height;
-        let width = renderer.width as f32;
-        let height = renderer.height as f32 - renderer.tab_bar_height() - renderer.statusline_height();
         let border_width = 2.0; // Border width in pixels
         
-        for tab in &mut self.tabs {
-            tab.resize(width, height, cell_width, cell_height, border_width);
+        for tab in self.tabs.iter_mut() {
+            tab.resize(available_width, available_height, cell_width, cell_height, border_width);
             
             // Update cell size on all terminals (needed for Kitty graphics protocol)
             for pane in tab.panes.values_mut() {
                 pane.terminal.set_cell_size(cell_width, cell_height);
+            }
+        }
+        
+        // Update the renderer with the active tab's used dimensions for proper centering
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let used_dims = tab.grid_used_dimensions;
+            if let Some(renderer) = &mut self.renderer {
+                renderer.set_grid_used_dimensions(used_dims.0, used_dims.1);
             }
         }
     }
@@ -1436,17 +1620,18 @@ impl App {
         
         for tab in &mut self.tabs {
             if let Some(pane) = tab.get_pane_mut(pane_id) {
-                // Take all pending data atomically
-                let data = pane.pty_buffer.take_pending();
+                // Get slice of pending data - zero copy!
+                let Some(data) = pane.pty_buffer.get_read_slice() else {
+                    return false;
+                };
                 let len = data.len();
                 
-                if len == 0 {
-                    return false;
-                }
-                
                 let process_start = std::time::Instant::now();
-                pane.terminal.process(&data);
+                pane.terminal.process(data);
                 let process_time_ns = process_start.elapsed().as_nanos() as u64;
+                
+                // Consume the data now that we're done parsing
+                pane.pty_buffer.consume_all();
                 
                 if process_time_ns > 5_000_000 {
                     log::info!("PTY: process={:.2}ms bytes={}",
@@ -1642,22 +1827,18 @@ impl App {
             }
             Action::NextTab => {
                 if !self.tabs.is_empty() {
-                    self.active_tab = (self.active_tab + 1) % self.tabs.len();
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
+                    let next_tab = (self.active_tab + 1) % self.tabs.len();
+                    self.switch_to_tab(next_tab);
                 }
             }
             Action::PrevTab => {
                 if !self.tabs.is_empty() {
-                    self.active_tab = if self.active_tab == 0 {
+                    let prev_tab = if self.active_tab == 0 {
                         self.tabs.len() - 1
                     } else {
                         self.active_tab - 1
                     };
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
+                    self.switch_to_tab(prev_tab);
                 }
             }
             Action::Tab1 => self.switch_to_tab(0),
@@ -1816,8 +1997,20 @@ impl App {
     fn switch_to_tab(&mut self, idx: usize) {
         if idx < self.tabs.len() {
             self.active_tab = idx;
+            // Update grid dimensions for proper centering of the new active tab
+            self.update_active_tab_grid_dimensions();
             if let Some(window) = &self.window {
                 window.request_redraw();
+            }
+        }
+    }
+    
+    /// Update the renderer's grid dimensions based on the active tab's stored dimensions.
+    fn update_active_tab_grid_dimensions(&mut self) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let used_dims = tab.grid_used_dimensions;
+            if let Some(renderer) = &mut self.renderer {
+                renderer.set_grid_used_dimensions(used_dims.0, used_dims.1);
             }
         }
     }
@@ -2030,9 +2223,19 @@ impl ApplicationHandler<UserEvent> for App {
                 self.poll_pane(pane_id);
                 let process_time = start.elapsed();
                 
-                // Request redraw to display the new content
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+                // Check if terminal is in synchronized output mode (DCS pending mode or CSI 2026)
+                // If so, skip the redraw - rendering will happen when sync mode ends
+                let synchronized = self.tabs.iter()
+                    .flat_map(|tab| tab.panes.values())
+                    .find(|pane| pane.id == pane_id)
+                    .map(|pane| pane.terminal.is_synchronized())
+                    .unwrap_or(false);
+                
+                // Request redraw to display the new content (unless in sync mode)
+                if !synchronized {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
                 }
                 
                 if process_time.as_millis() > 5 {
@@ -2309,6 +2512,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 };
                                 
                                 let render_info = PaneRenderInfo {
+                                    pane_id: pane_id.0,
                                     x: geom.x,
                                     y: geom.y,
                                     width: geom.width,
@@ -2416,16 +2620,23 @@ impl ApplicationHandler<UserEvent> for App {
         
         // Check for exited tabs and remove them
         let mut i = 0;
+        let mut tabs_removed = false;
         while i < self.tabs.len() {
             if self.tabs[i].child_exited() {
                 log::info!("Tab {} shell exited", i);
                 self.tabs.remove(i);
+                tabs_removed = true;
                 if self.active_tab >= self.tabs.len() && !self.tabs.is_empty() {
                     self.active_tab = self.tabs.len() - 1;
                 }
             } else {
                 i += 1;
             }
+        }
+        
+        // Update grid dimensions if tabs were removed
+        if tabs_removed && !self.tabs.is_empty() {
+            self.update_active_tab_grid_dimensions();
         }
         
         if self.tabs.is_empty() {

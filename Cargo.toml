@@ -42,6 +42,16 @@ ttf-parser = "0.25"
 fontconfig = "0.10"
 fontconfig-sys = { package = "yeslogic-fontconfig-sys", version = "6.0" }
 
+# Color emoji support (FreeType + Cairo for color font rendering)
+freetype-rs = "0.38"
+cairo-rs = { version = "0.21", features = ["freetype"] }
+
+# Emoji detection (Unicode emoji database for O(1) lookup)
+emojis = "0.8"
+
+# Unicode character width (UAX#11 East Asian Width)
+unicode-width = "0.2"
+
 # Configuration
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

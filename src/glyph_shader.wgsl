@@ -102,8 +102,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return in.bg_color;
     }
     
-    // Sample the glyph alpha from the atlas
-    let glyph_alpha = textureSample(atlas_texture, atlas_sampler, in.uv).r;
+    // Sample from RGBA atlas
+    let glyph_sample = textureSample(atlas_texture, atlas_sampler, in.uv);
+    
+    // Detect color glyphs: regular glyphs are stored as white (1,1,1) with alpha
+    // Color glyphs have actual RGB colors. Check if any RGB channel is not white.
+    let is_color_glyph = glyph_sample.r < 0.99 || glyph_sample.g < 0.99 || glyph_sample.b < 0.99;
+    
+    if is_color_glyph {
+        // Color glyph (emoji) - use atlas color directly
+        return glyph_sample;
+    }
+    
+    // Regular glyph - use alpha with foreground color
+    let glyph_alpha = glyph_sample.a;
     
     // Apply legacy gamma-incorrect blending for crisp text
     let adjusted_alpha = foreground_contrast_legacy(in.color.rgb, glyph_alpha, in.bg_color.rgb);
@@ -133,15 +145,22 @@ struct GridParams {
     // Screen dimensions in pixels
     screen_width: f32,
     screen_height: f32,
-    // Y offset for tab bar
+    // X offset for pane position
+    x_offset: f32,
+    // Y offset for tab bar + pane position
     y_offset: f32,
     // Cursor position (-1 if hidden)
     cursor_col: i32,
     cursor_row: i32,
     // Cursor style: 0=block, 1=underline, 2=bar
     cursor_style: u32,
-    // Padding
-    _padding: vec2<u32>,
+    // Background opacity for transparency (0.0 = transparent, 1.0 = opaque)
+    background_opacity: f32,
+    // Selection range (-1 values mean no selection)
+    selection_start_col: i32,
+    selection_start_row: i32,
+    selection_end_col: i32,
+    selection_end_row: i32,
 }
 
 // GPUCell instance data (matches Rust GPUCell struct)
@@ -154,12 +173,14 @@ struct GPUCell {
 }
 
 // Sprite info for glyph positioning
+// In Kitty's model, sprites are always cell-sized and glyphs are pre-positioned
+// within the sprite at the correct baseline. No offset math needed.
 struct SpriteInfo {
     // UV coordinates in atlas (x, y, width, height) - normalized 0-1
     uv: vec4<f32>,
-    // Offset from cell origin (x, y) in pixels
-    offset: vec2<f32>,
-    // Size in pixels
+    // Padding (previously offset, now unused)
+    _padding: vec2<f32>,
+    // Size in pixels (width, height) - always matches cell dimensions
     size: vec2<f32>,
 }
 
@@ -188,9 +209,15 @@ const ATTR_ITALIC_BIT: u32 = 0x10u;
 const ATTR_REVERSE_BIT: u32 = 0x20u;
 const ATTR_STRIKE_BIT: u32 = 0x40u;
 const ATTR_DIM_BIT: u32 = 0x80u;
+const ATTR_SELECTED_BIT: u32 = 0x100u;
 
 // Colored glyph flag
 const COLORED_GLYPH_FLAG: u32 = 0x80000000u;
+
+// Cursor shape constants
+const CURSOR_BLOCK: u32 = 0u;
+const CURSOR_UNDERLINE: u32 = 1u;
+const CURSOR_BAR: u32 = 2u;
 
 // Vertex output for instanced cell rendering
 struct CellVertexOutput {
@@ -200,14 +227,20 @@ struct CellVertexOutput {
     @location(2) bg_color: vec4<f32>,
     @location(3) @interpolate(flat) is_background: u32,
     @location(4) @interpolate(flat) is_colored_glyph: u32,
+    @location(5) @interpolate(flat) is_cursor: u32,
+    @location(6) @interpolate(flat) cursor_shape: u32,
+    @location(7) cursor_color: vec4<f32>,
+    @location(8) cell_pos: vec2<f32>,      // Cell top-left position in pixels
+    @location(9) @interpolate(flat) cell_size: vec2<f32>,  // Cell width/height in pixels
 }
 
-// Resolve a packed color to RGBA
+// Resolve a packed color to RGBA (in linear space for GPU rendering)
 fn resolve_color(packed: u32, is_foreground: bool) -> vec4<f32> {
     let color_type = packed & 0xFFu;
     
     if color_type == COLOR_TYPE_DEFAULT {
         // Default color - use color table entry 256 (fg) or 257 (bg)
+        // Color table is already in linear space
         if is_foreground {
             return color_table.colors[256];
         } else {
@@ -215,14 +248,15 @@ fn resolve_color(packed: u32, is_foreground: bool) -> vec4<f32> {
         }
     } else if color_type == COLOR_TYPE_INDEXED {
         // Indexed color - look up in color table
+        // Color table is already in linear space
         let index = (packed >> 8u) & 0xFFu;
         return color_table.colors[index];
     } else {
-        // RGB color - extract components
+        // RGB color - extract components and convert sRGB to linear
         let r = f32((packed >> 8u) & 0xFFu) / 255.0;
         let g = f32((packed >> 16u) & 0xFFu) / 255.0;
         let b = f32((packed >> 24u) & 0xFFu) / 255.0;
-        return vec4<f32>(r, g, b, 1.0);
+        return vec4<f32>(srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0);
     }
 }
 
@@ -265,15 +299,16 @@ fn vs_cell_bg(
     let cell = cells[instance_index];
     
     // Calculate cell pixel position
-    let cell_x = f32(col) * grid_params.cell_width;
+    let cell_x = grid_params.x_offset + f32(col) * grid_params.cell_width;
     let cell_y = grid_params.y_offset + f32(row) * grid_params.cell_height;
     
-    // Quad vertex positions (0=top-left, 1=top-right, 2=bottom-right, 3=bottom-left)
+    // Quad vertex positions for TriangleStrip (0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right)
+    // TriangleStrip produces triangles: (0,1,2) and (1,2,3)
     var positions: array<vec2<f32>, 4>;
-    positions[0] = vec2<f32>(cell_x, cell_y);
-    positions[1] = vec2<f32>(cell_x + grid_params.cell_width, cell_y);
-    positions[2] = vec2<f32>(cell_x + grid_params.cell_width, cell_y + grid_params.cell_height);
-    positions[3] = vec2<f32>(cell_x, cell_y + grid_params.cell_height);
+    positions[0] = vec2<f32>(cell_x, cell_y);                                              // top-left
+    positions[1] = vec2<f32>(cell_x + grid_params.cell_width, cell_y);                     // top-right
+    positions[2] = vec2<f32>(cell_x, cell_y + grid_params.cell_height);                    // bottom-left
+    positions[3] = vec2<f32>(cell_x + grid_params.cell_width, cell_y + grid_params.cell_height); // bottom-right
     
     let screen_size = vec2<f32>(grid_params.screen_width, grid_params.screen_height);
     let ndc_pos = pixel_to_ndc(positions[vertex_index], screen_size);
@@ -292,7 +327,29 @@ fn vs_cell_bg(
         bg = tmp;
     }
     
-    // Keep colors in sRGB space for legacy blending
+    // Check if this cell is selected (per-cell flag set by CPU, respects xlimit)
+    let is_selected = (attrs & ATTR_SELECTED_BIT) != 0u;
+    if is_selected {
+        fg = vec4<f32>(0.0, 0.0, 0.0, 1.0);  // Black foreground
+        bg = vec4<f32>(1.0, 1.0, 1.0, 1.0);  // White background
+    }
+    
+    // Check if this cell is the cursor
+    let is_cursor_cell = (i32(col) == grid_params.cursor_col) && (i32(row) == grid_params.cursor_row);
+    
+    // For default background (type 0), use fully transparent so the window's
+    // clear color (which has background_opacity applied) shows through.
+    // Only non-default backgrounds should be opaque.
+    // But NOT if the cell is selected (selection always has white bg)
+    let bg_type = cell.bg & 0xFFu;
+    if bg_type == COLOR_TYPE_DEFAULT && !is_reverse && !is_selected {
+        bg.a = 0.0;
+    }
+    
+    // Calculate cursor color - use fg color (inverted from bg) for visibility
+    // For block cursor, we'll use fg as the cursor background
+    var cursor_color = fg;
+    cursor_color.a = 1.0;
     
     var out: CellVertexOutput;
     out.clip_position = vec4<f32>(ndc_pos, 0.0, 1.0);
@@ -301,6 +358,11 @@ fn vs_cell_bg(
     out.bg_color = bg;
     out.is_background = 1u;
     out.is_colored_glyph = 0u;
+    out.is_cursor = select(0u, 1u, is_cursor_cell);
+    out.cursor_shape = grid_params.cursor_style;
+    out.cursor_color = cursor_color;
+    out.cell_pos = vec2<f32>(cell_x, cell_y);
+    out.cell_size = vec2<f32>(grid_params.cell_width, grid_params.cell_height);
     
     return out;
 }
@@ -344,27 +406,27 @@ fn vs_cell_glyph(
     }
     
     // Calculate cell pixel position
-    let cell_x = f32(col) * grid_params.cell_width;
+    let cell_x = grid_params.x_offset + f32(col) * grid_params.cell_width;
     let cell_y = grid_params.y_offset + f32(row) * grid_params.cell_height;
     
-    // Calculate glyph position (baseline-relative)
-    let baseline_y = cell_y + grid_params.cell_height * 0.8;
-    let glyph_x = cell_x + sprite.offset.x;
-    let glyph_y = baseline_y - sprite.offset.y - sprite.size.y;
+    // Kitty model: sprites are cell-sized with glyphs pre-positioned at baseline.
+    // Just map the sprite directly to the cell.
+    let glyph_x = cell_x;
+    let glyph_y = cell_y;
     
-    // Quad vertex positions
+    // Quad vertex positions for TriangleStrip (0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right)
     var positions: array<vec2<f32>, 4>;
-    positions[0] = vec2<f32>(glyph_x, glyph_y);
-    positions[1] = vec2<f32>(glyph_x + sprite.size.x, glyph_y);
-    positions[2] = vec2<f32>(glyph_x + sprite.size.x, glyph_y + sprite.size.y);
-    positions[3] = vec2<f32>(glyph_x, glyph_y + sprite.size.y);
+    positions[0] = vec2<f32>(glyph_x, glyph_y);                                  // top-left
+    positions[1] = vec2<f32>(glyph_x + sprite.size.x, glyph_y);                  // top-right
+    positions[2] = vec2<f32>(glyph_x, glyph_y + sprite.size.y);                  // bottom-left
+    positions[3] = vec2<f32>(glyph_x + sprite.size.x, glyph_y + sprite.size.y);  // bottom-right
     
-    // UV coordinates
+    // UV coordinates (matching vertex positions)
     var uvs: array<vec2<f32>, 4>;
-    uvs[0] = vec2<f32>(sprite.uv.x, sprite.uv.y);
-    uvs[1] = vec2<f32>(sprite.uv.x + sprite.uv.z, sprite.uv.y);
-    uvs[2] = vec2<f32>(sprite.uv.x + sprite.uv.z, sprite.uv.y + sprite.uv.w);
-    uvs[3] = vec2<f32>(sprite.uv.x, sprite.uv.y + sprite.uv.w);
+    uvs[0] = vec2<f32>(sprite.uv.x, sprite.uv.y);                                // top-left
+    uvs[1] = vec2<f32>(sprite.uv.x + sprite.uv.z, sprite.uv.y);                  // top-right
+    uvs[2] = vec2<f32>(sprite.uv.x, sprite.uv.y + sprite.uv.w);                  // bottom-left
+    uvs[3] = vec2<f32>(sprite.uv.x + sprite.uv.z, sprite.uv.y + sprite.uv.w);    // bottom-right
     
     let screen_size = vec2<f32>(grid_params.screen_width, grid_params.screen_height);
     let ndc_pos = pixel_to_ndc(positions[vertex_index], screen_size);
@@ -382,7 +444,22 @@ fn vs_cell_glyph(
         bg = tmp;
     }
     
-    // Keep colors in sRGB space for legacy blending (conversion happens in fragment shader)
+    // Check if this cell is selected (per-cell flag set by CPU, respects xlimit)
+    let is_selected = (attrs & ATTR_SELECTED_BIT) != 0u;
+    if is_selected {
+        fg = vec4<f32>(0.0, 0.0, 0.0, 1.0);  // Black foreground
+        bg = vec4<f32>(1.0, 1.0, 1.0, 1.0);  // White background
+    }
+    
+    // Check if this cell is the cursor
+    let is_cursor_cell = (i32(col) == grid_params.cursor_col) && (i32(row) == grid_params.cursor_row);
+    
+    // For block cursor, invert text color (use bg as fg)
+    var cursor_text_color = bg;
+    cursor_text_color.a = 1.0;
+    if is_cursor_cell && grid_params.cursor_style == CURSOR_BLOCK {
+        fg = cursor_text_color;
+    }
     
     var out: CellVertexOutput;
     out.clip_position = vec4<f32>(ndc_pos, 0.0, 1.0);
@@ -391,6 +468,11 @@ fn vs_cell_glyph(
     out.bg_color = bg;  // Pass background for legacy gamma blending
     out.is_background = 0u;
     out.is_colored_glyph = select(0u, 1u, is_colored);
+    out.is_cursor = select(0u, 1u, is_cursor_cell);
+    out.cursor_shape = grid_params.cursor_style;
+    out.cursor_color = cursor_text_color;
+    out.cell_pos = vec2<f32>(cell_x, cell_y);
+    out.cell_size = vec2<f32>(grid_params.cell_width, grid_params.cell_height);
     
     return out;
 }
@@ -399,19 +481,46 @@ fn vs_cell_glyph(
 @fragment
 fn fs_cell(in: CellVertexOutput) -> @location(0) vec4<f32> {
     if in.is_background == 1u {
-        // Background - just output the bg color
+        // Check if this is a cursor cell
+        if in.is_cursor == 1u {
+            // Calculate fragment position relative to cell
+            let frag_pos = in.clip_position.xy;
+            let cell_local = frag_pos - in.cell_pos;
+            
+            if in.cursor_shape == CURSOR_BLOCK {
+                // Block cursor - fill entire cell with cursor color
+                return in.cursor_color;
+            } else if in.cursor_shape == CURSOR_UNDERLINE {
+                // Underline cursor - bottom 10% or at least 2 pixels
+                let underline_height = max(2.0, in.cell_size.y * 0.1);
+                if cell_local.y >= in.cell_size.y - underline_height {
+                    return in.cursor_color;
+                }
+            } else if in.cursor_shape == CURSOR_BAR {
+                // Bar cursor - left 10% or at least 2 pixels
+                let bar_width = max(2.0, in.cell_size.x * 0.1);
+                if cell_local.x < bar_width {
+                    return in.cursor_color;
+                }
+            }
+        }
+        
+        // Normal background - just output the bg color
         return in.bg_color;
     }
     
-    // Glyph - sample from atlas
-    let glyph_alpha = textureSample(atlas_texture, atlas_sampler, in.uv).r;
+    // Glyph - sample from RGBA atlas
+    let glyph_sample = textureSample(atlas_texture, atlas_sampler, in.uv);
     
     if in.is_colored_glyph == 1u {
-        // Colored glyph (emoji) - use atlas color directly
-        // Note: For now we just use alpha since our atlas is single-channel
-        // Full emoji support would need an RGBA atlas
-        return vec4<f32>(in.fg_color.rgb, glyph_alpha);
+        // Colored glyph (emoji) - use atlas color directly with premultiplied alpha blending
+        // The atlas stores RGBA color from the emoji font
+        return glyph_sample;
     }
+    
+    // Regular glyph - atlas stores white (1,1,1) with alpha in A channel
+    // Use the alpha channel for text rendering
+    let glyph_alpha = glyph_sample.a;
     
     // Apply legacy gamma-incorrect blending for crisp text
     let adjusted_alpha = foreground_contrast_legacy(in.fg_color.rgb, glyph_alpha, in.bg_color.rgb);

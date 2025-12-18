@@ -9,12 +9,14 @@
 //! 2. Pass decoded codepoints to the text handler, not raw bytes
 //! 3. Control characters (LF, CR, TAB, BS, etc.) are handled inline in text drawing
 //! 4. Only ESC triggers state machine transitions
+//! 5. Use SIMD-accelerated byte search for finding escape sequence terminators
 
 /// Maximum number of CSI parameters.
 pub const MAX_CSI_PARAMS: usize = 256;
 
-/// Maximum length of an OSC string.
-const MAX_OSC_LEN: usize = 4096;
+/// Maximum length of an OSC string (same as escape length - no separate limit needed).
+/// Kitty doesn't have a separate OSC limit, just the overall escape sequence limit.
+const MAX_OSC_LEN: usize = 262144; // 256KB, same as MAX_ESCAPE_LEN
 
 /// Maximum length of an escape sequence before we give up.
 const MAX_ESCAPE_LEN: usize = 262144; // 256KB like Kitty
@@ -103,10 +105,11 @@ impl Utf8Decoder {
             let prev_state = self.state;
             match decode_utf8(&mut self.state, &mut self.codep, byte) {
                 UTF8_ACCEPT => {
-                    // Safe because we control the codepoint values from valid UTF-8
-                    if let Some(c) = char::from_u32(self.codep) {
-                        output.push(c);
-                    }
+                    // SAFETY: The DFA decoder guarantees valid Unicode codepoints when
+                    // state is ACCEPT. This is the same guarantee that Kitty relies on.
+                    // Using unchecked avoids a redundant validity check in the hot path.
+                    let c = unsafe { char::from_u32_unchecked(self.codep) };
+                    output.push(c);
                 }
                 UTF8_REJECT => {
                     // Invalid UTF-8 sequence
@@ -211,9 +214,13 @@ impl Default for CsiParams {
 
 impl CsiParams {
     /// Reset for a new CSI sequence.
+    /// Note: We don't zero the params/is_sub_param arrays since they're written before being read.
+    /// This avoids zeroing 1280 bytes on every CSI sequence.
+    #[inline]
     pub fn reset(&mut self) {
-        self.params = [0; MAX_CSI_PARAMS];
-        self.is_sub_param = [false; MAX_CSI_PARAMS];
+        // Don't zero arrays - individual elements are written before being read
+        // self.params = [0; MAX_CSI_PARAMS];      // Skip - saves 1024 bytes memset
+        // self.is_sub_param = [false; MAX_CSI_PARAMS]; // Skip - saves 256 bytes memset
         self.num_params = 0;
         self.primary = 0;
         self.secondary = 0;
@@ -672,96 +679,103 @@ impl Parser {
         handler.csi(&self.csi);
     }
 
-    /// Process OSC sequence bytes.
+    /// Process OSC sequence bytes using SIMD-accelerated terminator search.
+    /// Like Kitty's find_st_terminator + accumulate_st_terminated_esc_code.
     fn consume_osc<H: Handler>(&mut self, bytes: &[u8], pos: usize, handler: &mut H) -> usize {
-        let mut consumed = 0;
+        let remaining = &bytes[pos..];
         
-        while pos + consumed < bytes.len() {
-            let ch = bytes[pos + consumed];
-            consumed += 1;
-            self.escape_len += 1;
+        // Use SIMD-accelerated search to find BEL (0x07), ESC (0x1B), or C1 ST (0x9C)
+        // memchr2 finds either of two bytes; we check ESC specially for ESC \ sequence
+        // First, try to find BEL or C1 ST (the simple terminators)
+        if let Some(term_pos) = memchr::memchr3(0x07, 0x1B, 0x9C, remaining) {
+            let terminator = remaining[term_pos];
             
-            // Check for max length
-            if self.escape_len > MAX_ESCAPE_LEN || self.osc_buffer.len() > MAX_OSC_LEN {
+            // Check max length before accepting
+            if self.escape_len + term_pos > MAX_ESCAPE_LEN || self.osc_buffer.len() + term_pos > MAX_OSC_LEN {
                 log::debug!("OSC sequence too long, aborting");
                 self.state = State::Normal;
-                return consumed;
+                return remaining.len();
             }
             
-            match ch {
-                // BEL terminates OSC
+            match terminator {
                 0x07 => {
+                    // BEL terminator - copy data in bulk and dispatch
+                    self.osc_buffer.extend_from_slice(&remaining[..term_pos]);
                     handler.osc(&self.osc_buffer);
                     self.state = State::Normal;
-                    return consumed;
+                    self.escape_len += term_pos + 1;
+                    return term_pos + 1;
                 }
-                // ESC \ (ST) terminates OSC
+                0x9C => {
+                    // C1 ST terminator - copy data in bulk and dispatch
+                    self.osc_buffer.extend_from_slice(&remaining[..term_pos]);
+                    handler.osc(&self.osc_buffer);
+                    self.state = State::Normal;
+                    self.escape_len += term_pos + 1;
+                    return term_pos + 1;
+                }
                 0x1B => {
-                    // Need to peek at next byte
-                    if pos + consumed < bytes.len() && bytes[pos + consumed] == b'\\' {
-                        consumed += 1;
+                    // ESC found - check if followed by \ for ST
+                    if term_pos + 1 < remaining.len() && remaining[term_pos + 1] == b'\\' {
+                        // ESC \ (ST) terminator
+                        self.osc_buffer.extend_from_slice(&remaining[..term_pos]);
                         handler.osc(&self.osc_buffer);
                         self.state = State::Normal;
-                        return consumed;
-                    } else {
-                        // ESC not followed by \, dispatch what we have
+                        self.escape_len += term_pos + 2;
+                        return term_pos + 2;
+                    } else if term_pos + 1 < remaining.len() {
+                        // ESC not followed by \ - this is a new escape sequence
+                        // Copy everything before ESC and transition to Escape state
+                        self.osc_buffer.extend_from_slice(&remaining[..term_pos]);
                         handler.osc(&self.osc_buffer);
                         self.state = State::Escape;
-                        return consumed;
+                        self.escape_len += term_pos + 1;
+                        return term_pos + 1;
+                    } else {
+                        // ESC at end of buffer, need more data
+                        // Copy everything before ESC, keep ESC for next parse
+                        self.osc_buffer.extend_from_slice(&remaining[..term_pos]);
+                        self.escape_len += term_pos;
+                        return term_pos;
                     }
                 }
-                // C1 ST (0x9C) terminates OSC
-                0x9C => {
-                    handler.osc(&self.osc_buffer);
-                    self.state = State::Normal;
-                    return consumed;
-                }
-                _ => {
-                    self.osc_buffer.push(ch);
-                }
+                _ => unreachable!(),
             }
+        } else {
+            // No terminator found - check max length
+            if self.escape_len + remaining.len() > MAX_ESCAPE_LEN || self.osc_buffer.len() + remaining.len() > MAX_OSC_LEN {
+                log::debug!("OSC sequence too long, aborting");
+                self.state = State::Normal;
+                return remaining.len();
+            }
+            
+            // Buffer all remaining bytes for next parse call
+            self.osc_buffer.extend_from_slice(remaining);
+            self.escape_len += remaining.len();
+            return remaining.len();
         }
-        
-        consumed
     }
 
-    /// Process DCS/APC/PM/SOS sequence bytes (string commands terminated by ST).
+    /// Process DCS/APC/PM/SOS sequence bytes using SIMD-accelerated terminator search.
+    /// Like Kitty's find_st_terminator + accumulate_st_terminated_esc_code.
     fn consume_string_command<H: Handler>(&mut self, bytes: &[u8], pos: usize, handler: &mut H) -> usize {
-        let mut consumed = 0;
+        let remaining = &bytes[pos..];
         
-        while pos + consumed < bytes.len() {
-            let ch = bytes[pos + consumed];
-            consumed += 1;
-            self.escape_len += 1;
+        // Use SIMD-accelerated search to find ESC (0x1B) or C1 ST (0x9C)
+        if let Some(term_pos) = memchr::memchr2(0x1B, 0x9C, remaining) {
+            let terminator = remaining[term_pos];
             
-            // Check for max length
-            if self.escape_len > MAX_ESCAPE_LEN {
+            // Check max length before accepting
+            if self.escape_len + term_pos > MAX_ESCAPE_LEN {
                 log::debug!("String command too long, aborting");
                 self.state = State::Normal;
-                return consumed;
+                return remaining.len();
             }
             
-            match ch {
-                // ESC \ (ST) terminates
-                0x1B => {
-                    if pos + consumed < bytes.len() && bytes[pos + consumed] == b'\\' {
-                        consumed += 1;
-                        // Dispatch based on original state
-                        match self.state {
-                            State::Dcs => handler.dcs(&self.string_buffer),
-                            State::Apc => handler.apc(&self.string_buffer),
-                            State::Pm => handler.pm(&self.string_buffer),
-                            State::Sos => handler.sos(&self.string_buffer),
-                            _ => {}
-                        }
-                        self.state = State::Normal;
-                        return consumed;
-                    } else {
-                        self.string_buffer.push(ch);
-                    }
-                }
-                // C1 ST (0x9C) terminates
+            match terminator {
                 0x9C => {
+                    // C1 ST terminator - copy data in bulk and dispatch
+                    self.string_buffer.extend_from_slice(&remaining[..term_pos]);
                     match self.state {
                         State::Dcs => handler.dcs(&self.string_buffer),
                         State::Apc => handler.apc(&self.string_buffer),
@@ -770,15 +784,55 @@ impl Parser {
                         _ => {}
                     }
                     self.state = State::Normal;
-                    return consumed;
+                    self.escape_len += term_pos + 1;
+                    return term_pos + 1;
                 }
-                _ => {
-                    self.string_buffer.push(ch);
+                0x1B => {
+                    // ESC found - check if followed by \ for ST
+                    if term_pos + 1 < remaining.len() && remaining[term_pos + 1] == b'\\' {
+                        // ESC \ (ST) terminator
+                        self.string_buffer.extend_from_slice(&remaining[..term_pos]);
+                        match self.state {
+                            State::Dcs => handler.dcs(&self.string_buffer),
+                            State::Apc => handler.apc(&self.string_buffer),
+                            State::Pm => handler.pm(&self.string_buffer),
+                            State::Sos => handler.sos(&self.string_buffer),
+                            _ => {}
+                        }
+                        self.state = State::Normal;
+                        self.escape_len += term_pos + 2;
+                        return term_pos + 2;
+                    } else if term_pos + 1 < remaining.len() {
+                        // ESC not followed by \ - include ESC in data and continue
+                        // (Unlike OSC, string commands include raw ESC that isn't ST)
+                        self.string_buffer.extend_from_slice(&remaining[..=term_pos]);
+                        self.escape_len += term_pos + 1;
+                        // Continue searching from after this ESC
+                        let consumed = term_pos + 1;
+                        return consumed + self.consume_string_command(bytes, pos + consumed, handler);
+                    } else {
+                        // ESC at end of buffer, need more data
+                        // Copy everything before ESC, keep ESC for next parse
+                        self.string_buffer.extend_from_slice(&remaining[..term_pos]);
+                        self.escape_len += term_pos;
+                        return term_pos;
+                    }
                 }
+                _ => unreachable!(),
             }
+        } else {
+            // No terminator found - check max length
+            if self.escape_len + remaining.len() > MAX_ESCAPE_LEN {
+                log::debug!("String command too long, aborting");
+                self.state = State::Normal;
+                return remaining.len();
+            }
+            
+            // Buffer all remaining bytes for next parse call
+            self.string_buffer.extend_from_slice(remaining);
+            self.escape_len += remaining.len();
+            return remaining.len();
         }
-        
-        consumed
     }
 }
 
