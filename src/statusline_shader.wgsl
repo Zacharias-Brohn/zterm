@@ -69,8 +69,10 @@ struct StatuslineCell {
 struct SpriteInfo {
     // UV coordinates in atlas (x, y, width, height) - normalized 0-1
     uv: vec4<f32>,
-    // Padding
-    _padding: vec2<f32>,
+    // Atlas layer index (z-coordinate for texture array)
+    layer: f32,
+    // Padding for alignment
+    _padding: f32,
     // Size in pixels (width, height)
     size: vec2<f32>,
 }
@@ -101,7 +103,7 @@ struct ColorTable {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 @group(0) @binding(0)
-var atlas_texture: texture_2d<f32>;
+var atlas_texture: texture_2d_array<f32>;
 @group(0) @binding(1)
 var atlas_sampler: sampler;
 
@@ -138,6 +140,7 @@ struct VertexOutput {
     @location(2) bg_color: vec4<f32>,
     @location(3) @interpolate(flat) is_background: u32,
     @location(4) @interpolate(flat) is_colored_glyph: u32,
+    @location(5) @interpolate(flat) glyph_layer: i32,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -222,6 +225,7 @@ fn vs_statusline_bg(
     out.bg_color = bg;
     out.is_background = 1u;
     out.is_colored_glyph = 0u;
+    out.glyph_layer = 0;
     
     return out;
 }
@@ -293,6 +297,7 @@ fn vs_statusline_glyph(
     out.bg_color = bg;
     out.is_background = 0u;
     out.is_colored_glyph = select(0u, 1u, is_colored);
+    out.glyph_layer = i32(sprite.layer);
     
     return out;
 }
@@ -307,8 +312,8 @@ fn fs_statusline(in: VertexOutput) -> @location(0) vec4<f32> {
         return in.bg_color;
     }
     
-    // Sample glyph from atlas
-    let glyph_sample = textureSample(atlas_texture, atlas_sampler, in.uv);
+    // Sample glyph from atlas (using layer for texture array)
+    let glyph_sample = textureSample(atlas_texture, atlas_sampler, in.uv, in.glyph_layer);
     
     if in.is_colored_glyph == 1u {
         // Colored glyph (emoji) - use atlas color directly

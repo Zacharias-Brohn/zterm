@@ -35,7 +35,10 @@ pub struct Cell {
     pub bg_color: Color,
     pub bold: bool,
     pub italic: bool,
-    pub underline: bool,
+    /// Underline style: 0=none, 1=single, 2=double, 3=curly, 4=dotted, 5=dashed
+    pub underline_style: u8,
+    /// Strikethrough decoration
+    pub strikethrough: bool,
     /// If true, this cell is the continuation of a wide (double-width) character.
     /// The actual character is stored in the previous cell.
     pub wide_continuation: bool,
@@ -49,7 +52,8 @@ impl Default for Cell {
             bg_color: Color::Default,
             bold: false,
             italic: false,
-            underline: false,
+            underline_style: 0,
+            strikethrough: false,
             wide_continuation: false,
         }
     }
@@ -244,7 +248,8 @@ struct SavedCursor {
     bg: Color,
     bold: bool,
     italic: bool,
-    underline: bool,
+    underline_style: u8,
+    strikethrough: bool,
 }
 
 /// Alternate screen buffer state.
@@ -447,8 +452,10 @@ pub struct Terminal {
     pub current_bold: bool,
     /// Current italic state.
     pub current_italic: bool,
-    /// Current underline state.
-    pub current_underline: bool,
+    /// Current underline style (0=none, 1=single, 2=double, 3=curly, 4=dotted, 5=dashed).
+    pub current_underline_style: u8,
+    /// Current strikethrough state.
+    pub current_strikethrough: bool,
     /// Whether the terminal content has changed.
     pub dirty: bool,
     /// Bitmap of dirty lines - bit N is set if line N needs redrawing.
@@ -539,7 +546,8 @@ impl Terminal {
             current_bg: Color::Default,
             current_bold: false,
             current_italic: false,
-            current_underline: false,
+            current_underline_style: 0,
+            current_strikethrough: false,
             dirty: true,
             dirty_lines: [!0u64; 4], // All lines dirty initially
             scroll_top: 0,
@@ -672,7 +680,8 @@ impl Terminal {
             bg_color: self.current_bg,
             bold: false,
             italic: false,
-            underline: false,
+            underline_style: 0,
+            strikethrough: false,
             wide_continuation: false,
         }
     }
@@ -1307,7 +1316,8 @@ impl Handler for Terminal {
                         bg_color: self.current_bg,
                         bold: self.current_bold,
                         italic: self.current_italic,
-                        underline: self.current_underline,
+                        underline_style: self.current_underline_style,
+                        strikethrough: self.current_strikethrough,
                         wide_continuation: false,
                     };
                     self.cursor_col += 1;
@@ -1382,7 +1392,8 @@ impl Handler for Terminal {
                         bg_color: self.current_bg,
                         bold: self.current_bold,
                         italic: self.current_italic,
-                        underline: self.current_underline,
+                        underline_style: self.current_underline_style,
+                        strikethrough: self.current_strikethrough,
                         wide_continuation: false,
                     };
                     self.cursor_col += 1;
@@ -1393,15 +1404,16 @@ impl Handler for Terminal {
                            && self.grid[grid_row][self.cursor_col + 1].wide_continuation {
                             self.grid[grid_row][self.cursor_col + 1] = Cell::default();
                         }
-                        self.grid[grid_row][self.cursor_col] = Cell {
-                            character: ' ',
-                            fg_color: self.current_fg,
-                            bg_color: self.current_bg,
-                            bold: self.current_bold,
-                            italic: self.current_italic,
-                            underline: self.current_underline,
-                            wide_continuation: true,
-                        };
+                    self.grid[grid_row][self.cursor_col] = Cell {
+                        character: c,
+                        fg_color: self.current_fg,
+                        bg_color: self.current_bg,
+                        bold: self.current_bold,
+                        italic: self.current_italic,
+                        underline_style: self.current_underline_style,
+                        strikethrough: self.current_strikethrough,
+                        wide_continuation: false,
+                    };
                         self.cursor_col += 1;
                     }
                 }
@@ -1891,7 +1903,8 @@ impl Handler for Terminal {
             bg: self.current_bg,
             bold: self.current_bold,
             italic: self.current_italic,
-            underline: self.current_underline,
+            underline_style: self.current_underline_style,
+            strikethrough: self.current_strikethrough,
         };
         log::debug!("ESC 7: Cursor saved at ({}, {})", self.cursor_col, self.cursor_row);
     }
@@ -1903,7 +1916,8 @@ impl Handler for Terminal {
         self.current_bg = self.saved_cursor.bg;
         self.current_bold = self.saved_cursor.bold;
         self.current_italic = self.saved_cursor.italic;
-        self.current_underline = self.saved_cursor.underline;
+        self.current_underline_style = self.saved_cursor.underline_style;
+        self.current_strikethrough = self.saved_cursor.strikethrough;
         log::debug!("ESC 8: Cursor restored to ({}, {})", self.cursor_col, self.cursor_row);
     }
 
@@ -1912,7 +1926,8 @@ impl Handler for Terminal {
         self.current_bg = Color::Default;
         self.current_bold = false;
         self.current_italic = false;
-        self.current_underline = false;
+        self.current_underline_style = 0;
+        self.current_strikethrough = false;
         self.cursor_col = 0;
         self.cursor_row = 0;
         self.cursor_visible = true;
@@ -1983,13 +1998,14 @@ impl Handler for Terminal {
         for visual_row in 0..self.rows {
             let grid_row = self.line_map[visual_row];
             for cell in &mut self.grid[grid_row] {
-                *cell = Cell {
+                            *cell = Cell {
                     character: 'E',
                     fg_color: Color::Default,
                     bg_color: Color::Default,
                     bold: false,
                     italic: false,
-                    underline: false,
+                    underline_style: 0,
+                    strikethrough: false,
                     wide_continuation: false,
                 };
             }
@@ -2064,15 +2080,16 @@ impl Terminal {
         }
         
         // Write the character to the first cell
-        self.grid[grid_row][self.cursor_col] = Cell {
-            character: c,
-            fg_color: self.current_fg,
-            bg_color: self.current_bg,
-            bold: self.current_bold,
-            italic: self.current_italic,
-            underline: self.current_underline,
-            wide_continuation: false,
-        };
+                    self.grid[grid_row][self.cursor_col] = Cell {
+                        character: c,
+                        fg_color: self.current_fg,
+                        bg_color: self.current_bg,
+                        bold: self.current_bold,
+                        italic: self.current_italic,
+                        underline_style: self.current_underline_style,
+                        strikethrough: self.current_strikethrough,
+                        wide_continuation: false,
+                    };
         self.mark_line_dirty(self.cursor_row);
         self.cursor_col += 1;
         
@@ -2091,7 +2108,8 @@ impl Terminal {
                 bg_color: self.current_bg,
                 bold: self.current_bold,
                 italic: self.current_italic,
-                underline: self.current_underline,
+                underline_style: self.current_underline_style,
+                strikethrough: self.current_strikethrough,
                 wide_continuation: true,
             };
             self.cursor_col += 1;
@@ -2105,7 +2123,8 @@ impl Terminal {
             self.current_bg = Color::Default;
             self.current_bold = false;
             self.current_italic = false;
-            self.current_underline = false;
+            self.current_underline_style = 0;
+            self.current_strikethrough = false;
             return;
         }
 
@@ -2119,16 +2138,30 @@ impl Terminal {
                     self.current_bg = Color::Default;
                     self.current_bold = false;
                     self.current_italic = false;
-                    self.current_underline = false;
+                    self.current_underline_style = 0;
+                    self.current_strikethrough = false;
                 }
                 1 => self.current_bold = true,
                 3 => self.current_italic = true,
-                4 => self.current_underline = true,
+                4 => {
+                    // Check for sub-parameter (4:x format for underline style)
+                    if i + 1 < params.num_params && params.is_sub_param[i + 1] {
+                        let style = params.params[i + 1];
+                        // 0=none, 1=single, 2=double, 3=curly, 4=dotted, 5=dashed
+                        self.current_underline_style = (style as u8).min(5);
+                        i += 1;
+                    } else {
+                        // Plain SGR 4 = single underline
+                        self.current_underline_style = 1;
+                    }
+                }
                 7 => std::mem::swap(&mut self.current_fg, &mut self.current_bg),
+                9 => self.current_strikethrough = true,
                 22 => self.current_bold = false,
                 23 => self.current_italic = false,
-                24 => self.current_underline = false,
+                24 => self.current_underline_style = 0,
                 27 => std::mem::swap(&mut self.current_fg, &mut self.current_bg),
+                29 => self.current_strikethrough = false,
                 30..=37 => self.current_fg = Color::Indexed((code - 30) as u8),
                 38 => {
                     // Extended foreground color

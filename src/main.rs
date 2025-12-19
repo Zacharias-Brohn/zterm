@@ -1599,8 +1599,8 @@ impl App {
         // Use raw available pixel space so layout can handle cell alignment properly
         let (cell_width, cell_height, available_width, available_height) = {
             let Some(renderer) = &self.renderer else { return };
-            let cell_width = renderer.cell_width;
-            let cell_height = renderer.cell_height;
+            let cell_width = renderer.cell_metrics.cell_width as f32;
+            let cell_height = renderer.cell_metrics.cell_height as f32;
             let (available_width, available_height) = renderer.available_grid_space();
             (cell_width, cell_height, available_width, available_height)
         };

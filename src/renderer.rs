@@ -250,8 +250,13 @@ impl EdgeGlow {
     }
 }
 
-/// Size of the glyph atlas texture.
-const ATLAS_SIZE: u32 = 1024;
+/// Size of the glyph atlas texture (like Kitty's max_texture_size).
+/// 8192x8192 provides massive capacity before needing additional layers.
+const ATLAS_SIZE: u32 = 8192;
+
+/// Maximum number of atlas layers (like Kitty's max_array_len).
+/// With 8192x8192 per layer, this provides virtually unlimited glyph storage.
+const MAX_ATLAS_LAYERS: u32 = 64;
 
 /// Bytes per pixel in the RGBA atlas (4 for RGBA8).
 const ATLAS_BPP: u32 = 4;
@@ -267,6 +272,8 @@ struct GlyphInfo {
     size: [f32; 2],
     /// Whether this is a colored glyph (emoji).
     is_colored: bool,
+    /// Atlas layer index (z-coordinate for texture array).
+    layer: f32,
 }
 
 /// Wrapper to hold the rustybuzz Face with a 'static lifetime.
@@ -460,6 +467,26 @@ pub const ATTR_SELECTED: u32 = 0x100; // Cell is selected (for selection highlig
 /// Flag for colored glyphs (emoji).
 pub const COLORED_GLYPH_FLAG: u32 = 0x80000000;
 
+/// Pre-rendered cursor sprite indices (like Kitty's cursor_shape_map).
+/// These sprites are created at fixed indices in the sprite array after initialization.
+/// Index 0 is reserved for "no glyph" (empty cell).
+pub const CURSOR_SPRITE_BEAM: u32 = 1;      // Bar/beam cursor (vertical line on left)
+pub const CURSOR_SPRITE_UNDERLINE: u32 = 2; // Underline cursor (horizontal line at bottom)
+pub const CURSOR_SPRITE_HOLLOW: u32 = 3;    // Hollow/unfocused cursor (outline rectangle)
+
+/// Pre-rendered decoration sprite indices (like Kitty's decoration sprites).
+/// These are created after cursor sprites and used for text decorations.
+/// The shader uses these to render underlines, strikethrough, etc.
+pub const DECORATION_SPRITE_STRIKETHROUGH: u32 = 4;    // Strikethrough line
+pub const DECORATION_SPRITE_UNDERLINE: u32 = 5;        // Single underline
+pub const DECORATION_SPRITE_DOUBLE_UNDERLINE: u32 = 6; // Double underline
+pub const DECORATION_SPRITE_UNDERCURL: u32 = 7;        // Wavy/curly underline
+pub const DECORATION_SPRITE_DOTTED: u32 = 8;           // Dotted underline
+pub const DECORATION_SPRITE_DASHED: u32 = 9;           // Dashed underline
+
+/// First available sprite index for regular glyphs (after reserved cursor and decoration sprites)
+pub const FIRST_GLYPH_SPRITE: u32 = 10;
+
 /// Sprite info for glyph positioning.
 /// Matches SpriteInfo in glyph_shader.wgsl exactly.
 /// 
@@ -471,25 +498,48 @@ pub const COLORED_GLYPH_FLAG: u32 = 0x80000000;
 pub struct SpriteInfo {
     /// UV coordinates in atlas (x, y, width, height) - normalized 0-1
     pub uv: [f32; 4],
-    /// Padding to maintain alignment (previously offset, now unused)
-    pub _padding: [f32; 2],
+    /// Atlas layer index (z-coordinate for texture array) and padding
+    /// layer is the first f32, second f32 is unused padding
+    pub layer: f32,
+    pub _padding: f32,
     /// Size in pixels (width, height) - always matches cell dimensions
     pub size: [f32; 2],
 }
 
+/// Font cell metrics with integer dimensions (like Kitty's FontCellMetrics).
+/// Using integers ensures pixel-perfect alignment and avoids floating-point precision issues.
+#[derive(Copy, Clone, Debug)]
+pub struct FontCellMetrics {
+    /// Cell width in pixels (computed using ceil from font advance).
+    pub cell_width: u32,
+    /// Cell height in pixels (computed using ceil from font height).
+    pub cell_height: u32,
+    /// Baseline offset from top of cell in pixels.
+    pub baseline: u32,
+    /// Y position for underline (from top of cell, in pixels).
+    /// Computed from font metrics: ascender - underline_position.
+    pub underline_position: u32,
+    /// Thickness of underline in pixels.
+    pub underline_thickness: u32,
+    /// Y position for strikethrough (from top of cell, in pixels).
+    /// Typically around 65% of baseline from top.
+    pub strikethrough_position: u32,
+    /// Thickness of strikethrough in pixels.
+    pub strikethrough_thickness: u32,
+}
+
 /// Grid parameters uniform for instanced rendering.
 /// Matches GridParams in glyph_shader.wgsl exactly.
+/// Uses Kitty-style NDC positioning: viewport is set per-pane, so shader
+/// works in pure NDC space without needing pixel offsets.
+/// Cell dimensions are integers like Kitty for pixel-perfect rendering.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct GridParams {
     cols: u32,
     rows: u32,
-    cell_width: f32,
-    cell_height: f32,
-    screen_width: f32,
-    screen_height: f32,
-    x_offset: f32,
-    y_offset: f32,
+    cell_width: u32,
+    cell_height: u32,
     cursor_col: i32,
     cursor_row: i32,
     cursor_style: u32,
@@ -603,10 +653,17 @@ pub struct Renderer {
     /// Cached GPU textures for images, keyed by image ID.
     image_textures: HashMap<u32, GpuImage>,
 
-    // Atlas texture
+    // Atlas texture (2D array like Kitty for virtually unlimited glyph storage)
     atlas_texture: wgpu::Texture,
-    atlas_data: Vec<u8>,
-    atlas_dirty: bool,
+    atlas_view: wgpu::TextureView,
+    /// Atlas sampler - stored for use when recreating bind group after layer addition
+    atlas_sampler: wgpu::Sampler,
+    /// Bind group layout for glyph rendering - needed to recreate bind group after texture changes
+    glyph_bind_group_layout: wgpu::BindGroupLayout,
+    /// Number of currently allocated layers in the GPU texture
+    atlas_num_layers: u32,
+    /// Current layer being written to (z-coordinate)
+    atlas_current_layer: u32,
 
     // Font and shaping
     #[allow(dead_code)] // Kept alive for rustybuzz::Face and FontRef which borrow it
@@ -658,12 +715,9 @@ pub struct Renderer {
     /// Scale factor to convert font units to pixels.
     /// This is font_size / height_unscaled, matching ab_glyph's calculation.
     font_units_to_px: f32,
-    /// Cell dimensions in pixels.
-    pub cell_width: f32,
-    pub cell_height: f32,
-    /// Baseline offset from top of cell in pixels.
-    /// Glyphs are positioned so their baseline sits at this Y position within the cell.
-    baseline: f32,
+    /// Font cell metrics with integer dimensions (like Kitty).
+    /// Using integers ensures pixel-perfect alignment and avoids floating-point precision issues.
+    pub cell_metrics: FontCellMetrics,
     /// Window dimensions.
     pub width: u32,
     pub height: u32,
@@ -1953,40 +2007,73 @@ impl Renderer {
         let scaled_font = primary_font.as_scaled(font_size);
         
         // Get advance width for 'M' (em width)
+        // Like Kitty, use ceil() to ensure glyphs always fit in cells
         let m_glyph_id = primary_font.glyph_id('M');
-        let cell_width = scaled_font.h_advance(m_glyph_id).round();
+        let cell_width = scaled_font.h_advance(m_glyph_id).ceil() as u32;
 
         // Use font line metrics for cell height
         // ab_glyph's height() = ascent - descent (where descent is negative)
-        let cell_height = scaled_font.height().round();
+        // Like Kitty, use ceil() to ensure glyphs always fit
+        let cell_height = scaled_font.height().ceil() as u32;
         
         // Calculate baseline offset from top of cell.
         // The baseline is where the bottom of uppercase letters sit.
         // ascent is the distance from baseline to top of tallest glyph.
-        let baseline = scaled_font.ascent().round();
+        let baseline = scaled_font.ascent().ceil() as u32;
+        
+        // Calculate underline position and thickness (like Kitty's freetype.c)
+        // Use DPI-aware thickness calculation: thickness_pts * dpi / 72.0
+        let underline_thickness = ((1.0 * dpi / 72.0).round() as u32).max(1).min(cell_height);
+        // Underline position is typically just below the baseline
+        // Kitty computes: ascender - underline_position from font metrics
+        // Since we don't have direct access to OS/2 table, use baseline + small offset
+        let underline_position = (baseline + underline_thickness).min(cell_height - 1);
+        
+        // Calculate strikethrough position and thickness (like Kitty)
+        // Kitty: strikethrough_position = floor(baseline * 0.65) if not in font metrics
+        let strikethrough_position = ((baseline as f32 * 0.65).floor() as u32).min(cell_height - 1);
+        let strikethrough_thickness = underline_thickness; // Same as underline by default
+        
+        // Create FontCellMetrics struct (like Kitty)
+        let cell_metrics = FontCellMetrics {
+            cell_width,
+            cell_height,
+            baseline,
+            underline_position,
+            underline_thickness,
+            strikethrough_position,
+            strikethrough_thickness,
+        };
         
         // Calculate the correct scale factor for converting font units to pixels.
         // This matches ab_glyph's calculation: scale / height_unscaled
         // where height_unscaled = ascent - descent (the font's natural line height).
         let font_units_to_px = font_size / primary_font.height_unscaled();
 
-        // Create atlas texture
+        // Create atlas texture as a 2D array (like Kitty) for virtually unlimited glyph storage.
+        // Start with 1 layer, grow dynamically as needed.
+        let initial_layers = 1u32;
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Glyph Atlas"),
+            label: Some("Glyph Atlas Array"),
             size: wgpu::Extent3d {
                 width: ATLAS_SIZE,
                 height: ATLAS_SIZE,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: initial_layers,
             },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING 
+                 | wgpu::TextureUsages::COPY_DST 
+                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 
-        let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -1996,7 +2083,7 @@ impl Renderer {
             ..Default::default()
         });
 
-        // Create bind group layout
+        // Create bind group layout - use D2Array for texture array
         let glyph_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Glyph Bind Group Layout"),
@@ -2006,7 +2093,7 @@ impl Renderer {
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
+                            view_dimension: wgpu::TextureViewDimension::D2Array,
                             multisampled: false,
                         },
                         count: None,
@@ -2817,7 +2904,7 @@ impl Renderer {
             cache: None,
         });
 
-        Self {
+        let mut renderer = Self {
             surface,
             device,
             queue,
@@ -2832,8 +2919,9 @@ impl Renderer {
             image_sampler,
             image_textures: HashMap::new(),
             atlas_texture,
-            atlas_data: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * ATLAS_BPP) as usize],
-            atlas_dirty: false,
+            atlas_view,
+            atlas_num_layers: initial_layers,
+            atlas_current_layer: 0,
             font_data,
             primary_font,
             font_variants,
@@ -2859,9 +2947,7 @@ impl Renderer {
             dpi,
             font_size,
             font_units_to_px,
-            cell_width,
-            cell_height,
-            baseline,
+            cell_metrics,
             width: size.width,
             height: size.height,
             palette: ColorPalette::default(),
@@ -2920,20 +3006,30 @@ impl Renderer {
             overlay_quads: Vec::with_capacity(32),
             overlay_quad_buffer,
             overlay_quad_bind_group,
-        }
+            // Store sampler and layout for atlas layer growth (bind group recreation)
+            atlas_sampler,
+            glyph_bind_group_layout,
+        };
+        
+        // Create pre-rendered cursor sprites at fixed indices (like Kitty's send_prerendered_sprites)
+        renderer.create_cursor_sprites();
+        // Create pre-rendered decoration sprites (underline, undercurl, strikethrough, etc.)
+        renderer.create_decoration_sprites();
+        
+        renderer
     }
 
     /// Returns the height of the tab bar in pixels (one cell height, or 0 if hidden).
     pub fn tab_bar_height(&self) -> f32 {
         match self.tab_bar_position {
             TabBarPosition::Hidden => 0.0,
-            _ => self.cell_height,
+            _ => self.cell_metrics.cell_height as f32,
         }
     }
 
     /// Returns the height of the statusline in pixels (one cell height).
     pub fn statusline_height(&self) -> f32 {
-        self.cell_height
+        self.cell_metrics.cell_height as f32
     }
 
     /// Returns the Y position where the statusline starts.
@@ -2977,8 +3073,8 @@ impl Renderer {
     /// Calculates terminal dimensions in cells, accounting for tab bar and statusline.
     pub fn terminal_size(&self) -> (usize, usize) {
         let available_height = self.height as f32 - self.tab_bar_height() - self.statusline_height();
-        let cols = (self.width as f32 / self.cell_width).floor() as usize;
-        let rows = (available_height / self.cell_height).floor() as usize;
+        let cols = (self.width as f32 / self.cell_metrics.cell_width as f32).floor() as usize;
+        let rows = (available_height / self.cell_metrics.cell_height as f32).floor() as usize;
         (cols.max(1), rows.max(1))
     }
 
@@ -3004,7 +3100,7 @@ impl Renderer {
             self.grid_used_width
         } else {
             let (cols, _) = self.terminal_size();
-            cols as f32 * self.cell_width
+            cols as f32 * self.cell_metrics.cell_width as f32
         };
         (self.width as f32 - used_width) / 2.0
     }
@@ -3016,7 +3112,7 @@ impl Renderer {
             self.grid_used_height
         } else {
             let (_, rows) = self.terminal_size();
-            rows as f32 * self.cell_height
+            rows as f32 * self.cell_metrics.cell_height as f32
         };
         let available_height = self.height as f32 - self.tab_bar_height() - self.statusline_height();
         (available_height - used_height) / 2.0
@@ -3053,7 +3149,7 @@ impl Renderer {
         
         // Use a larger epsilon to account for cell-alignment gaps in split panes
         // With cell-aligned splits, gaps can be up to one cell height
-        let epsilon = self.cell_height.max(self.cell_width);
+        let epsilon = (self.cell_metrics.cell_height.max(self.cell_metrics.cell_width)) as f32;
         
         // Left edge at screen boundary - extend to screen left edge
         if pane_x < epsilon {
@@ -3109,7 +3205,7 @@ impl Renderer {
         
         // Use a larger epsilon to account for cell-alignment gaps in split panes
         // With cell-aligned splits, gaps can be up to one cell height
-        let epsilon = self.cell_height.max(self.cell_width);
+        let epsilon = (self.cell_metrics.cell_height.max(self.cell_metrics.cell_width)) as f32;
         
         // Left edge at screen boundary - extend to screen left edge
         if pane_x < epsilon {
@@ -3179,8 +3275,8 @@ impl Renderer {
         }
 
         // Calculate cell position
-        let col = (grid_x / self.cell_width).floor() as usize;
-        let row = (grid_y / self.cell_height).floor() as usize;
+        let col = (grid_x / self.cell_metrics.cell_width as f32).floor() as usize;
+        let row = (grid_y / self.cell_metrics.cell_height as f32).floor() as usize;
 
         // Get terminal dimensions to check bounds
         let (max_cols, max_rows) = self.terminal_size();
@@ -3200,8 +3296,8 @@ impl Renderer {
             return false;
         }
 
-        let old_cell_width = self.cell_width;
-        let old_cell_height = self.cell_height;
+        let old_cell_width = self.cell_metrics.cell_width;
+        let old_cell_height = self.cell_metrics.cell_height;
 
         self.scale_factor = new_scale;
         self.dpi = 96.0 * new_scale;
@@ -3210,46 +3306,37 @@ impl Renderer {
         self.font_size = (self.base_font_size * new_scale as f32).round();
 
         // Recalculate cell dimensions using ab_glyph
+        // Like Kitty, use ceil() to ensure glyphs always fit
         let scaled_font = self.primary_font.as_scaled(self.font_size);
         let m_glyph_id = self.primary_font.glyph_id('M');
-        self.cell_width = scaled_font.h_advance(m_glyph_id).round();
-        self.cell_height = scaled_font.height().round();
+        self.cell_metrics.cell_width = scaled_font.h_advance(m_glyph_id).ceil() as u32;
+        self.cell_metrics.cell_height = scaled_font.height().ceil() as u32;
+        
+        // Update baseline - critical for correct glyph positioning!
+        // Like Kitty, baseline is the font's ascent (distance from baseline to top of glyphs).
+        self.cell_metrics.baseline = scaled_font.ascent().ceil() as u32;
+        
+        // Update underline/strikethrough metrics
+        let underline_thickness = ((1.0 * self.dpi / 72.0).round() as u32).max(1).min(self.cell_metrics.cell_height);
+        self.cell_metrics.underline_thickness = underline_thickness;
+        self.cell_metrics.underline_position = (self.cell_metrics.baseline + underline_thickness).min(self.cell_metrics.cell_height - 1);
+        self.cell_metrics.strikethrough_position = ((self.cell_metrics.baseline as f32 * 0.65).floor() as u32).min(self.cell_metrics.cell_height - 1);
+        self.cell_metrics.strikethrough_thickness = underline_thickness;
         
         // Update the font units to pixels scale factor
         self.font_units_to_px = self.font_size / self.primary_font.height_unscaled();
 
         log::info!(
-            "Scale factor changed to {}: font {}px -> {}px, cell: {}x{}",
-            new_scale, self.base_font_size, self.font_size, self.cell_width, self.cell_height
+            "Scale factor changed to {}: font {}px -> {}px, cell: {}x{}, baseline: {}",
+            new_scale, self.base_font_size, self.font_size, self.cell_metrics.cell_width, self.cell_metrics.cell_height, self.cell_metrics.baseline
         );
 
-        // Clear all glyph caches - they were rendered at the old size
-        self.char_cache.clear();
-        self.ligature_cache.clear();
-        self.glyph_cache.clear();
-
-        // Reset atlas and sprite tracking
-        self.atlas_cursor_x = 0;
-        self.atlas_cursor_y = 0;
-        self.atlas_row_height = 0;
-        self.atlas_data.fill(0);
-        self.atlas_dirty = true;
-        
-        // Clear sprite maps since sprite indices are now invalid
-        self.sprite_map.clear();
-        self.sprite_info.clear();
-        self.sprite_info.push(SpriteInfo::default());
-        self.next_sprite_idx = 1;
-        self.cells_dirty = true;
-        
-        self.statusline_sprite_map.clear();
-        self.statusline_sprite_info.clear();
-        self.statusline_sprite_info.push(SpriteInfo::default());
-        self.statusline_next_sprite_idx = 1;
+        // Reset atlas and all sprite/glyph caches (includes cursor sprite creation)
+        self.reset_atlas();
 
         // Return true if cell dimensions changed
-        (self.cell_width - old_cell_width).abs() > 0.01
-            || (self.cell_height - old_cell_height).abs() > 0.01
+        self.cell_metrics.cell_width != old_cell_width
+            || self.cell_metrics.cell_height != old_cell_height
     }
 
     /// Set the background opacity for transparent terminal rendering.
@@ -3269,8 +3356,8 @@ impl Renderer {
             return false;
         }
 
-        let old_cell_width = self.cell_width;
-        let old_cell_height = self.cell_height;
+        let old_cell_width = self.cell_metrics.cell_width;
+        let old_cell_height = self.cell_metrics.cell_height;
 
         self.base_font_size = size;
         
@@ -3278,54 +3365,47 @@ impl Renderer {
         self.font_size = (size * self.scale_factor as f32).round();
 
         // Recalculate cell dimensions using ab_glyph
+        // Like Kitty, use ceil() to ensure glyphs always fit
         let scaled_font = self.primary_font.as_scaled(self.font_size);
         let m_glyph_id = self.primary_font.glyph_id('M');
-        self.cell_width = scaled_font.h_advance(m_glyph_id).round();
-        self.cell_height = scaled_font.height().round();
+        self.cell_metrics.cell_width = scaled_font.h_advance(m_glyph_id).ceil() as u32;
+        self.cell_metrics.cell_height = scaled_font.height().ceil() as u32;
+        
+        // Update baseline - critical for correct glyph positioning!
+        // Like Kitty, baseline is the font's ascent (distance from baseline to top of glyphs).
+        self.cell_metrics.baseline = scaled_font.ascent().ceil() as u32;
+        
+        // Update underline/strikethrough metrics
+        let underline_thickness = ((1.0 * self.dpi / 72.0).round() as u32).max(1).min(self.cell_metrics.cell_height);
+        self.cell_metrics.underline_thickness = underline_thickness;
+        self.cell_metrics.underline_position = (self.cell_metrics.baseline + underline_thickness).min(self.cell_metrics.cell_height - 1);
+        self.cell_metrics.strikethrough_position = ((self.cell_metrics.baseline as f32 * 0.65).floor() as u32).min(self.cell_metrics.cell_height - 1);
+        self.cell_metrics.strikethrough_thickness = underline_thickness;
         
         // Update the font units to pixels scale factor
         self.font_units_to_px = self.font_size / self.primary_font.height_unscaled();
 
         log::info!(
-            "Font size changed to {}px -> {}px, cell: {}x{}",
-            size, self.font_size, self.cell_width, self.cell_height
+            "Font size changed to {}px -> {}px, cell: {}x{}, baseline: {}",
+            size, self.font_size, self.cell_metrics.cell_width, self.cell_metrics.cell_height, self.cell_metrics.baseline
         );
 
-        // Clear all glyph caches - they were rendered at the old size
-        self.char_cache.clear();
-        self.ligature_cache.clear();
-        self.glyph_cache.clear();
-
-        // Reset atlas and sprite tracking
-        self.atlas_cursor_x = 0;
-        self.atlas_cursor_y = 0;
-        self.atlas_row_height = 0;
-        self.atlas_data.fill(0);
-        self.atlas_dirty = true;
-        
-        // Clear sprite maps since sprite indices are now invalid
-        self.sprite_map.clear();
-        self.sprite_info.clear();
-        self.sprite_info.push(SpriteInfo::default());
-        self.next_sprite_idx = 1;
-        self.cells_dirty = true;
-        
-        self.statusline_sprite_map.clear();
-        self.statusline_sprite_info.clear();
-        self.statusline_sprite_info.push(SpriteInfo::default());
-        self.statusline_next_sprite_idx = 1;
+        // Reset atlas and all sprite/glyph caches (includes cursor sprite creation)
+        self.reset_atlas();
 
         // Return true if cell dimensions changed
-        (self.cell_width - old_cell_width).abs() > 0.01
-            || (self.cell_height - old_cell_height).abs() > 0.01
+        self.cell_metrics.cell_width != old_cell_width
+            || self.cell_metrics.cell_height != old_cell_height
     }
 
-    /// Reset the glyph atlas when it becomes full.
-    /// This clears all cached glyphs and resets the atlas cursor.
+    /// Reset the glyph atlas when font size or scale factor changes.
+    /// This clears all cached glyphs (which are now invalid) and resets the atlas.
+    /// NOTE: This should ONLY be called for font/scale changes, NOT when atlas is full
+    /// (for that case, we add a new layer via add_atlas_layer()).
     fn reset_atlas(&mut self) {
-        log::info!("Resetting glyph atlas (was full)");
+        log::info!("Resetting glyph atlas (font/scale changed)");
         
-        // Clear all glyph caches - they need to be re-rasterized
+        // Clear all glyph caches - they need to be re-rasterized at new size
         self.char_cache.clear();
         self.ligature_cache.clear();
         self.glyph_cache.clear();
@@ -3343,12 +3423,16 @@ impl Renderer {
         self.statusline_sprite_info.push(SpriteInfo::default()); // Index 0 = no glyph
         self.statusline_next_sprite_idx = 1;
         
-        // Reset atlas cursor and data
+        // Reset atlas cursor and go back to layer 0
         self.atlas_cursor_x = 0;
         self.atlas_cursor_y = 0;
         self.atlas_row_height = 0;
-        self.atlas_data.fill(0);
-        self.atlas_dirty = true;
+        self.atlas_current_layer = 0;
+        
+        // Create pre-rendered cursor sprites at fixed indices (like Kitty)
+        self.create_cursor_sprites();
+        // Create pre-rendered decoration sprites (underline, undercurl, strikethrough, etc.)
+        self.create_decoration_sprites();
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -3369,12 +3453,13 @@ impl Renderer {
     }
 
     /// Pack cell attributes into u32 format for GPU.
+    /// underline_style: 0=none, 1=single, 2=double, 3=curly, 4=dotted, 5=dashed
     #[inline]
-    fn pack_attrs(bold: bool, italic: bool, underline: bool) -> u32 {
-        let mut attrs = 0u32;
+    fn pack_attrs(bold: bool, italic: bool, underline_style: u8, strikethrough: bool) -> u32 {
+        let mut attrs = (underline_style as u32) & 0x7; // 3 bits for decoration type
         if bold { attrs |= ATTR_BOLD; }
         if italic { attrs |= ATTR_ITALIC; }
-        if underline { attrs |= ATTR_UNDERLINE; }
+        if strikethrough { attrs |= ATTR_STRIKE; }
         attrs
     }
 
@@ -3486,7 +3571,8 @@ impl Renderer {
         // so no offset is needed - the shader just maps sprite to cell 1:1
         let sprite = SpriteInfo {
             uv: glyph.uv,
-            _padding: [0.0, 0.0],
+            layer: glyph.layer,
+            _padding: 0.0,
             size: glyph.size,
         };
         
@@ -3564,7 +3650,7 @@ impl Renderer {
                     bg: Self::pack_color(&cell.bg_color),
                     decoration_fg: 0,
                     sprite_idx: 0, // No glyph for continuation
-                    attrs: Self::pack_attrs(cell.bold, cell.italic, cell.underline),
+                    attrs: Self::pack_attrs(cell.bold, cell.italic, cell.underline_style, cell.strikethrough),
                 };
                 col += 1;
                 continue;
@@ -3648,7 +3734,7 @@ impl Renderer {
                                 bg: Self::pack_color(&current_cell.bg_color),
                                 decoration_fg: 0,
                                 sprite_idx: final_sprite_idx,
-                                attrs: Self::pack_attrs(cell.bold, cell.italic, cell.underline),
+                                attrs: Self::pack_attrs(cell.bold, cell.italic, cell.underline_style, cell.strikethrough),
                             };
                         }
                         
@@ -3706,7 +3792,7 @@ impl Renderer {
                                 bg: Self::pack_color(&current_cell.bg_color),
                                 decoration_fg: 0,
                                 sprite_idx: sprite_idx | COLORED_GLYPH_FLAG,
-                                attrs: Self::pack_attrs(cell.bold, cell.italic, cell.underline),
+                                attrs: Self::pack_attrs(cell.bold, cell.italic, cell.underline_style, cell.strikethrough),
                             };
                         }
                         
@@ -3743,7 +3829,7 @@ impl Renderer {
                 bg: Self::pack_color(&cell.bg_color),
                 decoration_fg: 0,
                 sprite_idx,
-                attrs: Self::pack_attrs(cell.bold, cell.italic, cell.underline),
+                attrs: Self::pack_attrs(cell.bold, cell.italic, cell.underline_style, cell.strikethrough),
             };
             col += 1;
         }
@@ -3873,10 +3959,10 @@ impl Renderer {
                 if Self::is_multicell_symbol(c) && !Self::is_box_drawing(c) {
                     // Get the glyph's natural width to determine desired cells
                     let glyph_width = self.get_glyph_width(c);
-                    let desired_cells = (glyph_width / self.cell_width).ceil() as usize;
+                    let desired_cells = (glyph_width / self.cell_metrics.cell_width as f32).ceil() as usize;
                     
-                    log::debug!("Symbol check U+{:04X}: glyph_width={:.1}, cell_width={:.1}, desired_cells={}", 
-                               c as u32, glyph_width, self.cell_width, desired_cells);
+                    log::debug!("Symbol check U+{:04X}: glyph_width={:.1}, cell_width={}, desired_cells={}", 
+                               c as u32, glyph_width, self.cell_metrics.cell_width, desired_cells);
                     
                     if desired_cells > 1 {
                         // Count trailing empty cells (spaces or null characters)
@@ -3929,7 +4015,8 @@ impl Renderer {
                                         // Create sprite info from glyph info
                                         let sprite = SpriteInfo {
                                             uv: glyph.uv,
-                                            _padding: [0.0, 0.0],
+                                            layer: glyph.layer,
+                                            _padding: 0.0,
                                             size: glyph.size,
                                         };
                                         
@@ -3997,7 +4084,8 @@ impl Renderer {
                                     
                                     let sprite = SpriteInfo {
                                         uv: glyph.uv,
-                                        _padding: [0.0, 0.0],
+                                        layer: glyph.layer,
+                                        _padding: 0.0,
                                         size: glyph.size,
                                     };
                                     
@@ -4201,8 +4289,8 @@ impl Renderer {
         // Calculate target columns based on window width
         // Use ceil() to ensure we cover the entire window edge-to-edge
         // (the rightmost cell may extend slightly past the window, which is fine)
-        let target_cols = if self.cell_width > 0.0 {
-            (target_width / self.cell_width).ceil() as usize
+        let target_cols = if self.cell_metrics.cell_width > 0 {
+            (target_width / self.cell_metrics.cell_width as f32).ceil() as usize
         } else {
             self.statusline_max_cols
         };
@@ -4296,7 +4384,7 @@ impl Renderer {
                         let fg = Self::pack_statusline_color(*fg_color);
                         let bg = Self::pack_statusline_color(*bg_color);
                         let style = if *bold { FontStyle::Bold } else { FontStyle::Regular };
-                        let attrs = Self::pack_attrs(*bold, false, false);
+                        let attrs = Self::pack_attrs(*bold, false, 0, false);
                         
                         let (sprite_idx, is_colored) = if *c == ' ' || *c == '\0' {
                             (0, false)
@@ -4345,7 +4433,7 @@ impl Renderer {
                         let fg = Self::pack_statusline_color(fg_color);
                         let bg = Self::pack_statusline_color(bg_color);
                         let style = if bold { FontStyle::Bold } else { FontStyle::Regular };
-                        let attrs = Self::pack_attrs(bold, false, false);
+                        let attrs = Self::pack_attrs(bold, false, 0, false);
                         
                         let (sprite_idx, is_colored) = if c == ' ' || c == '\0' {
                             (0, false)
@@ -4383,7 +4471,7 @@ impl Renderer {
                     for component in section.components.iter() {
                         let component_fg = Self::pack_statusline_color(component.fg);
                         let style = if component.bold { FontStyle::Bold } else { FontStyle::Regular };
-                        let attrs = Self::pack_attrs(component.bold, false, false);
+                        let attrs = Self::pack_attrs(component.bold, false, 0, false);
                         
                         // Process characters with lookahead for multi-cell symbols
                         let chars: Vec<char> = component.text.chars().collect();
@@ -4429,7 +4517,8 @@ impl Renderer {
                                             
                                             let sprite = SpriteInfo {
                                                 uv: glyph.uv,
-                                                _padding: [0.0, 0.0],
+                                                layer: glyph.layer,
+                                                _padding: 0.0,
                                                 size: glyph.size,
                                             };
                                             
@@ -4651,14 +4740,14 @@ impl Renderer {
         }
         
         // Default to one cell width if glyph not found
-        self.cell_width
+        self.cell_metrics.cell_width as f32
     }
 
     /// Render a box-drawing character procedurally to a bitmap.
     /// Returns (bitmap, supersampled) where supersampled indicates if anti-aliasing was used.
     fn render_box_char(&self, c: char) -> Option<(Vec<u8>, bool)> {
-        let w = self.cell_width.ceil() as usize;
-        let h = self.cell_height.ceil() as usize;
+        let w = self.cell_metrics.cell_width as usize;
+        let h = self.cell_metrics.cell_height as usize;
         let mut bitmap = vec![0u8; w * h];
         let mut supersampled = false;
 
@@ -5930,10 +6019,10 @@ impl Renderer {
                                 
                                 if let Some(ref mut renderer) = *renderer_cell {
                                     log::debug!("Attempting to render color glyph for U+{:04X} with font_size={}, cell={}x{}", 
-                                               c as u32, self.font_size, self.cell_width as u32, self.cell_height as u32);
+                                               c as u32, self.font_size, self.cell_metrics.cell_width, self.cell_metrics.cell_height);
                                     
                                     renderer.render_color_glyph(
-                                        &path, c, self.font_size, self.cell_width as u32, self.cell_height as u32
+                                        &path, c, self.font_size, self.cell_metrics.cell_width, self.cell_metrics.cell_height
                                     )
                                 } else {
                                     None
@@ -6018,10 +6107,10 @@ impl Renderer {
                     
                     if let Some(ref mut renderer) = *renderer_cell {
                         log::debug!("Attempting to render color glyph for U+{:04X} with font_size={}, cell={}x{}", 
-                                   c as u32, self.font_size, self.cell_width as u32, self.cell_height as u32);
+                                   c as u32, self.font_size, self.cell_metrics.cell_width, self.cell_metrics.cell_height);
                         
                         renderer.render_color_glyph(
-                            path, c, self.font_size, self.cell_width as u32, self.cell_height as u32
+                            path, c, self.font_size, self.cell_metrics.cell_width, self.cell_metrics.cell_height
                         )
                     } else {
                         None
@@ -6055,6 +6144,7 @@ impl Renderer {
             // Empty glyph (e.g., space)
             let info = GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
+                layer: 0.0,
                 size: [0.0, 0.0],
                 is_colored: false,
             };
@@ -6066,6 +6156,7 @@ impl Renderer {
             // Empty glyph (e.g., space)
             let info = GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
+                layer: 0.0,
                 size: [0.0, 0.0],
                 is_colored: false,
             };
@@ -6079,13 +6170,13 @@ impl Renderer {
         // a multi-cell group).
         let (final_bitmap, final_width, final_height, final_offset_x, final_offset_y) = 
             if Self::is_multicell_symbol(c) {
-                let cell_w = self.cell_width;
+                let cell_w = self.cell_metrics.cell_width as f32;
                 // Use just the glyph bitmap width for comparison, not offset_x + width
                 // offset_x is the left bearing which can be negative
                 let glyph_w = glyph_width as f32;
                 
-                log::debug!("Scaling check for U+{:04X}: glyph_width={}, cell_width={:.1}, offset_x={:.1}", 
-                           c as u32, glyph_width, cell_w, offset_x);
+                log::debug!("Scaling check for U+{:04X}: glyph_width={}, cell_width={}, offset_x={:.1}", 
+                           c as u32, glyph_width, self.cell_metrics.cell_width, offset_x);
                 
                 if glyph_w > cell_w {
                     // Glyph is wider than cell - rescale to fit
@@ -6149,8 +6240,8 @@ impl Renderer {
     /// 
     /// Returns a Vec of GlyphInfo, one for each cell.
     fn rasterize_pua_multicell(&mut self, c: char, num_cells: usize) -> Vec<GlyphInfo> {
-        let cell_w = self.cell_width.ceil() as usize;
-        let cell_h = self.cell_height.ceil() as usize;
+        let cell_w = self.cell_metrics.cell_width as usize;
+        let cell_h = self.cell_metrics.cell_height as usize;
         let canvas_width = cell_w * num_cells;
         
         // First, rasterize the glyph at full size
@@ -6176,6 +6267,7 @@ impl Renderer {
             // Empty glyph - return empty sprites for each cell
             return vec![GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
+                layer: 0.0,
                 size: [0.0, 0.0],
                 is_colored: false,
             }; num_cells];
@@ -6184,6 +6276,7 @@ impl Renderer {
         if bitmap.is_empty() || glyph_width == 0 || glyph_height == 0 {
             return vec![GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
+                layer: 0.0,
                 size: [0.0, 0.0],
                 is_colored: false,
             }; num_cells];
@@ -6198,7 +6291,7 @@ impl Renderer {
         
         // Calculate vertical position using baseline, same as single-cell rendering
         // dest_y = baseline - glyph_height - offset_y
-        let dest_y = (self.baseline - glyph_height as f32 - offset_y).round() as i32;
+        let dest_y = (self.cell_metrics.baseline as f32 - glyph_height as f32 - offset_y).round() as i32;
         
         // Copy glyph bitmap to the multi-cell canvas
         for gy in 0..glyph_height as i32 {
@@ -6246,8 +6339,8 @@ impl Renderer {
     /// 
     /// Returns a Vec of GlyphInfo, one for each cell.
     fn rasterize_emoji_multicell(&mut self, c: char, num_cells: usize) -> Vec<GlyphInfo> {
-        let cell_w = self.cell_width.ceil() as usize;
-        let cell_h = self.cell_height.ceil() as usize;
+        let cell_w = self.cell_metrics.cell_width as usize;
+        let cell_h = self.cell_metrics.cell_height as usize;
         let canvas_width = cell_w * num_cells;
         
         // Find a color font for this emoji (find_color_font_for_char handles fontconfig internally)
@@ -6255,6 +6348,7 @@ impl Renderer {
             log::debug!("No color font found for emoji U+{:04X}", c as u32);
             return vec![GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
+                layer: 0.0,
                 size: [0.0, 0.0],
                 is_colored: true,
             }; num_cells];
@@ -6282,6 +6376,7 @@ impl Renderer {
             log::debug!("Failed to render emoji U+{:04X}", c as u32);
             return vec![GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
+                layer: 0.0,
                 size: [0.0, 0.0],
                 is_colored: true,
             }; num_cells];
@@ -6290,6 +6385,7 @@ impl Renderer {
         if rgba.is_empty() || glyph_width == 0 || glyph_height == 0 {
             return vec![GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
+                layer: 0.0,
                 size: [0.0, 0.0],
                 is_colored: true,
             }; num_cells];
@@ -6300,7 +6396,7 @@ impl Renderer {
         
         // Position the glyph - for color glyphs, offset_y is ascent (distance from baseline to TOP)
         let dest_x = offset_x.round() as i32;
-        let dest_y = (self.baseline - offset_y).round() as i32;
+        let dest_y = (self.cell_metrics.baseline as f32 - offset_y).round() as i32;
         
         // Copy the RGBA bitmap to the multi-cell canvas
         for gy in 0..glyph_height as i32 {
@@ -6433,8 +6529,8 @@ impl Renderer {
         offset_x: f32,
         offset_y: f32,
     ) -> Vec<u8> {
-        let cell_w = self.cell_width.ceil() as usize;
-        let cell_h = self.cell_height.ceil() as usize;
+        let cell_w = self.cell_metrics.cell_width as usize;
+        let cell_h = self.cell_metrics.cell_height as usize;
         let mut canvas = vec![0u8; cell_w * cell_h];
         
         // Calculate destination position in the cell canvas.
@@ -6444,7 +6540,7 @@ impl Renderer {
         //           = baseline - glyph_height - offset_y
         // Since offset_y can be negative (for descenders), this works correctly.
         let dest_x = offset_x.round() as i32;
-        let dest_y = (self.baseline - glyph_height as f32 - offset_y).round() as i32;
+        let dest_y = (self.cell_metrics.baseline as f32 - glyph_height as f32 - offset_y).round() as i32;
         
         // Copy the glyph bitmap to the canvas, clipping to cell bounds
         for gy in 0..glyph_height as i32 {
@@ -6477,14 +6573,14 @@ impl Renderer {
         offset_x: f32,
         offset_y: f32,
     ) -> Vec<u8> {
-        let cell_w = self.cell_width.ceil() as usize;
-        let cell_h = self.cell_height.ceil() as usize;
+        let cell_w = self.cell_metrics.cell_width as usize;
+        let cell_h = self.cell_metrics.cell_height as usize;
         let mut canvas = vec![0u8; cell_w * cell_h * 4]; // RGBA
         
         // For color glyphs, offset_y is the ascent (distance from baseline to TOP of glyph)
         // So dest_y = baseline - offset_y positions the top of the glyph correctly
         let dest_x = offset_x.round() as i32;
-        let dest_y = (self.baseline - offset_y).round() as i32;
+        let dest_y = (self.cell_metrics.baseline as f32 - offset_y).round() as i32;
         
         // Copy the RGBA bitmap to the canvas
         for gy in 0..glyph_height as i32 {
@@ -6515,9 +6611,11 @@ impl Renderer {
 
     /// Upload a cell-sized grayscale canvas to the atlas.
     /// Returns GlyphInfo with UV coordinates pointing to the uploaded sprite.
+    /// Like Kitty's send_sprite_to_gpu(), uploads immediately to the GPU texture
+    /// using write_texture with only the cell-sized region (not the full layer).
     fn upload_cell_canvas_to_atlas(&mut self, canvas: &[u8], is_colored: bool) -> GlyphInfo {
-        let cell_w = self.cell_width.ceil() as u32;
-        let cell_h = self.cell_height.ceil() as u32;
+        let cell_w = self.cell_metrics.cell_width;
+        let cell_h = self.cell_metrics.cell_height;
         
         // Check if we need to move to next row
         if self.atlas_cursor_x + cell_w > ATLAS_SIZE {
@@ -6526,30 +6624,32 @@ impl Renderer {
             self.atlas_row_height = 0;
         }
         
-        // Check if atlas is full - reset and retry
+        // Check if current layer is full - add a new layer (like Kitty)
         if self.atlas_cursor_y + cell_h > ATLAS_SIZE {
-            self.reset_atlas();
-            if self.atlas_cursor_x + cell_w > ATLAS_SIZE {
-                self.atlas_cursor_x = 0;
-                self.atlas_cursor_y += self.atlas_row_height + 1;
-                self.atlas_row_height = 0;
-            }
+            self.add_atlas_layer();
+            self.atlas_cursor_x = 0;
+            self.atlas_cursor_y = 0;
+            self.atlas_row_height = 0;
         }
         
-        // Copy canvas to atlas
+        let layer = self.atlas_current_layer;
+        
+        // Prepare the sprite data in RGBA format (cell_w * cell_h * 4 bytes)
+        // This is a small buffer that will be uploaded directly to the GPU
+        let sprite_size = (cell_w * cell_h * ATLAS_BPP) as usize;
+        let mut sprite_data = vec![0u8; sprite_size];
+        
         if is_colored {
             // RGBA canvas - copy directly
             for y in 0..cell_h as usize {
                 for x in 0..cell_w as usize {
                     let src_idx = (y * cell_w as usize + x) * 4;
-                    let dst_x = self.atlas_cursor_x + x as u32;
-                    let dst_y = self.atlas_cursor_y + y as u32;
-                    let dst_idx = ((dst_y * ATLAS_SIZE + dst_x) * ATLAS_BPP) as usize;
-                    if src_idx + 3 < canvas.len() && dst_idx + 3 < self.atlas_data.len() {
-                        self.atlas_data[dst_idx] = canvas[src_idx];
-                        self.atlas_data[dst_idx + 1] = canvas[src_idx + 1];
-                        self.atlas_data[dst_idx + 2] = canvas[src_idx + 2];
-                        self.atlas_data[dst_idx + 3] = canvas[src_idx + 3];
+                    let dst_idx = (y * cell_w as usize + x) * 4;
+                    if src_idx + 3 < canvas.len() && dst_idx + 3 < sprite_data.len() {
+                        sprite_data[dst_idx] = canvas[src_idx];
+                        sprite_data[dst_idx + 1] = canvas[src_idx + 1];
+                        sprite_data[dst_idx + 2] = canvas[src_idx + 2];
+                        sprite_data[dst_idx + 3] = canvas[src_idx + 3];
                     }
                 }
             }
@@ -6558,25 +6658,49 @@ impl Renderer {
             for y in 0..cell_h as usize {
                 for x in 0..cell_w as usize {
                     let src_idx = y * cell_w as usize + x;
-                    let dst_x = self.atlas_cursor_x + x as u32;
-                    let dst_y = self.atlas_cursor_y + y as u32;
-                    let dst_idx = ((dst_y * ATLAS_SIZE + dst_x) * ATLAS_BPP) as usize;
-                    if src_idx < canvas.len() && dst_idx + 3 < self.atlas_data.len() {
-                        self.atlas_data[dst_idx] = 255;     // R
-                        self.atlas_data[dst_idx + 1] = 255; // G
-                        self.atlas_data[dst_idx + 2] = 255; // B
-                        self.atlas_data[dst_idx + 3] = canvas[src_idx]; // A
+                    let dst_idx = (y * cell_w as usize + x) * 4;
+                    if src_idx < canvas.len() && dst_idx + 3 < sprite_data.len() {
+                        sprite_data[dst_idx] = 255;     // R
+                        sprite_data[dst_idx + 1] = 255; // G
+                        sprite_data[dst_idx + 2] = 255; // B
+                        sprite_data[dst_idx + 3] = canvas[src_idx]; // A
                     }
                 }
             }
         }
-        self.atlas_dirty = true;
+        
+        // Upload immediately to GPU - like Kitty's glTexSubImage3D call
+        // This uploads only the cell-sized region, not the full 8192x8192 layer
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: self.atlas_cursor_x,
+                    y: self.atlas_cursor_y,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &sprite_data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(cell_w * ATLAS_BPP),
+                rows_per_image: Some(cell_h),
+            },
+            wgpu::Extent3d {
+                width: cell_w,
+                height: cell_h,
+                depth_or_array_layers: 1,
+            },
+        );
         
         // Calculate UV coordinates
         let uv_x = self.atlas_cursor_x as f32 / ATLAS_SIZE as f32;
         let uv_y = self.atlas_cursor_y as f32 / ATLAS_SIZE as f32;
         let uv_w = cell_w as f32 / ATLAS_SIZE as f32;
         let uv_h = cell_h as f32 / ATLAS_SIZE as f32;
+        let layer_f = layer as f32;
         
         // Update atlas cursor
         self.atlas_cursor_x += cell_w + 1;
@@ -6586,7 +6710,445 @@ impl Renderer {
             uv: [uv_x, uv_y, uv_w, uv_h],
             size: [cell_w as f32, cell_h as f32],
             is_colored,
+            layer: layer_f,
         }
+    }
+    
+    /// Add a new layer to the atlas (like Kitty's realloc_sprite_texture).
+    /// This reallocates the GPU texture with an additional layer and uses GPU-to-GPU
+    /// copy (like Kitty's glCopyImageSubData) to preserve existing sprite data.
+    fn add_atlas_layer(&mut self) {
+        let new_layer = self.atlas_current_layer + 1;
+        
+        if new_layer >= MAX_ATLAS_LAYERS {
+            log::error!("Atlas layer limit reached ({} layers), cannot add more", MAX_ATLAS_LAYERS);
+            // As a last resort, we could reset here, but this should never happen
+            // with 64 layers of 8192x8192
+            return;
+        }
+        
+        log::info!("Adding atlas layer {} (growing from {} layers)", new_layer, self.atlas_num_layers);
+        
+        self.atlas_current_layer = new_layer;
+        
+        // If we need more layers than currently allocated, reallocate the texture
+        if new_layer >= self.atlas_num_layers {
+            let new_num_layers = new_layer + 1;
+            
+            // Create new texture with more layers
+            // Must include COPY_SRC to allow GPU-to-GPU copy from old texture
+            let new_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Glyph Atlas Array"),
+                size: wgpu::Extent3d {
+                    width: ATLAS_SIZE,
+                    height: ATLAS_SIZE,
+                    depth_or_array_layers: new_num_layers,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING 
+                     | wgpu::TextureUsages::COPY_DST 
+                     | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            
+            // GPU-to-GPU copy existing layers from old texture to new texture
+            // Like Kitty's glCopyImageSubData - fast GPU-side copy without CPU involvement
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Atlas Layer Copy Encoder"),
+            });
+            
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.atlas_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &new_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: ATLAS_SIZE,
+                    height: ATLAS_SIZE,
+                    depth_or_array_layers: self.atlas_num_layers,
+                },
+            );
+            
+            self.queue.submit(std::iter::once(encoder.finish()));
+            
+            // Create new view
+            let new_view = new_texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+            
+            // Update bind group with new texture view
+            let new_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Glyph Bind Group"),
+                layout: &self.glyph_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&new_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                    },
+                ],
+            });
+            
+            self.atlas_texture = new_texture;
+            self.atlas_view = new_view;
+            self.glyph_bind_group = new_bind_group;
+            self.atlas_num_layers = new_num_layers;
+        }
+    }
+
+    /// Create pre-rendered cursor sprites in the atlas (like Kitty's send_prerendered_sprites).
+    /// This creates sprites at fixed indices for beam, underline, and hollow cursors.
+    /// Must be called after sprite_info is initialized with index 0 reserved.
+    fn create_cursor_sprites(&mut self) {
+        let cell_w = self.cell_metrics.cell_width as usize;
+        let cell_h = self.cell_metrics.cell_height as usize;
+        let cell_area = cell_w * cell_h;
+        
+        // Calculate DPI-aware cursor thicknesses (Kitty-style: thickness_pts * dpi / 72.0)
+        let beam_thickness = (1.5 * self.dpi / 72.0)
+            .round()
+            .max(1.0)
+            .min(cell_w as f64) as usize;
+        let underline_thickness = (2.0 * self.dpi / 72.0)
+            .round()
+            .max(1.0)
+            .min(cell_h as f64) as usize;
+        let hollow_thickness = (1.0 * self.dpi / 72.0)
+            .round()
+            .max(1.0)
+            .min(cell_w.min(cell_h) as f64) as usize;
+        
+        // Create grayscale canvas for each cursor type
+        let mut canvas = vec![0u8; cell_area];
+        
+        // === Beam cursor (vertical bar on left edge) ===
+        // Like Kitty's add_beam_cursor / vert() function
+        canvas.fill(0);
+        for y in 0..cell_h {
+            for x in 0..beam_thickness {
+                canvas[y * cell_w + x] = 255;
+            }
+        }
+        let beam_info = self.upload_cell_canvas_to_atlas(&canvas, false);
+        let beam_sprite = SpriteInfo {
+            uv: beam_info.uv,
+            layer: beam_info.layer,
+            _padding: 0.0,
+            size: beam_info.size,
+        };
+        
+        // === Underline cursor (horizontal bar at bottom) ===
+        // Like Kitty's add_underline_cursor / horz() function
+        canvas.fill(0);
+        let underline_top = cell_h.saturating_sub(underline_thickness);
+        for y in underline_top..cell_h {
+            for x in 0..cell_w {
+                canvas[y * cell_w + x] = 255;
+            }
+        }
+        let underline_info = self.upload_cell_canvas_to_atlas(&canvas, false);
+        let underline_sprite = SpriteInfo {
+            uv: underline_info.uv,
+            layer: underline_info.layer,
+            _padding: 0.0,
+            size: underline_info.size,
+        };
+        
+        // === Hollow cursor (rectangle outline) ===
+        // Like Kitty's add_hollow_cursor function
+        canvas.fill(0);
+        // Top edge
+        for y in 0..hollow_thickness {
+            for x in 0..cell_w {
+                canvas[y * cell_w + x] = 255;
+            }
+        }
+        // Bottom edge
+        for y in cell_h.saturating_sub(hollow_thickness)..cell_h {
+            for x in 0..cell_w {
+                canvas[y * cell_w + x] = 255;
+            }
+        }
+        // Left edge
+        for y in 0..cell_h {
+            for x in 0..hollow_thickness {
+                canvas[y * cell_w + x] = 255;
+            }
+        }
+        // Right edge
+        for y in 0..cell_h {
+            for x in cell_w.saturating_sub(hollow_thickness)..cell_w {
+                canvas[y * cell_w + x] = 255;
+            }
+        }
+        let hollow_info = self.upload_cell_canvas_to_atlas(&canvas, false);
+        let hollow_sprite = SpriteInfo {
+            uv: hollow_info.uv,
+            layer: hollow_info.layer,
+            _padding: 0.0,
+            size: hollow_info.size,
+        };
+        
+        // Store sprites at their fixed indices
+        // sprite_info[0] = no glyph (already set)
+        // sprite_info[1] = beam cursor (CURSOR_SPRITE_BEAM)
+        // sprite_info[2] = underline cursor (CURSOR_SPRITE_UNDERLINE)
+        // sprite_info[3] = hollow cursor (CURSOR_SPRITE_HOLLOW)
+        while self.sprite_info.len() < FIRST_GLYPH_SPRITE as usize {
+            self.sprite_info.push(SpriteInfo::default());
+        }
+        self.sprite_info[CURSOR_SPRITE_BEAM as usize] = beam_sprite;
+        self.sprite_info[CURSOR_SPRITE_UNDERLINE as usize] = underline_sprite;
+        self.sprite_info[CURSOR_SPRITE_HOLLOW as usize] = hollow_sprite;
+        self.next_sprite_idx = FIRST_GLYPH_SPRITE;
+        
+        log::debug!(
+            "Created cursor sprites: beam={}px wide, underline={}px tall, hollow={}px border",
+            beam_thickness, underline_thickness, hollow_thickness
+        );
+    }
+
+    /// Create pre-rendered decoration sprites in the atlas (like Kitty's decorations.c).
+    /// This creates sprites for strikethrough, underline, undercurl, dotted, dashed, and double underline.
+    /// Must be called after create_cursor_sprites().
+    fn create_decoration_sprites(&mut self) {
+        let cell_w = self.cell_metrics.cell_width as usize;
+        let cell_h = self.cell_metrics.cell_height as usize;
+        let cell_area = cell_w * cell_h;
+        
+        let underline_pos = self.cell_metrics.underline_position as usize;
+        let underline_thick = self.cell_metrics.underline_thickness as usize;
+        let strike_pos = self.cell_metrics.strikethrough_position as usize;
+        let strike_thick = self.cell_metrics.strikethrough_thickness as usize;
+        
+        // Helper: draw horizontal line at y_start for 'thickness' rows
+        let draw_hline = |canvas: &mut [u8], y_start: usize, thickness: usize| {
+            for y in y_start..(y_start + thickness).min(cell_h) {
+                for x in 0..cell_w {
+                    canvas[y * cell_w + x] = 255;
+                }
+            }
+        };
+        
+        // Create canvas for decorations
+        let mut canvas = vec![0u8; cell_area];
+        
+        // === Strikethrough (like Kitty's add_strikethrough) ===
+        canvas.fill(0);
+        let strike_half = strike_thick / 2;
+        let strike_top = if strike_half > strike_pos { 0 } else { strike_pos - strike_half };
+        draw_hline(&mut canvas, strike_top, strike_thick);
+        let strike_info = self.upload_cell_canvas_to_atlas(&canvas, false);
+        let strike_sprite = SpriteInfo {
+            uv: strike_info.uv,
+            layer: strike_info.layer,
+            _padding: 0.0,
+            size: strike_info.size,
+        };
+        
+        // === Single Underline (like Kitty's add_straight_underline) ===
+        canvas.fill(0);
+        let under_half = underline_thick / 2;
+        let under_top = if under_half > underline_pos { 0 } else { underline_pos - under_half };
+        draw_hline(&mut canvas, under_top, underline_thick);
+        let underline_info = self.upload_cell_canvas_to_atlas(&canvas, false);
+        let underline_sprite = SpriteInfo {
+            uv: underline_info.uv,
+            layer: underline_info.layer,
+            _padding: 0.0,
+            size: underline_info.size,
+        };
+        
+        // === Double Underline (like Kitty's add_double_underline) ===
+        canvas.fill(0);
+        // Two lines: one at underline_pos - thickness, one at underline_pos
+        let a = underline_pos.saturating_sub(underline_thick);
+        let b = underline_pos.min(cell_h - 1);
+        let (top, bottom) = if a <= b { (a, b) } else { (b, a) };
+        // Ensure at least 2 pixels gap between lines
+        let (top, bottom) = if bottom.saturating_sub(top) < 2 {
+            let bottom = (bottom + 1).min(cell_h - 1);
+            let top = if bottom >= 2 { top } else { top.saturating_sub(1) };
+            (top, bottom)
+        } else {
+            (top, bottom)
+        };
+        // Draw single-pixel lines at top and bottom
+        if top < cell_h {
+            for x in 0..cell_w { canvas[top * cell_w + x] = 255; }
+        }
+        if bottom < cell_h && bottom != top {
+            for x in 0..cell_w { canvas[bottom * cell_w + x] = 255; }
+        }
+        let double_info = self.upload_cell_canvas_to_atlas(&canvas, false);
+        let double_sprite = SpriteInfo {
+            uv: double_info.uv,
+            layer: double_info.layer,
+            _padding: 0.0,
+            size: double_info.size,
+        };
+        
+        // === Undercurl (like Kitty's add_curl_underline with Wu antialiasing) ===
+        // This follows Kitty's decorations.c add_curl_underline() exactly
+        canvas.fill(0);
+        
+        let max_x = cell_w.saturating_sub(1);
+        let max_y = cell_h.saturating_sub(1);
+        
+        // Wave factor: 2*PI for one full wave per cell (like Kitty's default undercurl_style)
+        let xfactor = 2.0 * std::f64::consts::PI / max_x as f64;
+        
+        // Calculate position and thickness like Kitty does
+        let d_quot = underline_thick / 2;
+        let d_rem = underline_thick % 2;
+        let position = underline_pos.min(cell_h.saturating_sub(d_quot + d_rem));
+        let thickness = underline_thick.max(1).min(cell_h.saturating_sub(position + 1));
+        
+        // max_height is the descender space from the font
+        let max_height = cell_h.saturating_sub(position.saturating_sub(thickness / 2));
+        // half_height is the wave amplitude (1/4 of available space so it's not too large)
+        let half_height = (max_height / 4).max(1);
+        
+        // Adjust thickness like Kitty: reduce slightly for thinner appearance
+        // Note: thickness CAN become 0, which means only antialiased edges are drawn (1px line)
+        let thickness = if thickness < 3 {
+            thickness.saturating_sub(1)  // Can become 0 for thin 1px line
+        } else {
+            thickness.saturating_sub(2)
+        };
+        
+        // Center the wave vertically in the underline area
+        let position = position + half_height * 2;
+        let position = if position + half_height > max_y {
+            max_y.saturating_sub(half_height)
+        } else {
+            position
+        };
+        
+        // Helper to add intensity at a position (like Kitty's add_intensity)
+        let add_intensity = |canvas: &mut [u8], x: usize, y: i32, val: u8, position: usize| {
+            let y = (y + position as i32).clamp(0, max_y as i32) as usize;
+            if y < cell_h && x < cell_w {
+                let idx = y * cell_w + x;
+                canvas[idx] = canvas[idx].saturating_add(val);
+            }
+        };
+        
+        // Draw antialiased cosine wave using Wu algorithm (like Kitty)
+        // Cosine waves always have slope <= 1 so are never steep
+        for x in 0..cell_w {
+            let y = (half_height as f64) * (x as f64 * xfactor).cos();
+            let y1 = (y - thickness as f64).floor() as i32;  // upper bound
+            let y2 = y.ceil() as i32;  // lower bound
+            
+            // Wu antialiasing intensity based on fractional part
+            let frac = (y - y.floor()).abs();
+            let intensity = (255.0 * frac) as u8;
+            let i1 = 255u8.saturating_sub(intensity);  // upper edge intensity
+            let i2 = intensity;  // lower edge intensity
+            
+            // Draw antialiased upper bound
+            add_intensity(&mut canvas, x, y1, i1, position);
+            
+            // Draw antialiased lower bound  
+            add_intensity(&mut canvas, x, y2, i2, position);
+            
+            // Fill between upper and lower bound with full intensity
+            for t in 1..=thickness {
+                add_intensity(&mut canvas, x, y1 + t as i32, 255, position);
+            }
+        }
+        let curl_info = self.upload_cell_canvas_to_atlas(&canvas, false);
+        let curl_sprite = SpriteInfo {
+            uv: curl_info.uv,
+            layer: curl_info.layer,
+            _padding: 0.0,
+            size: curl_info.size,
+        };
+        
+        // === Dotted Underline (like Kitty's add_dotted_underline) ===
+        canvas.fill(0);
+        let num_dots = (cell_w / (2 * underline_thick.max(1))).max(1);
+        let dot_size = (cell_w / (2 * num_dots)).max(1);
+        
+        // Distribute dots evenly
+        for y in under_top..(under_top + underline_thick).min(cell_h) {
+            let mut x = dot_size / 2; // Start with half gap
+            for _ in 0..num_dots {
+                for dx in 0..dot_size {
+                    if x + dx < cell_w {
+                        canvas[y * cell_w + x + dx] = 255;
+                    }
+                }
+                x += dot_size * 2; // Dot + gap
+            }
+        }
+        let dotted_info = self.upload_cell_canvas_to_atlas(&canvas, false);
+        let dotted_sprite = SpriteInfo {
+            uv: dotted_info.uv,
+            layer: dotted_info.layer,
+            _padding: 0.0,
+            size: dotted_info.size,
+        };
+        
+        // === Dashed Underline (like Kitty's add_dashed_underline) ===
+        canvas.fill(0);
+        let quarter_width = cell_w / 4;
+        let dash_width = cell_w.saturating_sub(3 * quarter_width);
+        let second_dash_start = 3 * quarter_width;
+        
+        for y in under_top..(under_top + underline_thick).min(cell_h) {
+            // First dash at start
+            for x in 0..dash_width {
+                if x < cell_w {
+                    canvas[y * cell_w + x] = 255;
+                }
+            }
+            // Second dash
+            for x in second_dash_start..(second_dash_start + dash_width).min(cell_w) {
+                canvas[y * cell_w + x] = 255;
+            }
+        }
+        let dashed_info = self.upload_cell_canvas_to_atlas(&canvas, false);
+        let dashed_sprite = SpriteInfo {
+            uv: dashed_info.uv,
+            layer: dashed_info.layer,
+            _padding: 0.0,
+            size: dashed_info.size,
+        };
+        
+        // Store sprites at their fixed indices
+        // Ensure sprite_info has enough capacity
+        while self.sprite_info.len() < FIRST_GLYPH_SPRITE as usize {
+            self.sprite_info.push(SpriteInfo::default());
+        }
+        self.sprite_info[DECORATION_SPRITE_STRIKETHROUGH as usize] = strike_sprite;
+        self.sprite_info[DECORATION_SPRITE_UNDERLINE as usize] = underline_sprite;
+        self.sprite_info[DECORATION_SPRITE_DOUBLE_UNDERLINE as usize] = double_sprite;
+        self.sprite_info[DECORATION_SPRITE_UNDERCURL as usize] = curl_sprite;
+        self.sprite_info[DECORATION_SPRITE_DOTTED as usize] = dotted_sprite;
+        self.sprite_info[DECORATION_SPRITE_DASHED as usize] = dashed_sprite;
+        self.next_sprite_idx = FIRST_GLYPH_SPRITE;
+        
+        log::debug!(
+            "Created decoration sprites: underline at y={}, strikethrough at y={}, thickness={}px",
+            underline_pos, strike_pos, underline_thick
+        );
     }
 
     /// Get or rasterize a glyph by its glyph ID from the primary font.
@@ -6609,6 +7171,7 @@ impl Renderer {
             // Empty glyph (e.g., space)
             let info = GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
+                layer: 0.0,
                 size: [0.0, 0.0],
                 is_colored: false,
             };
@@ -6620,6 +7183,7 @@ impl Renderer {
             // Empty glyph (e.g., space)
             let info = GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
+                layer: 0.0,
                 size: [0.0, 0.0],
                 is_colored: false,
             };
@@ -6665,6 +7229,7 @@ impl Renderer {
             // Empty glyph (e.g., space)
             let info = GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
+                layer: 0.0,
                 size: [0.0, 0.0],
                 is_colored: false,
             };
@@ -6676,6 +7241,7 @@ impl Renderer {
             // Empty glyph (e.g., space)
             let info = GlyphInfo {
                 uv: [0.0, 0.0, 0.0, 0.0],
+                layer: 0.0,
                 size: [0.0, 0.0],
                 is_colored: false,
             };
@@ -6939,12 +7505,8 @@ impl Renderer {
         self.quads.clear();
         self.overlay_quads.clear();
 
-        // Check if atlas is getting full and reset proactively
-        // This prevents mid-render failures and ensures all glyphs can be rendered
-        let atlas_usage = self.atlas_cursor_y as f32 / ATLAS_SIZE as f32;
-        if atlas_usage > 0.9 {
-            self.reset_atlas();
-        }
+        // NOTE: With Kitty-style multi-layer atlas, we no longer reset when full.
+        // Instead, add_atlas_layer() is called when the current layer fills up.
 
         let width = self.width as f32;
         let height = self.height as f32;
@@ -6983,12 +7545,12 @@ impl Renderer {
             // Render each tab
             let mut tab_x = 4.0_f32;
             let tab_padding = 8.0_f32;
-            let min_tab_width = self.cell_width * 8.0;
+            let min_tab_width = self.cell_metrics.cell_width as f32 * 8.0;
 
             for idx in 0..num_tabs {
                 let is_active = idx == active_tab;
                 let title = format!(" {} ", idx + 1);
-                let title_width = title.chars().count() as f32 * self.cell_width;
+                let title_width = title.chars().count() as f32 * self.cell_metrics.cell_width as f32;
                 let tab_width = title_width.max(min_tab_width);
 
                 let tab_bg = if is_active {
@@ -7028,7 +7590,7 @@ impl Renderer {
                 self.render_rect(tab_x, tab_bar_y + 2.0, tab_width, tab_bar_height - 4.0, tab_bg);
 
                 // Render tab title text
-                let text_y = tab_bar_y + (tab_bar_height - self.cell_height) / 2.0;
+                let text_y = tab_bar_y + (tab_bar_height - self.cell_metrics.cell_height as f32) / 2.0;
                 let text_x = tab_x + (tab_width - title_width) / 2.0;
 
                 for (char_idx, c) in title.chars().enumerate() {
@@ -7038,7 +7600,7 @@ impl Renderer {
                     let glyph = self.rasterize_char(c);
                     if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
                         // In Kitty's model, glyphs are cell-sized and positioned at (0,0)
-                        let char_x = text_x + char_idx as f32 * self.cell_width;
+                        let char_x = text_x + char_idx as f32 * self.cell_metrics.cell_width as f32;
                         let glyph_x = char_x.round();
                         let glyph_y = text_y.round();
 
@@ -7123,7 +7685,7 @@ impl Renderer {
             let grid_bottom = terminal_y_offset + available_height;
             let grid_left = 0.0_f32;
             let grid_right = width;
-            let epsilon = self.cell_height.max(self.cell_width);
+            let epsilon = (self.cell_metrics.cell_height.max(self.cell_metrics.cell_width)) as f32;
 
             // Check each pair of panes to find adjacent ones
             for i in 0..panes.len() {
@@ -7242,6 +7804,8 @@ impl Renderer {
             pane_id: u64,
             cols: u32,
             rows: u32,
+            // Viewport for Kitty-style NDC rendering (x, y, width, height in pixels)
+            viewport: (f32, f32, f32, f32),
             dim_overlay: Option<(f32, f32, f32, f32, [f32; 4])>, // (x, y, w, h, color)
         }
         let mut pane_render_list: Vec<PaneRenderData> = Vec::new();
@@ -7261,8 +7825,8 @@ impl Renderer {
             self.update_gpu_cells(terminal);
             
             // Calculate pane dimensions in cells
-            let cols = (pane_width / self.cell_width).floor() as u32;
-            let rows = (pane_height / self.cell_height).floor() as u32;
+            let cols = (pane_width / self.cell_metrics.cell_width as f32).floor() as u32;
+            let rows = (pane_height / self.cell_metrics.cell_height as f32).floor() as u32;
             
             // Use the actual gpu_cells size for buffer allocation (terminal.cols * terminal.rows)
             // This may differ from pane pixel dimensions due to rounding
@@ -7280,12 +7844,8 @@ impl Renderer {
             let grid_params = GridParams {
                 cols,
                 rows,
-                cell_width: self.cell_width,
-                cell_height: self.cell_height,
-                screen_width: self.width as f32,
-                screen_height: self.height as f32,
-                x_offset: pane_x,
-                y_offset: pane_y,
+                cell_width: self.cell_metrics.cell_width,
+                cell_height: self.cell_metrics.cell_height,
                 // Hide cursor when scrolled into scrollback buffer or when cursor is explicitly hidden
                 cursor_col: if terminal.cursor_visible && terminal.scroll_offset == 0 { terminal.cursor_col as i32 } else { -1 },
                 cursor_row: if terminal.cursor_visible && terminal.scroll_offset == 0 { terminal.cursor_row as i32 } else { -1 },
@@ -7341,10 +7901,20 @@ impl Renderer {
                 None
             };
             
+            // Viewport dimensions for Kitty-style NDC rendering
+            // The viewport is set to the pane's pixel area, so the shader works in pure NDC space
+            // Cell dimensions are already integers like Kitty - no floating-point accumulation errors
+            let viewport_width = (cols * self.cell_metrics.cell_width) as f32;
+            let viewport_height = (rows * self.cell_metrics.cell_height) as f32;
+            // Also round the viewport position to pixel boundaries
+            let viewport_x = pane_x.round();
+            let viewport_y = pane_y.round();
+            
             pane_render_list.push(PaneRenderData {
                 pane_id: info.pane_id,
                 cols,
                 rows,
+                viewport: (viewport_x, viewport_y, viewport_width, viewport_height),
                 dim_overlay,
             });
         }
@@ -7405,8 +7975,8 @@ impl Renderer {
                 // Create params for statusline shader
                 let statusline_params = StatuslineParams {
                     char_count: cols as u32,
-                    cell_width: self.cell_width,
-                    cell_height: self.cell_height,
+                    cell_width: self.cell_metrics.cell_width as f32,
+                    cell_height: self.cell_metrics.cell_height as f32,
                     screen_width: width,
                     screen_height: height,
                     y_offset: statusline_y,
@@ -7532,8 +8102,8 @@ impl Renderer {
                 terminal.image_storage.placements(),
                 pane_x,
                 pane_y,
-                self.cell_width,
-                self.cell_height,
+                self.cell_metrics.cell_width as f32,
+                self.cell_metrics.cell_height as f32,
                 width,
                 height,
                 terminal.scrollback.len(),
@@ -7622,28 +8192,8 @@ impl Renderer {
         // Upload overlay quads if we have any (will be rendered after main quads)
         // We reuse the same buffer, uploading overlay quads when needed during rendering
 
-        if self.atlas_dirty {
-            self.queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture: &self.atlas_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &self.atlas_data,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(ATLAS_SIZE * ATLAS_BPP),
-                    rows_per_image: Some(ATLAS_SIZE),
-                },
-                wgpu::Extent3d {
-                    width: ATLAS_SIZE,
-                    height: ATLAS_SIZE,
-                    depth_or_array_layers: 1,
-                },
-            );
-            self.atlas_dirty = false;
-        }
+        // Atlas uploads now happen immediately in upload_cell_canvas_to_atlas()
+        // like Kitty's send_sprite_to_gpu() - no batched layer uploads needed
 
         // Create command encoder and render
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -7703,12 +8253,20 @@ impl Renderer {
             // INSTANCED CELL RENDERING (Like Kitty's per-window VAO approach)
             // Each pane has its own bind group with its own buffers.
             // Data was already uploaded before the render pass started.
+            // 
+            // Kitty-style viewport approach: set viewport to pane area so shader
+            // can work in pure NDC space (-1 to +1), avoiding floating-point
+            // precision issues that cause wobbly/misaligned text.
             // ═══════════════════════════════════════════════════════════════════
             for pane_data in &pane_render_list {
                 let instance_count = pane_data.cols * pane_data.rows;
                 
                 // Get this pane's bind group (data already uploaded)
                 if let Some(pane_res) = self.pane_resources.get(&pane_data.pane_id) {
+                    // Set viewport to this pane's area (Kitty-style)
+                    let (vp_x, vp_y, vp_w, vp_h) = pane_data.viewport;
+                    render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
+                    
                     // Draw cell backgrounds
                     render_pass.set_pipeline(&self.cell_bg_pipeline);
                     render_pass.set_bind_group(0, &self.glyph_bind_group, &[]); // Atlas (shared)
@@ -7722,6 +8280,9 @@ impl Renderer {
                     render_pass.draw(0..4, 0..instance_count); // 4 vertices per quad, N instances
                 }
             }
+            
+            // Restore full-screen viewport for remaining rendering (statusline, overlays)
+            render_pass.set_viewport(0.0, 0.0, self.width as f32, self.height as f32, 0.0, 1.0);
             
             // ═══════════════════════════════════════════════════════════════════
             // STATUSLINE RENDERING (dedicated shader)

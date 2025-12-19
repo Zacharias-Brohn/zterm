@@ -88,7 +88,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 }
 
 @group(0) @binding(0)
-var atlas_texture: texture_2d<f32>;
+var atlas_texture: texture_2d_array<f32>;
 @group(0) @binding(1)
 var atlas_sampler: sampler;
 
@@ -102,8 +102,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return in.bg_color;
     }
     
-    // Sample from RGBA atlas
-    let glyph_sample = textureSample(atlas_texture, atlas_sampler, in.uv);
+    // Sample from RGBA atlas (layer 0 for legacy rendering)
+    let glyph_sample = textureSample(atlas_texture, atlas_sampler, in.uv, 0);
     
     // Detect color glyphs: regular glyphs are stored as white (1,1,1) with alpha
     // Color glyphs have actual RGB colors. Check if any RGB channel is not white.
@@ -135,20 +135,16 @@ struct ColorTable {
 }
 
 // Grid parameters uniform
+// Uses Kitty-style NDC positioning: the viewport is set per-pane, so the shader
+// works in pure NDC space (-1 to +1) without needing pixel offsets.
+// Cell dimensions are integers like Kitty for pixel-perfect rendering.
 struct GridParams {
     // Grid dimensions in cells
     cols: u32,
     rows: u32,
-    // Cell dimensions in pixels
-    cell_width: f32,
-    cell_height: f32,
-    // Screen dimensions in pixels
-    screen_width: f32,
-    screen_height: f32,
-    // X offset for pane position
-    x_offset: f32,
-    // Y offset for tab bar + pane position
-    y_offset: f32,
+    // Cell dimensions in pixels (integers like Kitty)
+    cell_width: u32,
+    cell_height: u32,
     // Cursor position (-1 if hidden)
     cursor_col: i32,
     cursor_row: i32,
@@ -178,8 +174,10 @@ struct GPUCell {
 struct SpriteInfo {
     // UV coordinates in atlas (x, y, width, height) - normalized 0-1
     uv: vec4<f32>,
-    // Padding (previously offset, now unused)
-    _padding: vec2<f32>,
+    // Atlas layer index (z-coordinate for texture array)
+    layer: f32,
+    // Padding for alignment
+    _padding: f32,
     // Size in pixels (width, height) - always matches cell dimensions
     size: vec2<f32>,
 }
@@ -214,10 +212,62 @@ const ATTR_SELECTED_BIT: u32 = 0x100u;
 // Colored glyph flag
 const COLORED_GLYPH_FLAG: u32 = 0x80000000u;
 
-// Cursor shape constants
+// Cursor shape constants (matches terminal cursor_style values)
 const CURSOR_BLOCK: u32 = 0u;
 const CURSOR_UNDERLINE: u32 = 1u;
 const CURSOR_BAR: u32 = 2u;
+
+// Pre-rendered cursor sprite indices (must match Rust CURSOR_SPRITE_* constants)
+// These sprites are created at fixed indices in the sprite array.
+const CURSOR_SPRITE_BEAM: u32 = 1u;      // Bar/beam cursor (vertical line on left)
+const CURSOR_SPRITE_UNDERLINE: u32 = 2u; // Underline cursor (horizontal line at bottom)
+const CURSOR_SPRITE_HOLLOW: u32 = 3u;    // Hollow/unfocused cursor (outline rectangle)
+
+// Pre-rendered decoration sprite indices (must match Rust DECORATION_SPRITE_* constants)
+const DECORATION_SPRITE_STRIKETHROUGH: u32 = 4u;    // Strikethrough line
+const DECORATION_SPRITE_UNDERLINE: u32 = 5u;        // Single underline
+const DECORATION_SPRITE_DOUBLE_UNDERLINE: u32 = 6u; // Double underline
+const DECORATION_SPRITE_UNDERCURL: u32 = 7u;        // Wavy/curly underline
+const DECORATION_SPRITE_DOTTED: u32 = 8u;           // Dotted underline
+const DECORATION_SPRITE_DASHED: u32 = 9u;           // Dashed underline
+
+// Decoration type values from ATTR_DECORATION_MASK (lower 3 bits of attrs)
+const DECORATION_NONE: u32 = 0u;
+const DECORATION_SINGLE: u32 = 1u;
+const DECORATION_DOUBLE: u32 = 2u;
+const DECORATION_CURLY: u32 = 3u;
+const DECORATION_DOTTED: u32 = 4u;
+const DECORATION_DASHED: u32 = 5u;
+
+// Map cursor style to cursor sprite index
+fn cursor_style_to_sprite(style: u32) -> u32 {
+    if style == CURSOR_BAR {
+        return CURSOR_SPRITE_BEAM;
+    } else if style == CURSOR_UNDERLINE {
+        return CURSOR_SPRITE_UNDERLINE;
+    } else {
+        // CURSOR_BLOCK uses solid fill, not a sprite
+        return 0u;
+    }
+}
+
+// Map decoration type (from attrs lower 3 bits) to underline sprite index
+// Returns 0 if no underline decoration
+fn decoration_type_to_sprite(decoration_type: u32) -> u32 {
+    if decoration_type == DECORATION_SINGLE {
+        return DECORATION_SPRITE_UNDERLINE;
+    } else if decoration_type == DECORATION_DOUBLE {
+        return DECORATION_SPRITE_DOUBLE_UNDERLINE;
+    } else if decoration_type == DECORATION_CURLY {
+        return DECORATION_SPRITE_UNDERCURL;
+    } else if decoration_type == DECORATION_DOTTED {
+        return DECORATION_SPRITE_DOTTED;
+    } else if decoration_type == DECORATION_DASHED {
+        return DECORATION_SPRITE_DASHED;
+    } else {
+        return 0u; // DECORATION_NONE
+    }
+}
 
 // Check if a cell is within the selection range
 // Selection is specified as (start_col, start_row) to (end_col, end_row), normalized
@@ -267,8 +317,18 @@ struct CellVertexOutput {
     @location(5) @interpolate(flat) is_cursor: u32,
     @location(6) @interpolate(flat) cursor_shape: u32,
     @location(7) cursor_color: vec4<f32>,
-    @location(8) cell_pos: vec2<f32>,      // Cell top-left position in pixels
+    @location(8) cursor_uv: vec2<f32>,  // UV coordinates for cursor sprite (interpolated)
     @location(9) @interpolate(flat) cell_size: vec2<f32>,  // Cell width/height in pixels
+    @location(10) underline_uv: vec2<f32>,  // UV for underline sprite
+    @location(11) strike_uv: vec2<f32>,     // UV for strikethrough sprite
+    @location(12) @interpolate(flat) decoration_fg: vec4<f32>,  // Decoration color
+    @location(13) @interpolate(flat) has_underline: u32,  // Underline sprite index (0 = none)
+    @location(14) @interpolate(flat) has_strikethrough: u32,  // 1 if strikethrough, 0 otherwise
+    // Atlas layer indices for texture array sampling
+    @location(15) @interpolate(flat) glyph_layer: i32,      // Layer for main glyph sprite
+    @location(16) @interpolate(flat) cursor_layer: i32,     // Layer for cursor sprite
+    @location(17) @interpolate(flat) underline_layer: i32,  // Layer for underline decoration
+    @location(18) @interpolate(flat) strike_layer: i32,     // Layer for strikethrough decoration
 }
 
 // Resolve a packed color to RGBA (in linear space for GPU rendering)
@@ -306,17 +366,13 @@ fn srgb_to_linear(c: f32) -> f32 {
     }
 }
 
-// Convert pixel coordinate to NDC
-fn pixel_to_ndc(pixel: vec2<f32>, screen: vec2<f32>) -> vec2<f32> {
-    return vec2<f32>(
-        (pixel.x / screen.x) * 2.0 - 1.0,
-        1.0 - (pixel.y / screen.y) * 2.0
-    );
-}
-
 // Background vertex shader (renders cell backgrounds)
 // vertex_index: 0-3 for quad corners
 // instance_index: cell index in row-major order
+//
+// Uses Kitty-style NDC positioning: the viewport is set per-pane, so we work
+// directly in NDC space (-1 to +1). This avoids floating-point precision issues
+// that cause wobbly/misaligned text when cell dimensions aren't integer pixels.
 @vertex
 fn vs_cell_bg(
     @builtin(vertex_index) vertex_index: u32,
@@ -335,20 +391,28 @@ fn vs_cell_bg(
     // Get cell data
     let cell = cells[instance_index];
     
-    // Calculate cell pixel position
-    let cell_x = grid_params.x_offset + f32(col) * grid_params.cell_width;
-    let cell_y = grid_params.y_offset + f32(row) * grid_params.cell_height;
+    // Kitty-style NDC positioning: calculate cell size in NDC space
+    // NDC ranges from -1 to +1, so total range is 2.0
+    let dx = 2.0 / f32(grid_params.cols);
+    let dy = 2.0 / f32(grid_params.rows);
+    
+    // Calculate cell position in NDC (origin at top-left: -1, +1)
+    let left = -1.0 + f32(col) * dx;
+    let top = 1.0 - f32(row) * dy;
     
     // Quad vertex positions for TriangleStrip (0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right)
     // TriangleStrip produces triangles: (0,1,2) and (1,2,3)
-    var positions: array<vec2<f32>, 4>;
-    positions[0] = vec2<f32>(cell_x, cell_y);                                              // top-left
-    positions[1] = vec2<f32>(cell_x + grid_params.cell_width, cell_y);                     // top-right
-    positions[2] = vec2<f32>(cell_x, cell_y + grid_params.cell_height);                    // bottom-left
-    positions[3] = vec2<f32>(cell_x + grid_params.cell_width, cell_y + grid_params.cell_height); // bottom-right
+    var ndc_positions: array<vec2<f32>, 4>;
+    ndc_positions[0] = vec2<f32>(left, top);              // top-left
+    ndc_positions[1] = vec2<f32>(left + dx, top);         // top-right
+    ndc_positions[2] = vec2<f32>(left, top - dy);         // bottom-left
+    ndc_positions[3] = vec2<f32>(left + dx, top - dy);    // bottom-right
     
-    let screen_size = vec2<f32>(grid_params.screen_width, grid_params.screen_height);
-    let ndc_pos = pixel_to_ndc(positions[vertex_index], screen_size);
+    let ndc_pos = ndc_positions[vertex_index];
+    
+    // Convert integer cell dimensions to float for calculations
+    let cell_width_f = f32(grid_params.cell_width);
+    let cell_height_f = f32(grid_params.cell_height);
     
     // Resolve colors
     let attrs = cell.attrs;
@@ -397,6 +461,26 @@ fn vs_cell_bg(
     }
     cursor_color.a = 1.0;
     
+    // Calculate cursor sprite UV coordinates (for non-block cursors)
+    // Look up the pre-rendered cursor sprite based on cursor style
+    var cursor_uv = vec2<f32>(0.0, 0.0);
+    var cursor_layer: i32 = 0;
+    if is_cursor_cell && grid_params.cursor_style != CURSOR_BLOCK {
+        let cursor_sprite_idx = cursor_style_to_sprite(grid_params.cursor_style);
+        if cursor_sprite_idx > 0u {
+            let cursor_sprite = sprites[cursor_sprite_idx];
+            cursor_layer = i32(cursor_sprite.layer);
+            // Calculate UV for this vertex (matching quad corners)
+            // vertex_index: 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right
+            var cursor_uvs: array<vec2<f32>, 4>;
+            cursor_uvs[0] = vec2<f32>(cursor_sprite.uv.x, cursor_sprite.uv.y);
+            cursor_uvs[1] = vec2<f32>(cursor_sprite.uv.x + cursor_sprite.uv.z, cursor_sprite.uv.y);
+            cursor_uvs[2] = vec2<f32>(cursor_sprite.uv.x, cursor_sprite.uv.y + cursor_sprite.uv.w);
+            cursor_uvs[3] = vec2<f32>(cursor_sprite.uv.x + cursor_sprite.uv.z, cursor_sprite.uv.y + cursor_sprite.uv.w);
+            cursor_uv = cursor_uvs[vertex_index];
+        }
+    }
+    
     var out: CellVertexOutput;
     out.clip_position = vec4<f32>(ndc_pos, 0.0, 1.0);
     out.uv = vec2<f32>(0.0, 0.0); // Not used for background
@@ -407,13 +491,24 @@ fn vs_cell_bg(
     out.is_cursor = select(0u, 1u, is_cursor_cell);
     out.cursor_shape = grid_params.cursor_style;
     out.cursor_color = cursor_color;
-    out.cell_pos = vec2<f32>(cell_x, cell_y);
-    out.cell_size = vec2<f32>(grid_params.cell_width, grid_params.cell_height);
+    out.cursor_uv = cursor_uv;
+    out.cell_size = vec2<f32>(cell_width_f, cell_height_f);
+    out.underline_uv = vec2<f32>(0.0, 0.0);  // Not used for background
+    out.strike_uv = vec2<f32>(0.0, 0.0);      // Not used for background
+    out.decoration_fg = vec4<f32>(0.0, 0.0, 0.0, 0.0);  // Not used for background
+    out.has_underline = 0u;
+    out.has_strikethrough = 0u;
+    // Layer indices for atlas sampling
+    out.glyph_layer = 0;       // Not used for background
+    out.cursor_layer = cursor_layer;
+    out.underline_layer = 0;   // Not used for background
+    out.strike_layer = 0;      // Not used for background
     
     return out;
 }
 
 // Glyph vertex shader (renders cell glyphs)
+// Uses Kitty-style NDC positioning for alignment, viewport handles pane offset.
 @vertex
 fn vs_cell_glyph(
     @builtin(vertex_index) vertex_index: u32,
@@ -433,52 +528,72 @@ fn vs_cell_glyph(
     let cell = cells[instance_index];
     let sprite_idx = cell.sprite_idx & ~COLORED_GLYPH_FLAG;
     let is_colored = (cell.sprite_idx & COLORED_GLYPH_FLAG) != 0u;
+    let attrs = cell.attrs;
     
-    // Skip if no glyph
-    if sprite_idx == 0u {
+    // Check for decorations (like Kitty: decorations render even for empty cells)
+    let decoration_type = attrs & ATTR_DECORATION_MASK;
+    let has_strike = (attrs & ATTR_STRIKE_BIT) != 0u;
+    let underline_sprite_idx = decoration_type_to_sprite(decoration_type);
+    let has_decorations = underline_sprite_idx > 0u || has_strike;
+    
+    // Skip if no glyph AND no decorations
+    if sprite_idx == 0u && !has_decorations {
         var out: CellVertexOutput;
         out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         return out;
     }
     
-    // Get sprite info
-    let sprite = sprites[sprite_idx];
+    // Kitty-style NDC positioning: calculate cell size in NDC space
+    // NDC ranges from -1 to +1, so total range is 2.0
+    let dx = 2.0 / f32(grid_params.cols);
+    let dy = 2.0 / f32(grid_params.rows);
     
-    // Skip if sprite has no size
-    if sprite.size.x <= 0.0 || sprite.size.y <= 0.0 {
-        var out: CellVertexOutput;
-        out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-        return out;
+    // Convert integer cell dimensions to float for calculations
+    let cell_width_f = f32(grid_params.cell_width);
+    let cell_height_f = f32(grid_params.cell_height);
+    
+    // Calculate cell position in NDC (origin at top-left: -1, +1)
+    let left = -1.0 + f32(col) * dx;
+    let top = 1.0 - f32(row) * dy;
+    
+    // Determine sprite dimensions - for decoration-only cells, use cell size
+    var sprite_dx = dx;
+    var sprite_dy = dy;
+    var glyph_uv = vec2<f32>(0.0, 0.0);  // Default: no glyph
+    var glyph_layer: i32 = 0;
+    
+    // If we have a glyph, use sprite dimensions and compute glyph UV
+    if sprite_idx > 0u {
+        let sprite = sprites[sprite_idx];
+        glyph_layer = i32(sprite.layer);
+        if sprite.size.x > 0.0 && sprite.size.y > 0.0 {
+            // Scale NDC size proportionally for wide chars, emoji, etc.
+            sprite_dx = dx * (sprite.size.x / cell_width_f);
+            sprite_dy = dy * (sprite.size.y / cell_height_f);
+        }
     }
-    
-    // Calculate cell pixel position
-    let cell_x = grid_params.x_offset + f32(col) * grid_params.cell_width;
-    let cell_y = grid_params.y_offset + f32(row) * grid_params.cell_height;
-    
-    // Kitty model: sprites are cell-sized with glyphs pre-positioned at baseline.
-    // Just map the sprite directly to the cell.
-    let glyph_x = cell_x;
-    let glyph_y = cell_y;
     
     // Quad vertex positions for TriangleStrip (0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right)
-    var positions: array<vec2<f32>, 4>;
-    positions[0] = vec2<f32>(glyph_x, glyph_y);                                  // top-left
-    positions[1] = vec2<f32>(glyph_x + sprite.size.x, glyph_y);                  // top-right
-    positions[2] = vec2<f32>(glyph_x, glyph_y + sprite.size.y);                  // bottom-left
-    positions[3] = vec2<f32>(glyph_x + sprite.size.x, glyph_y + sprite.size.y);  // bottom-right
+    var ndc_positions: array<vec2<f32>, 4>;
+    ndc_positions[0] = vec2<f32>(left, top);                        // top-left
+    ndc_positions[1] = vec2<f32>(left + sprite_dx, top);            // top-right
+    ndc_positions[2] = vec2<f32>(left, top - sprite_dy);            // bottom-left
+    ndc_positions[3] = vec2<f32>(left + sprite_dx, top - sprite_dy); // bottom-right
     
-    // UV coordinates (matching vertex positions)
+    let ndc_pos = ndc_positions[vertex_index];
+    
+    // UV coordinates for glyph (only if we have a glyph)
     var uvs: array<vec2<f32>, 4>;
-    uvs[0] = vec2<f32>(sprite.uv.x, sprite.uv.y);                                // top-left
-    uvs[1] = vec2<f32>(sprite.uv.x + sprite.uv.z, sprite.uv.y);                  // top-right
-    uvs[2] = vec2<f32>(sprite.uv.x, sprite.uv.y + sprite.uv.w);                  // bottom-left
-    uvs[3] = vec2<f32>(sprite.uv.x + sprite.uv.z, sprite.uv.y + sprite.uv.w);    // bottom-right
-    
-    let screen_size = vec2<f32>(grid_params.screen_width, grid_params.screen_height);
-    let ndc_pos = pixel_to_ndc(positions[vertex_index], screen_size);
+    if sprite_idx > 0u {
+        let sprite = sprites[sprite_idx];
+        uvs[0] = vec2<f32>(sprite.uv.x, sprite.uv.y);                                // top-left
+        uvs[1] = vec2<f32>(sprite.uv.x + sprite.uv.z, sprite.uv.y);                  // top-right
+        uvs[2] = vec2<f32>(sprite.uv.x, sprite.uv.y + sprite.uv.w);                  // bottom-left
+        uvs[3] = vec2<f32>(sprite.uv.x + sprite.uv.z, sprite.uv.y + sprite.uv.w);    // bottom-right
+        glyph_uv = uvs[vertex_index];
+    }
     
     // Resolve colors
-    let attrs = cell.attrs;
     let is_reverse = (attrs & ATTR_REVERSE_BIT) != 0u;
     
     var fg = resolve_color(cell.fg, true);
@@ -507,9 +622,46 @@ fn vs_cell_glyph(
         fg = cursor_text_color;
     }
     
+    // Calculate underline UV if decoration is present
+    // (underline_sprite_idx, has_strike were computed earlier)
+    var underline_uv = vec2<f32>(0.0, 0.0);
+    var underline_layer: i32 = 0;
+    if underline_sprite_idx > 0u {
+        let underline_sprite = sprites[underline_sprite_idx];
+        underline_layer = i32(underline_sprite.layer);
+        var underline_uvs: array<vec2<f32>, 4>;
+        underline_uvs[0] = vec2<f32>(underline_sprite.uv.x, underline_sprite.uv.y);
+        underline_uvs[1] = vec2<f32>(underline_sprite.uv.x + underline_sprite.uv.z, underline_sprite.uv.y);
+        underline_uvs[2] = vec2<f32>(underline_sprite.uv.x, underline_sprite.uv.y + underline_sprite.uv.w);
+        underline_uvs[3] = vec2<f32>(underline_sprite.uv.x + underline_sprite.uv.z, underline_sprite.uv.y + underline_sprite.uv.w);
+        underline_uv = underline_uvs[vertex_index];
+    }
+    
+    // Calculate strikethrough UV if present
+    var strike_uv = vec2<f32>(0.0, 0.0);
+    var strike_layer: i32 = 0;
+    if has_strike {
+        let strike_sprite = sprites[DECORATION_SPRITE_STRIKETHROUGH];
+        strike_layer = i32(strike_sprite.layer);
+        var strike_uvs: array<vec2<f32>, 4>;
+        strike_uvs[0] = vec2<f32>(strike_sprite.uv.x, strike_sprite.uv.y);
+        strike_uvs[1] = vec2<f32>(strike_sprite.uv.x + strike_sprite.uv.z, strike_sprite.uv.y);
+        strike_uvs[2] = vec2<f32>(strike_sprite.uv.x, strike_sprite.uv.y + strike_sprite.uv.w);
+        strike_uvs[3] = vec2<f32>(strike_sprite.uv.x + strike_sprite.uv.z, strike_sprite.uv.y + strike_sprite.uv.w);
+        strike_uv = strike_uvs[vertex_index];
+    }
+    
+    // Resolve decoration color (use decoration_fg if set, otherwise foreground color)
+    var decoration_fg_color = resolve_color(cell.decoration_fg, true);
+    // If decoration_fg is default (type 0), use foreground color instead
+    let deco_fg_type = cell.decoration_fg & 0xFFu;
+    if deco_fg_type == COLOR_TYPE_DEFAULT {
+        decoration_fg_color = fg;
+    }
+    
     var out: CellVertexOutput;
     out.clip_position = vec4<f32>(ndc_pos, 0.0, 1.0);
-    out.uv = uvs[vertex_index];
+    out.uv = glyph_uv;
     out.fg_color = fg;
     out.bg_color = bg;  // Pass background for legacy gamma blending
     out.is_background = 0u;
@@ -517,8 +669,18 @@ fn vs_cell_glyph(
     out.is_cursor = select(0u, 1u, is_cursor_cell);
     out.cursor_shape = grid_params.cursor_style;
     out.cursor_color = cursor_text_color;
-    out.cell_pos = vec2<f32>(cell_x, cell_y);
-    out.cell_size = vec2<f32>(grid_params.cell_width, grid_params.cell_height);
+    out.cursor_uv = vec2<f32>(0.0, 0.0); // Not used for glyph pass (cursor rendered in bg pass)
+    out.cell_size = vec2<f32>(cell_width_f, cell_height_f);
+    out.underline_uv = underline_uv;
+    out.strike_uv = strike_uv;
+    out.decoration_fg = decoration_fg_color;
+    out.has_underline = underline_sprite_idx;
+    out.has_strikethrough = select(0u, 1u, has_strike);
+    // Layer indices for atlas sampling
+    out.glyph_layer = glyph_layer;
+    out.cursor_layer = 0;  // Not used for glyph pass
+    out.underline_layer = underline_layer;
+    out.strike_layer = strike_layer;
     
     return out;
 }
@@ -529,24 +691,18 @@ fn fs_cell(in: CellVertexOutput) -> @location(0) vec4<f32> {
     if in.is_background == 1u {
         // Check if this is a cursor cell
         if in.is_cursor == 1u {
-            // Calculate fragment position relative to cell
-            let frag_pos = in.clip_position.xy;
-            let cell_local = frag_pos - in.cell_pos;
-            
             if in.cursor_shape == CURSOR_BLOCK {
                 // Block cursor - fill entire cell with cursor color
                 return in.cursor_color;
-            } else if in.cursor_shape == CURSOR_UNDERLINE {
-                // Underline cursor - bottom 10% or at least 2 pixels
-                let underline_height = max(2.0, in.cell_size.y * 0.1);
-                if cell_local.y >= in.cell_size.y - underline_height {
-                    return in.cursor_color;
-                }
-            } else if in.cursor_shape == CURSOR_BAR {
-                // Bar cursor - left 10% or at least 2 pixels
-                let bar_width = max(2.0, in.cell_size.x * 0.1);
-                if cell_local.x < bar_width {
-                    return in.cursor_color;
+            } else {
+                // Non-block cursors (bar, underline) - sample from pre-rendered cursor sprite
+                // The cursor_uv was calculated in the vertex shader
+                let cursor_sample = textureSample(atlas_texture, atlas_sampler, in.cursor_uv, in.cursor_layer);
+                let cursor_alpha = cursor_sample.a;
+                
+                if cursor_alpha > 0.0 {
+                    // Blend cursor color with background based on sprite alpha
+                    return vec4<f32>(in.cursor_color.rgb, cursor_alpha);
                 }
             }
         }
@@ -555,22 +711,63 @@ fn fs_cell(in: CellVertexOutput) -> @location(0) vec4<f32> {
         return in.bg_color;
     }
     
-    // Glyph - sample from RGBA atlas
-    let glyph_sample = textureSample(atlas_texture, atlas_sampler, in.uv);
+    // Glyph pass - sample from RGBA atlas
+    // Start with glyph color (or transparent if decoration-only cell)
+    var result_rgb: vec3<f32>;
+    var result_alpha: f32;
     
-    if in.is_colored_glyph == 1u {
-        // Colored glyph (emoji) - use atlas color directly with premultiplied alpha blending
-        // The atlas stores RGBA color from the emoji font
-        return glyph_sample;
+    // Check if this is a decoration-only cell (no glyph, UV at origin)
+    let has_glyph = in.uv.x != 0.0 || in.uv.y != 0.0;
+    
+    if has_glyph {
+        let glyph_sample = textureSample(atlas_texture, atlas_sampler, in.uv, in.glyph_layer);
+        
+        if in.is_colored_glyph == 1u {
+            // Colored glyph (emoji) - use atlas color directly
+            result_rgb = glyph_sample.rgb;
+            result_alpha = glyph_sample.a;
+        } else {
+            // Regular glyph - atlas stores white (1,1,1) with alpha in A channel
+            let glyph_alpha = glyph_sample.a;
+            
+            // Apply legacy gamma-incorrect blending for crisp text
+            let adjusted_alpha = foreground_contrast_legacy(in.fg_color.rgb, glyph_alpha, in.bg_color.rgb);
+            
+            result_rgb = in.fg_color.rgb;
+            result_alpha = in.fg_color.a * adjusted_alpha;
+        }
+    } else {
+        // Decoration-only cell - start with transparent
+        result_rgb = vec3<f32>(0.0, 0.0, 0.0);
+        result_alpha = 0.0;
     }
     
-    // Regular glyph - atlas stores white (1,1,1) with alpha in A channel
-    // Use the alpha channel for text rendering
-    let glyph_alpha = glyph_sample.a;
+    // Sample and blend underline decoration if present
+    if in.has_underline > 0u {
+        let underline_sample = textureSample(atlas_texture, atlas_sampler, in.underline_uv, in.underline_layer);
+        let underline_alpha = underline_sample.a;
+        
+        if underline_alpha > 0.0 {
+            // Alpha-blend underline on top of glyph
+            // Use decoration_fg color with the sprite's alpha
+            let deco_alpha = underline_alpha * in.decoration_fg.a;
+            result_rgb = mix(result_rgb, in.decoration_fg.rgb, deco_alpha * (1.0 - result_alpha) + deco_alpha * result_alpha);
+            result_alpha = result_alpha + deco_alpha * (1.0 - result_alpha);
+        }
+    }
     
-    // Apply legacy gamma-incorrect blending for crisp text
-    let adjusted_alpha = foreground_contrast_legacy(in.fg_color.rgb, glyph_alpha, in.bg_color.rgb);
+    // Sample and blend strikethrough decoration if present
+    if in.has_strikethrough > 0u {
+        let strike_sample = textureSample(atlas_texture, atlas_sampler, in.strike_uv, in.strike_layer);
+        let strike_alpha = strike_sample.a;
+        
+        if strike_alpha > 0.0 {
+            // Alpha-blend strikethrough on top (it should cover the glyph)
+            let deco_alpha = strike_alpha * in.decoration_fg.a;
+            result_rgb = mix(result_rgb, in.decoration_fg.rgb, deco_alpha);
+            result_alpha = max(result_alpha, deco_alpha);
+        }
+    }
     
-    // Normal glyph - tint with foreground color using adjusted alpha
-    return vec4<f32>(in.fg_color.rgb, in.fg_color.a * adjusted_alpha);
+    return vec4<f32>(result_rgb, result_alpha);
 }
