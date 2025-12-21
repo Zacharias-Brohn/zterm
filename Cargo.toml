@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 # Window and rendering
 winit = { version = "0.30", features = ["wayland", "x11"] }
-wgpu = "23"
+wgpu = "28"
 pollster = "0.4"
 
 # PTY handling
@@ -27,6 +27,10 @@ polling = "3"
 thiserror = "2"
 
 # Logging
+# No release_max_level set by default - use features to control:
+# - Default: all logs enabled (for development)
+# - --features production: disables all logs in release builds
+# - --features render_timing: enables timing instrumentation with info-level logging
 log = "0.4"
 env_logger = "0.11"
 
@@ -65,6 +69,9 @@ memmap2 = "0.9"
 # Fast byte searching
 memchr = "2"
 
+# Fast HashMap (FxHash - what rustc uses)
+rustc-hash = "2"
+
 # Base64 decoding for OSC statusline
 base64 = "0.22"
 
@@ -79,3 +86,7 @@ ffmpeg-next = { version = "8.0", optional = true }
 [features]
 default = ["webm"]
 webm = ["ffmpeg-next"]
+# Enable timing instrumentation for performance debugging
+render_timing = []
+# Production build: disable all logging for zero overhead
+production = ["log/release_max_level_off"]

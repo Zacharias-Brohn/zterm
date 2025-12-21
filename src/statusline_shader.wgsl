@@ -103,7 +103,7 @@ struct ColorTable {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 @group(0) @binding(0)
-var atlas_texture: texture_2d_array<f32>;
+var atlas_textures: binding_array<texture_2d<f32>>;
 @group(0) @binding(1)
 var atlas_sampler: sampler;
 
@@ -312,8 +312,8 @@ fn fs_statusline(in: VertexOutput) -> @location(0) vec4<f32> {
         return in.bg_color;
     }
     
-    // Sample glyph from atlas (using layer for texture array)
-    let glyph_sample = textureSample(atlas_texture, atlas_sampler, in.uv, in.glyph_layer);
+    // Sample glyph from atlas (using layer to index texture array)
+    let glyph_sample = textureSample(atlas_textures[in.glyph_layer], atlas_sampler, in.uv);
     
     if in.is_colored_glyph == 1u {
         // Colored glyph (emoji) - use atlas color directly

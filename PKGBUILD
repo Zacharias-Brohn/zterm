@@ -18,7 +18,7 @@ source=()
 
 build() {
 	cd "$startdir"
-	cargo build --release --locked
+	cargo build --release --features production
 }
 
 package() {

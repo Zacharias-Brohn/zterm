@@ -8,13 +8,14 @@ use zterm::keyboard::{FunctionalKey, KeyEncoder, KeyEventType, KeyboardState, Mo
 use zterm::pty::Pty;
 use zterm::renderer::{EdgeGlow, PaneRenderInfo, Renderer, StatuslineComponent, StatuslineContent, StatuslineSection};
 use zterm::terminal::{Direction, Terminal, TerminalCommand, MouseTrackingMode};
+use zterm::vt_parser::SharedParser;
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -26,205 +27,6 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, NamedKey};
 use winit::platform::wayland::EventLoopBuilderExtWayland;
 use winit::window::{Window, WindowId};
-
-/// Kitty-style single-buffer for PTY I/O with zero-copy reads and writes.
-/// 
-/// Uses a single buffer with separate read/write regions:
-/// - I/O thread writes to `buf[write_offset..]` 
-/// - Main thread reads from `buf[0..read_len]`
-/// - After main thread consumes data, buffer compacts via memmove
-/// 
-/// When buffer is full, I/O thread waits on an eventfd. Main thread signals
-/// the eventfd after consuming data to wake up the I/O thread.
-/// 
-/// This gives us:
-/// - Zero-copy writes (I/O reads directly into buffer)
-/// - Zero-copy reads (main thread gets slice, no allocation)
-/// - Single 1MB buffer (vs 8MB for double-buffering)
-/// - No busy-waiting when buffer is full
-const PTY_BUF_SIZE: usize = 1024 * 1024; // 1MB like Kitty
-
-struct SharedPtyBuffer {
-    /// The actual buffer. UnsafeCell because we need disjoint mutable access:
-    /// I/O thread writes to [write_pending..], main thread reads [0..read_available]
-    buf: std::cell::UnsafeCell<Box<[u8; PTY_BUF_SIZE]>>,
-    /// Metadata protected by mutex - offsets into the buffer
-    state: Mutex<BufferState>,
-    /// Eventfd to wake up I/O thread when space becomes available
-    wakeup_fd: i32,
-}
-
-// SAFETY: We ensure disjoint access - I/O thread only writes past read_available,
-// main thread only reads up to read_available. Mutex protects metadata updates.
-unsafe impl Sync for SharedPtyBuffer {}
-unsafe impl Send for SharedPtyBuffer {}
-
-struct BufferState {
-    /// Bytes available for main thread to read (I/O has written, main hasn't consumed)
-    read_available: usize,
-    /// Bytes written by I/O thread but not yet made available to main thread
-    write_pending: usize,
-    /// Whether the I/O thread is waiting for space
-    waiting_for_space: bool,
-}
-
-impl SharedPtyBuffer {
-    fn new() -> Self {
-        // Create eventfd for wakeup signaling
-        let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if wakeup_fd < 0 {
-            panic!("Failed to create eventfd: {}", std::io::Error::last_os_error());
-        }
-        
-        Self {
-            buf: std::cell::UnsafeCell::new(Box::new([0u8; PTY_BUF_SIZE])),
-            state: Mutex::new(BufferState {
-                read_available: 0,
-                write_pending: 0,
-                waiting_for_space: false,
-            }),
-            wakeup_fd,
-        }
-    }
-    
-    /// Get the wakeup fd for the I/O thread to poll on.
-    fn wakeup_fd(&self) -> i32 {
-        self.wakeup_fd
-    }
-    
-    /// Check if there's space and mark as waiting if not.
-    /// Returns true if there's space, false if waiting.
-    fn check_space_or_wait(&self) -> bool {
-        let mut state = self.state.lock().unwrap();
-        let has_space = state.read_available + state.write_pending < PTY_BUF_SIZE;
-        if !has_space {
-            state.waiting_for_space = true;
-        }
-        has_space
-    }
-    
-    /// Get a write buffer for the I/O thread to read PTY data into.
-    /// Returns (pointer, available_space). Caller must call commit_write() after.
-    /// 
-    /// SAFETY: The returned pointer is valid until commit_write() is called.
-    /// Only one thread should call this at a time (the I/O thread).
-    fn create_write_buffer(&self) -> (*mut u8, usize) {
-        let state = self.state.lock().unwrap();
-        let write_offset = state.read_available + state.write_pending;
-        let available = PTY_BUF_SIZE.saturating_sub(write_offset);
-        
-        if available == 0 {
-            return (std::ptr::null_mut(), 0);
-        }
-        
-        // SAFETY: We have exclusive write access to buf[write_offset..] because:
-        // - Main thread only reads [0..read_available]
-        // - We're the only writer past read_available + write_pending
-        let ptr = unsafe { (*self.buf.get()).as_mut_ptr().add(write_offset) };
-        (ptr, available)
-    }
-    
-    /// Commit bytes written by the I/O thread.
-    fn commit_write(&self, len: usize) {
-        let mut state = self.state.lock().unwrap();
-        state.write_pending += len;
-    }
-    
-    /// Read from PTY fd into the buffer. Called by I/O thread.
-    /// Returns number of bytes read, 0 if no space/would block, -1 on error.
-    fn read_from_fd(&self, fd: i32) -> isize {
-        let (ptr, available) = self.create_write_buffer();
-        if available == 0 {
-            return 0; // Buffer full
-        }
-        
-        let result = unsafe { 
-            libc::read(fd, ptr as *mut libc::c_void, available) 
-        };
-        
-        if result > 0 {
-            self.commit_write(result as usize);
-        }
-        result
-    }
-    
-    /// Drain the wakeup eventfd. Called by I/O thread after waking up.
-    fn drain_wakeup(&self) {
-        let mut buf = 0u64;
-        unsafe {
-            libc::read(self.wakeup_fd, &mut buf as *mut u64 as *mut libc::c_void, 8);
-        }
-    }
-    
-    /// Make pending writes available for reading, get slice to read.
-    /// Returns None if no data available.
-    /// 
-    /// SAFETY: The returned slice is valid until consume() is called.
-    /// Only the main thread should call this.
-    fn get_read_slice(&self) -> Option<&[u8]> {
-        let mut state = self.state.lock().unwrap();
-        
-        // Move pending writes to readable
-        state.read_available += state.write_pending;
-        state.write_pending = 0;
-        
-        if state.read_available == 0 {
-            return None;
-        }
-        
-        // SAFETY: We have exclusive read access to [0..read_available] because:
-        // - I/O thread only writes past read_available
-        // - We're the only reader
-        let slice = unsafe { 
-            std::slice::from_raw_parts((*self.buf.get()).as_ptr(), state.read_available) 
-        };
-        Some(slice)
-    }
-    
-    /// Consume all read data, making space for new writes.
-    /// Called after parsing is complete. Wakes up I/O thread if it was waiting.
-    fn consume_all(&self) {
-        let should_wakeup;
-        {
-            let mut state = self.state.lock().unwrap();
-            
-            // If there's pending write data, we need to move it to the front
-            if state.write_pending > 0 {
-                // SAFETY: Memmove handles overlapping regions
-                unsafe {
-                    let buf = &mut *self.buf.get();
-                    std::ptr::copy(
-                        buf.as_ptr().add(state.read_available),
-                        buf.as_mut_ptr(),
-                        state.write_pending,
-                    );
-                }
-            }
-            
-            state.read_available = 0;
-            // write_pending stays the same but is now at offset 0
-            
-            should_wakeup = state.waiting_for_space;
-            state.waiting_for_space = false;
-        }
-        
-        // Wake up I/O thread if it was waiting for space
-        if should_wakeup {
-            let val = 1u64;
-            unsafe {
-                libc::write(self.wakeup_fd, &val as *const u64 as *const libc::c_void, 8);
-            }
-        }
-    }
-}
-
-impl Drop for SharedPtyBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.wakeup_fd);
-        }
-    }
-}
 
 /// Unique identifier for a pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -248,8 +50,9 @@ struct Pane {
     pty: Pty,
     /// Raw file descriptor for the PTY (for polling).
     pty_fd: i32,
-    /// Shared buffer for this pane's PTY I/O.
-    pty_buffer: Arc<SharedPtyBuffer>,
+    /// Shared parser with integrated buffer (Kitty-style).
+    /// I/O thread writes directly to this, main thread parses in-place.
+    shared_parser: Arc<SharedParser>,
     /// Selection state for this pane.
     selection: Option<Selection>,
     /// Whether we're currently selecting in this pane.
@@ -295,7 +98,7 @@ impl Pane {
             terminal,
             pty,
             pty_fd,
-            pty_buffer: Arc::new(SharedPtyBuffer::new()),
+            shared_parser: Arc::new(SharedParser::new()),
             selection: None,
             is_selecting: false,
             last_scrollback_len: 0,
@@ -1263,8 +1066,9 @@ impl Selection {
 enum UserEvent {
     /// Signal received to show the window.
     ShowWindow,
-    /// PTY has data available for a specific pane.
-    PtyReadable(PaneId),
+    /// Tick event - signals main loop to process all pending PTY data and render.
+    /// This is like Kitty's glfwPostEmptyEvent() + process_global_state pattern.
+    Tick,
     /// Config file was modified and should be reloaded.
     ConfigReloaded,
 }
@@ -1301,6 +1105,25 @@ struct App {
     should_create_window: bool,
     /// Edge glow animations (for when navigation fails). Multiple can be active simultaneously.
     edge_glows: Vec<EdgeGlow>,
+    #[cfg(feature = "render_timing")]
+    /// Cumulative parse time for benchmarking (nanoseconds).
+    total_parse_ns: u64,
+    #[cfg(feature = "render_timing")]
+    /// Cumulative render time for benchmarking (nanoseconds).
+    total_render_ns: u64,
+    #[cfg(feature = "render_timing")]
+    /// Number of parse calls.
+    parse_count: u64,
+    #[cfg(feature = "render_timing")]
+    /// Number of render calls.
+    render_count: u64,
+    #[cfg(feature = "render_timing")]
+    /// Last time we logged cumulative stats.
+    last_stats_log: std::time::Instant,
+    /// Last time we rendered a frame (for repaint_delay throttling).
+    last_render_at: std::time::Instant,
+    /// Whether a fatal render error occurred (e.g., OutOfMemory).
+    render_fatal_error: bool,
 }
 
 impl App {
@@ -1330,6 +1153,18 @@ impl App {
             last_frame_log: std::time::Instant::now(),
             should_create_window: false,
             edge_glows: Vec::new(),
+            #[cfg(feature = "render_timing")]
+            total_parse_ns: 0,
+            #[cfg(feature = "render_timing")]
+            total_render_ns: 0,
+            #[cfg(feature = "render_timing")]
+            parse_count: 0,
+            #[cfg(feature = "render_timing")]
+            render_count: 0,
+            #[cfg(feature = "render_timing")]
+            last_stats_log: std::time::Instant::now(),
+            last_render_at: std::time::Instant::now(),
+            render_fatal_error: false,
         }
     }
     
@@ -1374,11 +1209,17 @@ impl App {
         }
         
         // Request redraw to apply visual changes
+        self.request_redraw();
+        
+        log::info!("Configuration reloaded successfully");
+    }
+    
+    /// Request a window redraw if window is available.
+    #[inline]
+    fn request_redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
-        
-        log::info!("Configuration reloaded successfully");
     }
     
     /// Create a new tab and start its I/O thread.
@@ -1410,19 +1251,29 @@ impl App {
     
     /// Start background I/O thread for a pane's PTY.
     fn start_pane_io_thread(&self, pane: &Pane) {
-        self.start_pane_io_thread_with_info(pane.id, pane.pty_fd, pane.pty_buffer.clone());
+        self.start_pane_io_thread_with_info(pane.id, pane.pty_fd, pane.shared_parser.clone());
     }
     
     /// Start background I/O thread for a pane's PTY with explicit info.
-    fn start_pane_io_thread_with_info(&self, pane_id: PaneId, pty_fd: i32, pty_buffer: Arc<SharedPtyBuffer>) {
+    /// 
+    /// Kitty-style design:
+    /// - I/O thread reads PTY data directly into SharedParser's buffer
+    /// - Commits bytes atomically (pending counter)
+    /// - Sends Tick to main thread after INPUT_DELAY
+    /// - When buffer is full, disables PTY polling and waits for wakeup
+    /// - Main thread wakes us after parsing (which frees space)
+    fn start_pane_io_thread_with_info(&self, pane_id: PaneId, pty_fd: i32, shared_parser: Arc<SharedParser>) {
         let Some(proxy) = self.event_loop_proxy.clone() else { return };
         let shutdown = self.shutdown.clone();
-        let wakeup_fd = pty_buffer.wakeup_fd();
+        let wakeup_fd = shared_parser.wakeup_fd();
         
         std::thread::Builder::new()
             .name(format!("pty-io-{}", pane_id.0))
             .spawn(move || {
-                const INPUT_DELAY: Duration = Duration::from_millis(3);
+                // Input delay: batch rapid input bursts to reduce overhead.
+                // Kitty uses 3ms, but we use 0 for minimal latency.
+                // The main thread's REPAINT_DELAY (10ms) already provides batching.
+                const INPUT_DELAY: Duration = Duration::from_millis(0);
                 const PTY_KEY: usize = 0;
                 const WAKEUP_KEY: usize = 1;
                 
@@ -1448,14 +1299,20 @@ impl App {
                 }
                 
                 let mut events = Events::new();
-                let mut last_wakeup_at = std::time::Instant::now();
-                let mut has_pending_wakeup = false;
+                let mut last_tick_at = std::time::Instant::now();
+                let mut has_pending_data = false;
+                
+                // Debug tracking
+                let mut total_bytes_read: u64 = 0;
+                let mut loop_count: u64 = 0;
+                let io_start = std::time::Instant::now();
                 
                 while !shutdown.load(Ordering::Relaxed) {
                     events.clear();
+                    loop_count += 1;
                     
                     // Check if we have space - if not, disable PTY polling until woken
-                    let has_space = pty_buffer.check_space_or_wait();
+                    let has_space = shared_parser.has_space();
                     
                     // Set up poll events: always listen on wakeup_fd, only listen on pty_fd if we have space
                     unsafe {
@@ -1463,15 +1320,21 @@ impl App {
                         let _ = poller.modify(std::os::fd::BorrowedFd::borrow_raw(pty_fd), pty_event);
                     }
                     
-                    let timeout = if has_pending_wakeup {
-                        let elapsed = last_wakeup_at.elapsed();
+                    // Kitty-style timeout: if we have pending data OR buffer is full, use a timeout.
+                    // When buffer is full, we need to periodically re-check if space became available
+                    // (don't rely solely on wakeup - that can lead to deadlock).
+                    // When we have space and no pending data, we can block indefinitely.
+                    let timeout = if has_pending_data || !has_space {
+                        let elapsed = last_tick_at.elapsed();
                         Some(INPUT_DELAY.saturating_sub(elapsed))
                     } else {
-                        None // Block indefinitely until data or wakeup
+                        None // Block indefinitely until data arrives
                     };
                     
+                    let wait_start = std::time::Instant::now();
                     match poller.wait(&mut events, timeout) {
                         Ok(_) => {
+                            let wait_time = wait_start.elapsed();
                             let mut got_wakeup = false;
                             let mut got_pty_data = false;
                             
@@ -1484,9 +1347,20 @@ impl App {
                                 }
                             }
                             
+                            // Log long waits (only with render_timing feature)
+                            #[cfg(feature = "render_timing")]
+                            if wait_time.as_millis() > 50 {
+                                log::warn!("[IO-{}] Long wait: {:?} has_space={} has_pending={} got_wakeup={} got_pty={} timeout={:?}",
+                                    pane_id.0, wait_time, has_space, has_pending_data, got_wakeup, got_pty_data, timeout);
+                            }
+                            
+                            #[cfg(not(feature = "render_timing"))]
+                            let _ = wait_time; // silence unused warning
+                            
                             // Drain wakeup fd if signaled
                             if got_wakeup {
-                                pty_buffer.drain_wakeup();
+                                log::trace!("[IO-{}] Got wakeup from main thread", pane_id.0);
+                                shared_parser.drain_wakeup();
                                 // Re-arm wakeup fd
                                 unsafe {
                                     let _ = poller.modify(
@@ -1496,10 +1370,18 @@ impl App {
                                 }
                             }
                             
-                            // Read PTY data if available and we have space
-                            if got_pty_data && has_space {
+                            // Read PTY data if:
+                            // 1. Poll said PTY is readable, OR
+                            // 2. We just got woken up (space became available) - PTY might have data
+                            //    we couldn't read before because our buffer was full
+                            // The PTY fd is non-blocking, so reading when empty just returns EAGAIN
+                            let fresh_has_space = shared_parser.has_space();
+                            let should_try_read = (got_pty_data || got_wakeup) && fresh_has_space;
+                            
+                            if should_try_read {
+                                let mut bytes_this_loop: i64 = 0;
                                 loop {
-                                    let result = pty_buffer.read_from_fd(pty_fd);
+                                    let result = shared_parser.read_from_fd(pty_fd);
                                     if result < 0 {
                                         let err = std::io::Error::last_os_error();
                                         if err.kind() == std::io::ErrorKind::Interrupted {
@@ -1511,24 +1393,35 @@ impl App {
                                         log::debug!("PTY read error: {}", err);
                                         break;
                                     } else if result == 0 {
+                                        log::debug!("[IO-{}] PTY EOF", pane_id.0);
                                         break;
                                     } else {
-                                        has_pending_wakeup = true;
+                                        bytes_this_loop += result as i64;
+                                        total_bytes_read += result as u64;
+                                        has_pending_data = true;
                                         // Check if buffer became full
-                                        if !pty_buffer.check_space_or_wait() {
+                                        if !shared_parser.has_space() {
+                                            log::trace!("[IO-{}] Buffer full after reading {} bytes", pane_id.0, bytes_this_loop);
                                             break;
                                         }
                                     }
                                 }
+                            } else if got_wakeup && !fresh_has_space {
+                                // Buffer is full but we got a wakeup - main is parsing and will
+                                // free space soon. Mark pending so we send a tick after delay.
+                                has_pending_data = true;
+                                log::trace!("[IO-{}] Buffer full after wakeup, will tick", pane_id.0);
                             }
                             
-                            // Send wakeup to main thread if we have pending data and enough time passed
-                            if has_pending_wakeup {
+                            // Send Tick to main thread if we have pending data and enough time passed
+                            // Like Kitty: just send the wakeup, don't try to deduplicate
+                            if has_pending_data {
                                 let now = std::time::Instant::now();
-                                if now.duration_since(last_wakeup_at) >= INPUT_DELAY {
-                                    let _ = proxy.send_event(UserEvent::PtyReadable(pane_id));
-                                    last_wakeup_at = now;
-                                    has_pending_wakeup = false;
+                                if now.duration_since(last_tick_at) >= INPUT_DELAY {
+                                    log::trace!("[IO-{}] Sending Tick", pane_id.0);
+                                    let _ = proxy.send_event(UserEvent::Tick);
+                                    last_tick_at = now;
+                                    has_pending_data = false;
                                 }
                             }
                         }
@@ -1540,6 +1433,17 @@ impl App {
                         }
                     }
                 }
+                
+                #[cfg(feature = "render_timing")]
+                {
+                    let elapsed = io_start.elapsed();
+                    log::info!("[IO-{}] Thread exiting: loops={} total_bytes={} elapsed={:?} throughput={:.1} MB/s",
+                        pane_id.0, loop_count, total_bytes_read, elapsed,
+                        total_bytes_read as f64 / elapsed.as_secs_f64() / 1_000_000.0);
+                }
+                
+                #[cfg(not(feature = "render_timing"))]
+                let _ = (io_start, loop_count, total_bytes_read); // silence unused warnings
                 
                 log::debug!("PTY I/O thread for pane {} exiting", pane_id.0);
             })
@@ -1625,47 +1529,45 @@ impl App {
         }
     }
     
-    /// Process PTY data for a specific pane.
-    /// Returns true if any data was processed.
-    fn poll_pane(&mut self, pane_id: PaneId) -> bool {
-        // Find the pane across all tabs and process data
-        let mut processed = false;
-        let mut commands = Vec::new();
+    /// Process PTY data for a specific pane using Kitty-style in-place parsing.
+    /// 
+    /// Returns (processed_any, has_more_data, bytes_parsed) - processed_any is true if data was parsed,
+    /// has_more_data is true if there's still pending data after the time budget expired.
+    /// 
+    /// Key differences from previous design:
+    /// 1. begin_parse_pass() compacts buffer and makes pending data visible
+    /// 2. Parsing happens in-place - no copying data out of buffer
+    /// 3. end_parse_pass() reports consumed bytes, wakes I/O only if buffer was full
+    /// 4. Loop continues parsing as long as time budget allows
+    fn poll_pane(&mut self, pane_id: PaneId) -> (bool, bool) {
+        let mut ever_processed = false;
+        let mut all_commands = Vec::new();
         
         for tab in &mut self.tabs {
             if let Some(pane) = tab.get_pane_mut(pane_id) {
-                // Get slice of pending data - zero copy!
-                let Some(data) = pane.pty_buffer.get_read_slice() else {
-                    return false;
-                };
-                let len = data.len();
+                // Use SharedParser's run_parse_pass - it releases lock during parsing
+                // so I/O thread can continue writing while we parse
+                ever_processed = pane.shared_parser.run_parse_pass(&mut pane.terminal);
                 
-                let process_start = std::time::Instant::now();
-                pane.terminal.process(data);
-                let process_time_ns = process_start.elapsed().as_nanos() as u64;
-                
-                // Consume the data now that we're done parsing
-                pane.pty_buffer.consume_all();
-                
-                if process_time_ns > 5_000_000 {
-                    log::info!("PTY: process={:.2}ms bytes={}",
-                        process_time_ns as f64 / 1_000_000.0,
-                        len);
+                if ever_processed {
+                    pane.terminal.mark_dirty();
+                    // Collect any commands from the terminal
+                    all_commands.extend(pane.terminal.take_commands());
                 }
                 
-                // Collect any commands from the terminal
-                commands = pane.terminal.take_commands();
-                processed = true;
-                break;
+                // Check for pending data - I/O thread may have written more
+                let has_more_data = pane.shared_parser.has_pending_data();
+                
+                // Handle commands outside the borrow
+                for cmd in all_commands {
+                    self.handle_terminal_command(pane_id, cmd);
+                }
+                
+                return (ever_processed, has_more_data);
             }
         }
         
-        // Handle commands outside the borrow
-        for cmd in commands {
-            self.handle_terminal_command(pane_id, cmd);
-        }
-        
-        processed
+        (false, false)
     }
     
     /// Handle a command from the terminal (triggered by OSC sequences).
@@ -1688,6 +1590,178 @@ impl App {
         }
     }
     
+    /// Render a frame directly. Called from Tick handler for async rendering.
+    /// Returns true if animations are in progress and another render should be scheduled.
+    /// 
+    /// This is the Kitty-style approach: parse all input, then render once, all in the
+    /// same event handler. This avoids the overhead of bouncing between UserEvent::Tick
+    /// and WindowEvent::RedrawRequested.
+    fn do_render(&mut self) -> bool {
+        #[cfg(feature = "render_timing")]
+        let render_start = std::time::Instant::now();
+        let mut needs_another_frame = false;
+        
+        // Send any terminal responses back to PTY (for active pane)
+        if let Some(tab) = self.active_tab_mut() {
+            if let Some(pane) = tab.active_pane_mut() {
+                if let Some(response) = pane.terminal.take_response() {
+                    pane.write_to_pty(&response);
+                }
+                
+                // Track scrollback changes for selection adjustment
+                let scrollback_len = pane.terminal.scrollback.len() as u32;
+                if scrollback_len != pane.last_scrollback_len {
+                    let lines_added = scrollback_len.saturating_sub(pane.last_scrollback_len) as isize;
+                    if let Some(ref mut selection) = pane.selection {
+                        selection.start.row -= lines_added;
+                        selection.end.row -= lines_added;
+                    }
+                    pane.last_scrollback_len = scrollback_len;
+                }
+            }
+        }
+        
+        // Render all panes
+        let num_tabs = self.tabs.len();
+        let active_tab_idx = self.active_tab;
+        let fade_duration_ms = self.config.inactive_pane_fade_ms;
+        let inactive_dim = self.config.inactive_pane_dim;
+        
+        if let Some(renderer) = &mut self.renderer {
+            if let Some(tab) = self.tabs.get_mut(active_tab_idx) {
+                // Collect all pane geometries
+                let geometries = tab.collect_pane_geometries();
+                let active_pane_id = tab.active_pane;
+                
+                // First pass: sync images and calculate dim factors (needs mutable access)
+                let mut dim_factors: Vec<(PaneId, f32)> = Vec::new();
+                for (pane_id, _) in &geometries {
+                    if let Some(pane) = tab.panes.get_mut(pane_id) {
+                        let is_active = *pane_id == active_pane_id;
+                        let dim_factor = pane.calculate_dim_factor(is_active, fade_duration_ms, inactive_dim);
+                        dim_factors.push((*pane_id, dim_factor));
+                        
+                        // Sync terminal images to GPU (Kitty graphics protocol)
+                        renderer.sync_images(&mut pane.terminal.image_storage);
+                    }
+                }
+                
+                // Clear custom statusline if the foreground process is no longer neovim/vim
+                if let Some(pane) = tab.panes.get_mut(&active_pane_id) {
+                    if pane.custom_statusline.is_some() {
+                        if let Some(proc_name) = pane.pty.foreground_process_name() {
+                            let is_vim = proc_name == "nvim" || proc_name == "vim" || proc_name == "vi";
+                            if !is_vim {
+                                pane.custom_statusline = None;
+                            }
+                        }
+                    }
+                }
+                
+                // Build render info for all panes
+                let mut pane_render_data: Vec<(&Terminal, PaneRenderInfo, Option<(usize, usize, usize, usize)>)> = Vec::new();
+                
+                for (pane_id, geom) in &geometries {
+                    if let Some(pane) = tab.panes.get(pane_id) {
+                        let is_active = *pane_id == active_pane_id;
+                        let scroll_offset = pane.terminal.scroll_offset;
+                        
+                        // Get pre-calculated dim factor
+                        let dim_factor = dim_factors.iter()
+                            .find(|(id, _)| id == pane_id)
+                            .map(|(_, f)| *f)
+                            .unwrap_or(if is_active { 1.0 } else { inactive_dim });
+                        
+                        // Convert selection to screen coords for this pane
+                        let selection = if is_active {
+                            pane.selection.as_ref()
+                                .and_then(|sel| sel.to_screen_coords(scroll_offset, geom.rows))
+                        } else {
+                            None
+                        };
+                        
+                        let render_info = PaneRenderInfo {
+                            pane_id: pane_id.0,
+                            x: geom.x,
+                            y: geom.y,
+                            width: geom.width,
+                            height: geom.height,
+                            cols: geom.cols,
+                            rows: geom.rows,
+                            is_active,
+                            dim_factor,
+                        };
+                        
+                        pane_render_data.push((&pane.terminal, render_info, selection));
+                    }
+                }
+                
+                // Check if any animation is in progress
+                let animation_in_progress = dim_factors.iter().any(|(id, factor)| {
+                    let is_active = *id == active_pane_id;
+                    if is_active {
+                        *factor < 1.0
+                    } else {
+                        *factor > inactive_dim
+                    }
+                });
+                
+                let glow_in_progress = !self.edge_glows.is_empty();
+                
+                let image_animation_in_progress = tab.panes.values().any(|pane| {
+                    pane.terminal.image_storage.has_animations()
+                });
+                
+                needs_another_frame = animation_in_progress || glow_in_progress || image_animation_in_progress;
+                
+                // Get the statusline content for the active pane
+                let statusline_content: StatuslineContent = tab.panes.get(&active_pane_id)
+                    .map(|pane| {
+                        if let Some(ref custom) = pane.custom_statusline {
+                            StatuslineContent::Raw(custom.clone())
+                        } else if let Some(cwd) = pane.pty.foreground_cwd() {
+                            let mut sections = vec![build_cwd_section(&cwd)];
+                            if let Some(git_section) = build_git_section(&cwd) {
+                                sections.push(git_section);
+                            }
+                            StatuslineContent::Sections(sections)
+                        } else {
+                            StatuslineContent::Sections(Vec::new())
+                        }
+                    })
+                    .unwrap_or_default();
+                
+                match renderer.render_panes(&pane_render_data, num_tabs, active_tab_idx, &self.edge_glows, self.config.edge_glow_intensity, &statusline_content) {
+                    Ok(_) => {}
+                    Err(wgpu::SurfaceError::Lost) => {
+                        renderer.resize(renderer.width, renderer.height);
+                    }
+                    Err(wgpu::SurfaceError::OutOfMemory) => {
+                        log::error!("Out of GPU memory!");
+                        self.render_fatal_error = true;
+                    }
+                    Err(e) => {
+                        log::error!("Render error: {:?}", e);
+                    }
+                }
+            }
+        }
+        
+        // Clean up finished edge glow animations
+        self.edge_glows.retain(|g| !g.is_finished());
+        
+        // Update stats
+        #[cfg(feature = "render_timing")]
+        {
+            let render_time = render_start.elapsed();
+            self.total_render_ns += render_time.as_nanos() as u64;
+            self.render_count += 1;
+        }
+        self.last_render_at = std::time::Instant::now();
+        
+        needs_another_frame
+    }
+    
     /// Send bytes to the active tab's PTY.
     fn write_to_pty(&mut self, data: &[u8]) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -1703,6 +1777,16 @@ impl App {
     /// Get the active tab mutably, if any.
     fn active_tab_mut(&mut self) -> Option<&mut Tab> {
         self.tabs.get_mut(self.active_tab)
+    }
+    
+    /// Get the active pane of the active tab, if any.
+    fn active_pane(&self) -> Option<&Pane> {
+        self.active_tab().and_then(|t| t.active_pane())
+    }
+    
+    /// Get the active pane of the active tab mutably, if any.
+    fn active_pane_mut(&mut self) -> Option<&mut Pane> {
+        self.active_tab_mut().and_then(|t| t.active_pane_mut())
     }
     
     fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -1724,15 +1808,13 @@ impl App {
     }
     
     fn get_scroll_offset(&self) -> usize {
-        self.active_tab()
-            .and_then(|t| t.active_pane())
+        self.active_pane()
             .map(|p| p.terminal.scroll_offset)
             .unwrap_or(0)
     }
     
     fn has_mouse_tracking(&self) -> bool {
-        self.active_tab()
-            .and_then(|t| t.active_pane())
+        self.active_pane()
             .map(|p| p.terminal.mouse_tracking != MouseTrackingMode::None)
             .unwrap_or(false)
     }
@@ -1748,8 +1830,7 @@ impl App {
     
     fn send_mouse_event(&mut self, button: u8, col: u16, row: u16, pressed: bool, is_motion: bool) {
         let seq = {
-            let Some(tab) = self.active_tab() else { return };
-            let Some(pane) = tab.active_pane() else { return };
+            let Some(pane) = self.active_pane() else { return };
             pane.terminal.encode_mouse(button, col, row, pressed, is_motion, self.get_mouse_modifiers())
         };
         if !seq.is_empty() {
@@ -1768,38 +1849,39 @@ impl App {
         let shift = mod_state.shift_key();
         let super_key = mod_state.super_key();
 
-        let key_name = match &event.logical_key {
+        let key_name: String = match &event.logical_key {
             Key::Named(named) => {
-                match named {
-                    NamedKey::Tab => "tab".to_string(),
-                    NamedKey::Enter => "enter".to_string(),
-                    NamedKey::Escape => "escape".to_string(),
-                    NamedKey::Backspace => "backspace".to_string(),
-                    NamedKey::Delete => "delete".to_string(),
-                    NamedKey::Insert => "insert".to_string(),
-                    NamedKey::Home => "home".to_string(),
-                    NamedKey::End => "end".to_string(),
-                    NamedKey::PageUp => "pageup".to_string(),
-                    NamedKey::PageDown => "pagedown".to_string(),
-                    NamedKey::ArrowUp => "up".to_string(),
-                    NamedKey::ArrowDown => "down".to_string(),
-                    NamedKey::ArrowLeft => "left".to_string(),
-                    NamedKey::ArrowRight => "right".to_string(),
-                    NamedKey::Space => " ".to_string(),
-                    NamedKey::F1 => "f1".to_string(),
-                    NamedKey::F2 => "f2".to_string(),
-                    NamedKey::F3 => "f3".to_string(),
-                    NamedKey::F4 => "f4".to_string(),
-                    NamedKey::F5 => "f5".to_string(),
-                    NamedKey::F6 => "f6".to_string(),
-                    NamedKey::F7 => "f7".to_string(),
-                    NamedKey::F8 => "f8".to_string(),
-                    NamedKey::F9 => "f9".to_string(),
-                    NamedKey::F10 => "f10".to_string(),
-                    NamedKey::F11 => "f11".to_string(),
-                    NamedKey::F12 => "f12".to_string(),
+                let name: &'static str = match named {
+                    NamedKey::Tab => "tab",
+                    NamedKey::Enter => "enter",
+                    NamedKey::Escape => "escape",
+                    NamedKey::Backspace => "backspace",
+                    NamedKey::Delete => "delete",
+                    NamedKey::Insert => "insert",
+                    NamedKey::Home => "home",
+                    NamedKey::End => "end",
+                    NamedKey::PageUp => "pageup",
+                    NamedKey::PageDown => "pagedown",
+                    NamedKey::ArrowUp => "up",
+                    NamedKey::ArrowDown => "down",
+                    NamedKey::ArrowLeft => "left",
+                    NamedKey::ArrowRight => "right",
+                    NamedKey::Space => " ",
+                    NamedKey::F1 => "f1",
+                    NamedKey::F2 => "f2",
+                    NamedKey::F3 => "f3",
+                    NamedKey::F4 => "f4",
+                    NamedKey::F5 => "f5",
+                    NamedKey::F6 => "f6",
+                    NamedKey::F7 => "f7",
+                    NamedKey::F8 => "f8",
+                    NamedKey::F9 => "f9",
+                    NamedKey::F10 => "f10",
+                    NamedKey::F11 => "f11",
+                    NamedKey::F12 => "f12",
                     _ => return false,
-                }
+                };
+                name.to_string()
             }
             Key::Character(c) => c.to_lowercase(),
             _ => return false,
@@ -1831,9 +1913,7 @@ impl App {
                     self.create_tab(cols, rows);
                     // Resize the new tab to calculate pane geometries
                     self.resize_all_panes();
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
+                    self.request_redraw();
                 }
             }
             Action::ClosePane => {
@@ -1902,7 +1982,7 @@ impl App {
                 Ok(new_pane_id) => {
                     // Get the info we need to start the I/O thread
                     tab.get_pane(new_pane_id).map(|pane| {
-                        (pane.id, pane.pty_fd, pane.pty_buffer.clone())
+                        (pane.id, pane.pty_fd, pane.shared_parser.clone())
                     })
                 }
                 Err(e) => {
@@ -1915,13 +1995,11 @@ impl App {
         };
         
         // Start I/O thread for the new pane (outside the tab borrow)
-        if let Some((pane_id, pty_fd, pty_buffer)) = new_pane_info {
-            self.start_pane_io_thread_with_info(pane_id, pty_fd, pty_buffer);
+        if let Some((pane_id, pty_fd, shared_parser)) = new_pane_info {
+            self.start_pane_io_thread_with_info(pane_id, pty_fd, shared_parser);
             // Recalculate layout
             self.resize_all_panes();
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+            self.request_redraw();
             log::info!("Split pane (horizontal={}), new pane {}", horizontal, pane_id.0);
         }
     }
@@ -1983,9 +2061,7 @@ impl App {
             }
         }
         
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
+        self.request_redraw();
     }
     
     fn close_active_pane(&mut self) {
@@ -2006,9 +2082,7 @@ impl App {
             self.resize_all_panes();
         }
         
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
+        self.request_redraw();
     }
     
     fn switch_to_tab(&mut self, idx: usize) {
@@ -2016,9 +2090,7 @@ impl App {
             self.active_tab = idx;
             // Update grid dimensions for proper centering of the new active tab
             self.update_active_tab_grid_dimensions();
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+            self.request_redraw();
         }
     }
     
@@ -2116,6 +2188,8 @@ impl App {
     }
     
     fn handle_keyboard_input(&mut self, event: KeyEvent) {
+        log::debug!("KeyEvent: {:?} state={:?} repeat={}", event.logical_key, event.state, event.repeat);
+        
         if self.check_keybinding(&event) {
             return;
         }
@@ -2128,6 +2202,7 @@ impl App {
         };
 
         if event_type == KeyEventType::Release && !self.keyboard_state.report_events() {
+            log::debug!("Ignoring release event (not in enhanced mode)");
             return;
         }
 
@@ -2204,6 +2279,7 @@ impl App {
         };
 
         if let Some(bytes) = bytes {
+            log::debug!("Sending {} bytes to PTY: {:?}", bytes.len(), bytes);
             // Reset scroll when typing
             if let Some(tab) = self.active_tab_mut() {
                 if let Some(pane) = tab.active_pane_mut() {
@@ -2219,10 +2295,12 @@ impl App {
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(feature = "render_timing")]
         let start = std::time::Instant::now();
         if self.window.is_none() {
             self.create_window(event_loop);
         }
+        #[cfg(feature = "render_timing")]
         log::info!("App resumed (window creation): {:?}", start.elapsed());
     }
     
@@ -2234,29 +2312,124 @@ impl ApplicationHandler<UserEvent> for App {
                     self.create_window(event_loop);
                 }
             }
-            UserEvent::PtyReadable(pane_id) => {
-                // I/O thread has batched wakeups - read all available data now
-                let start = std::time::Instant::now();
-                self.poll_pane(pane_id);
-                let process_time = start.elapsed();
+            UserEvent::Tick => {
+                log::info!("[MAIN] Tick received");
+                // Check for fatal render errors from previous frames
+                if self.render_fatal_error {
+                    log::error!("Fatal render error occurred, exiting");
+                    event_loop.exit();
+                    return;
+                }
                 
-                // Check if terminal is in synchronized output mode (DCS pending mode or CSI 2026)
-                // If so, skip the redraw - rendering will happen when sync mode ends
-                let synchronized = self.tabs.iter()
-                    .flat_map(|tab| tab.panes.values())
-                    .find(|pane| pane.id == pane_id)
-                    .map(|pane| pane.terminal.is_synchronized())
-                    .unwrap_or(false);
+                #[cfg(feature = "render_timing")]
+                let tick_received_at = std::time::Instant::now();
+                #[cfg(feature = "render_timing")]
+                let _ = tick_received_at; // silence unused warning for now
                 
-                // Request redraw to display the new content (unless in sync mode)
-                if !synchronized {
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
+                // Like Kitty's process_global_state: parse panes (with time budget), then render
+                #[cfg(feature = "render_timing")]
+                let tick_start = std::time::Instant::now();
+                let mut any_input = false;
+                let mut any_has_more = false;
+                let mut any_not_synchronized = false;
+                
+                // Collect all pane IDs first to avoid borrow issues
+                let pane_ids: Vec<PaneId> = self.tabs.iter()
+                    .flat_map(|tab| tab.panes.keys().copied())
+                    .collect();
+                
+                // Poll each pane - parses data up to time budget, returns if more pending
+                for pane_id in &pane_ids {
+                    let (processed, has_more) = self.poll_pane(*pane_id);
+                    if processed {
+                        any_input = true;
+                    }
+                    if has_more {
+                        any_has_more = true;
                     }
                 }
                 
-                if process_time.as_millis() > 5 {
-                    log::info!("PTY process took {:?}", process_time);
+                // Log detailed parse stats if any tick was slow (only with render_timing feature)
+                #[cfg(feature = "render_timing")]
+                {
+                    let parse_time = tick_start.elapsed();
+                    if parse_time.as_millis() > 5 {
+                        for tab in &mut self.tabs {
+                            for pane in tab.panes.values_mut() {
+                                pane.terminal.stats.log_if_slow(0); // Log all stats when tick is slow
+                                pane.terminal.stats.reset(); // Reset for next tick
+                            }
+                        }
+                    }
+                }
+                
+                // CRITICAL: Send any terminal responses back to PTY immediately after parsing.
+                // This must happen regardless of rendering, or the application will hang
+                // waiting for responses to queries like DSR (Device Status Report).
+                for tab in &mut self.tabs {
+                    for pane in tab.panes.values_mut() {
+                        if let Some(response) = pane.terminal.take_response() {
+                            log::debug!("[RESPONSE] Sending {} bytes to PTY", response.len());
+                            pane.write_to_pty(&response);
+                        }
+                    }
+                }
+                
+                // Check if any terminal is NOT in synchronized mode (needs render)
+                for tab in &self.tabs {
+                    for pane in tab.panes.values() {
+                        if !pane.terminal.is_synchronized() {
+                            any_not_synchronized = true;
+                            break;
+                        }
+                    }
+                    if any_not_synchronized { break; }
+                }
+                
+                // Render directly here (Kitty-style), throttled by repaint_delay
+                // 6ms ≈ 166 FPS, ensures we hit 144 FPS on high refresh displays
+                const REPAINT_DELAY: Duration = Duration::from_millis(6);
+                let time_since_last_render = self.last_render_at.elapsed();
+                
+                let should_render = any_input && any_not_synchronized && 
+                    time_since_last_render >= REPAINT_DELAY &&
+                    self.renderer.is_some();
+                
+                #[cfg(feature = "render_timing")]
+                let render_start = std::time::Instant::now();
+                
+                if should_render {
+                    let needs_another_frame = self.do_render();
+                    
+                    // If animations are in progress, schedule another render via redraw
+                    if needs_another_frame {
+                        self.request_redraw();
+                    }
+                } else if any_input && any_not_synchronized && self.renderer.is_some() {
+                    // We had input but skipped render due to throttling.
+                    // Request a redraw so we don't lose this frame.
+                    self.request_redraw();
+                }
+                
+                #[cfg(feature = "render_timing")]
+                let render_time = if should_render { render_start.elapsed() } else { Duration::ZERO };
+                
+                // If there's more data pending, send another Tick immediately
+                // This ensures we keep processing without waiting for I/O thread wakeup
+                if any_has_more {
+                    if let Some(proxy) = &self.event_loop_proxy {
+                        let _ = proxy.send_event(UserEvent::Tick);
+                    }
+                }
+                
+                // Log every tick during benchmark for analysis (only with render_timing feature)
+                #[cfg(feature = "render_timing")]
+                {
+                    let tick_time = tick_start.elapsed();
+                    if tick_time.as_millis() > 5 {
+                        log::info!("[TICK] render={:?} total={:?} has_more={} rendered={}",
+                            render_time, tick_time, any_has_more, should_render);
+                    }
                 }
             }
             UserEvent::ConfigReloaded => {
@@ -2287,9 +2460,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if should_resize {
                     self.resize_all_panes();
                 }
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                self.request_redraw();
             }
 
             WindowEvent::ModifiersChanged(new_modifiers) => {
@@ -2322,20 +2493,27 @@ impl ApplicationHandler<UserEvent> for App {
                             pane.terminal.scroll(lines);
                         }
                     }
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
+                    self.request_redraw();
                 }
             }
             
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = position;
                 
-                let is_selecting = self.active_tab()
-                    .and_then(|t| t.active_pane())
+                let is_selecting = self.active_pane()
                     .map(|p| p.is_selecting)
                     .unwrap_or(false);
-                if is_selecting && !self.has_mouse_tracking() {
+                    
+                if is_selecting && self.has_mouse_tracking() {
+                    // Send mouse drag/motion events to PTY for apps like Neovim
+                    if let Some(renderer) = &self.renderer {
+                        if let Some((col, row)) = renderer.pixel_to_cell(position.x, position.y) {
+                            // Button 0 (left) with motion flag
+                            self.send_mouse_event(0, col as u16, row as u16, true, true);
+                        }
+                    }
+                } else if is_selecting && !self.has_mouse_tracking() {
+                    // Terminal-native selection
                     if let Some(renderer) = &self.renderer {
                         if let Some((col, screen_row)) = renderer.pixel_to_cell(position.x, position.y) {
                             let scroll_offset = self.get_scroll_offset();
@@ -2345,9 +2523,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 if let Some(pane) = tab.active_pane_mut() {
                                     if let Some(ref mut selection) = pane.selection {
                                         selection.end = CellPosition { col, row: content_row };
-                                        if let Some(window) = &self.window {
-                                            window.request_redraw();
-                                        }
+                                        self.request_redraw();
                                     }
                                 }
                             }
@@ -2408,8 +2584,7 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         ElementState::Released => {
-                            let was_selecting = self.active_tab()
-                                .and_then(|t| t.active_pane())
+                            let was_selecting = self.active_pane()
                                 .map(|p| p.is_selecting)
                                 .unwrap_or(false);
                             if was_selecting {
@@ -2423,19 +2598,25 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                self.request_redraw();
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
                 self.handle_keyboard_input(event);
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                // Don't request_redraw here - let the Tick handler do parsing and rendering
+                // after PTY responds. Calling request_redraw here causes a render of stale
+                // state before the PTY response arrives.
             }
 
             WindowEvent::RedrawRequested => {
+                // Check for fatal render errors
+                if self.render_fatal_error {
+                    log::error!("Fatal render error occurred, exiting");
+                    event_loop.exit();
+                    return;
+                }
+                
+                #[cfg(feature = "render_timing")]
                 let frame_start = std::time::Instant::now();
                 self.frame_count += 1;
                 
@@ -2445,187 +2626,36 @@ impl ApplicationHandler<UserEvent> for App {
                     self.last_frame_log = std::time::Instant::now();
                 }
                 
-                // Note: poll_pane() is called from UserEvent::PtyReadable, not here.
-                // This avoids double-processing and keeps rendering fast.
+                // Use shared render logic
+                let needs_another_frame = self.do_render();
                 
-                // Send any terminal responses back to PTY (for active pane)
-                if let Some(tab) = self.active_tab_mut() {
-                    if let Some(pane) = tab.active_pane_mut() {
-                        if let Some(response) = pane.terminal.take_response() {
-                            pane.write_to_pty(&response);
-                        }
-                        
-                        // Track scrollback changes for selection adjustment
-                        let scrollback_len = pane.terminal.scrollback.len() as u32;
-                        if scrollback_len != pane.last_scrollback_len {
-                            let lines_added = scrollback_len.saturating_sub(pane.last_scrollback_len) as isize;
-                            if let Some(ref mut selection) = pane.selection {
-                                selection.start.row -= lines_added;
-                                selection.end.row -= lines_added;
-                            }
-                            pane.last_scrollback_len = scrollback_len;
-                        }
-                    }
+                // If animations are in progress, schedule another render
+                if needs_another_frame {
+                    self.request_redraw();
                 }
                 
-                // Render all panes
-                let render_start = std::time::Instant::now();
-                let num_tabs = self.tabs.len();
-                let active_tab_idx = self.active_tab;
-                let fade_duration_ms = self.config.inactive_pane_fade_ms;
-                let inactive_dim = self.config.inactive_pane_dim;
-                
-                if let Some(renderer) = &mut self.renderer {
-                    if let Some(tab) = self.tabs.get_mut(active_tab_idx) {
-                        // Collect all pane geometries
-                        let geometries = tab.collect_pane_geometries();
-                        let active_pane_id = tab.active_pane;
-                        
-                        // First pass: sync images and calculate dim factors (needs mutable access)
-                        let mut dim_factors: Vec<(PaneId, f32)> = Vec::new();
-                        for (pane_id, _) in &geometries {
-                            if let Some(pane) = tab.panes.get_mut(pane_id) {
-                                let is_active = *pane_id == active_pane_id;
-                                let dim_factor = pane.calculate_dim_factor(is_active, fade_duration_ms, inactive_dim);
-                                dim_factors.push((*pane_id, dim_factor));
-                                
-                                // Sync terminal images to GPU (Kitty graphics protocol)
-                                renderer.sync_images(&mut pane.terminal.image_storage);
-                            }
-                        }
-                        
-                        // Clear custom statusline if the foreground process is no longer neovim/vim
-                        // This handles the case where neovim exits but didn't send a clear command
-                        if let Some(pane) = tab.panes.get_mut(&active_pane_id) {
-                            if pane.custom_statusline.is_some() {
-                                if let Some(proc_name) = pane.pty.foreground_process_name() {
-                                    let is_vim = proc_name == "nvim" || proc_name == "vim" || proc_name == "vi";
-                                    if !is_vim {
-                                        pane.custom_statusline = None;
-                                    }
-                                }
-                            }
-                        }
-                        
-                        // Build render info for all panes
-                        let mut pane_render_data: Vec<(&Terminal, PaneRenderInfo, Option<(usize, usize, usize, usize)>)> = Vec::new();
-                        
-                        for (pane_id, geom) in &geometries {
-                            if let Some(pane) = tab.panes.get(pane_id) {
-                                let is_active = *pane_id == active_pane_id;
-                                let scroll_offset = pane.terminal.scroll_offset;
-                                
-                                // Get pre-calculated dim factor
-                                let dim_factor = dim_factors.iter()
-                                    .find(|(id, _)| id == pane_id)
-                                    .map(|(_, f)| *f)
-                                    .unwrap_or(if is_active { 1.0 } else { inactive_dim });
-                                
-                                // Convert selection to screen coords for this pane
-                                let selection = if is_active {
-                                    let sel = pane.selection.as_ref()
-                                        .and_then(|sel| sel.to_screen_coords(scroll_offset, geom.rows));
-                                    if pane.selection.is_some() {
-                                        log::debug!("Render: pane.selection={:?}, scroll_offset={}, rows={}, screen_coords={:?}", 
-                                            pane.selection, scroll_offset, geom.rows, sel);
-                                    }
-                                    sel
-                                } else {
-                                    None
-                                };
-                                
-                                let render_info = PaneRenderInfo {
-                                    pane_id: pane_id.0,
-                                    x: geom.x,
-                                    y: geom.y,
-                                    width: geom.width,
-                                    height: geom.height,
-                                    cols: geom.cols,
-                                    rows: geom.rows,
-                                    is_active,
-                                    dim_factor,
-                                };
-                                
-                                pane_render_data.push((&pane.terminal, render_info, selection));
-                            }
-                        }
-                        
-                        // Request redraw if any animation is in progress
-                        let animation_in_progress = dim_factors.iter().any(|(id, factor)| {
-                            let is_active = *id == active_pane_id;
-                            if is_active {
-                                *factor < 1.0
-                            } else {
-                                *factor > inactive_dim
-                            }
-                        });
-                        
-                        if animation_in_progress {
-                            if let Some(window) = &self.window {
-                                window.request_redraw();
-                            }
-                        }
-                        
-                        // Handle edge glow animations
-                        let glow_in_progress = !self.edge_glows.is_empty();
-                        
-                        // Check if any pane has animated images
-                        let image_animation_in_progress = tab.panes.values().any(|pane| {
-                            pane.terminal.image_storage.has_animations()
-                        });
-                        
-                        // Get the statusline content for the active pane
-                        // If the pane has a custom statusline (from neovim), use raw ANSI content
-                        let statusline_content: StatuslineContent = tab.panes.get(&active_pane_id)
-                            .map(|pane| {
-                                if let Some(ref custom) = pane.custom_statusline {
-                                    // Use raw ANSI content directly - no parsing into sections
-                                    StatuslineContent::Raw(custom.clone())
-                                } else if let Some(cwd) = pane.pty.foreground_cwd() {
-                                    // Default: CWD and git sections
-                                    let mut sections = vec![build_cwd_section(&cwd)];
-                                    if let Some(git_section) = build_git_section(&cwd) {
-                                        sections.push(git_section);
-                                    }
-                                    StatuslineContent::Sections(sections)
-                                } else {
-                                    StatuslineContent::Sections(Vec::new())
-                                }
-                            })
-                            .unwrap_or_default();
-                        
-                        match renderer.render_panes(&pane_render_data, num_tabs, active_tab_idx, &self.edge_glows, self.config.edge_glow_intensity, &statusline_content) {
-                            Ok(_) => {}
-                            Err(wgpu::SurfaceError::Lost) => {
-                                renderer.resize(renderer.width, renderer.height);
-                            }
-                            Err(wgpu::SurfaceError::OutOfMemory) => {
-                                log::error!("Out of GPU memory!");
-                                event_loop.exit();
-                            }
-                            Err(e) => {
-                                log::error!("Render error: {:?}", e);
-                            }
-                        }
-                        
-                        // Request redraw if edge glow or image animation is in progress
-                        if glow_in_progress || image_animation_in_progress {
-                            if let Some(window) = &self.window {
-                                window.request_redraw();
-                            }
-                        }
-                    }
+                // Log cumulative stats every second (only with render_timing feature)
+                #[cfg(feature = "render_timing")]
+                if self.last_stats_log.elapsed() >= Duration::from_secs(1) {
+                    let parse_ms = self.total_parse_ns as f64 / 1_000_000.0;
+                    let render_ms = self.total_render_ns as f64 / 1_000_000.0;
+                    log::info!("STATS: parse={:.1}ms/{} render={:.1}ms/{} ratio={:.2}",
+                        parse_ms, self.parse_count,
+                        render_ms, self.render_count,
+                        if parse_ms > 0.0 { render_ms / parse_ms } else { 0.0 });
+                    self.total_parse_ns = 0;
+                    self.total_render_ns = 0;
+                    self.parse_count = 0;
+                    self.render_count = 0;
+                    self.last_stats_log = std::time::Instant::now();
                 }
                 
-                // Clean up finished edge glow animations
-                self.edge_glows.retain(|g| !g.is_finished());
-                
-                let render_time = render_start.elapsed();
-                let frame_time = frame_start.elapsed();
-                
-                if frame_time.as_millis() > 10 {
-                    log::info!("Slow frame: total={:?} render={:?}", 
-                        frame_time, render_time);
+                #[cfg(feature = "render_timing")]
+                {
+                    let frame_time = frame_start.elapsed();
+                    if frame_time.as_millis() > 16 {
+                        log::info!("Slow frame: {:?}", frame_time);
+                    }
                 }
             }
 

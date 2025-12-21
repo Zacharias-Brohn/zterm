@@ -88,7 +88,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 }
 
 @group(0) @binding(0)
-var atlas_texture: texture_2d_array<f32>;
+var atlas_textures: binding_array<texture_2d<f32>>;
 @group(0) @binding(1)
 var atlas_sampler: sampler;
 
@@ -103,7 +103,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     
     // Sample from RGBA atlas (layer 0 for legacy rendering)
-    let glyph_sample = textureSample(atlas_texture, atlas_sampler, in.uv, 0);
+    let glyph_sample = textureSample(atlas_textures[0], atlas_sampler, in.uv);
     
     // Detect color glyphs: regular glyphs are stored as white (1,1,1) with alpha
     // Color glyphs have actual RGB colors. Check if any RGB channel is not white.
@@ -697,7 +697,7 @@ fn fs_cell(in: CellVertexOutput) -> @location(0) vec4<f32> {
             } else {
                 // Non-block cursors (bar, underline) - sample from pre-rendered cursor sprite
                 // The cursor_uv was calculated in the vertex shader
-                let cursor_sample = textureSample(atlas_texture, atlas_sampler, in.cursor_uv, in.cursor_layer);
+                let cursor_sample = textureSample(atlas_textures[in.cursor_layer], atlas_sampler, in.cursor_uv);
                 let cursor_alpha = cursor_sample.a;
                 
                 if cursor_alpha > 0.0 {
@@ -720,7 +720,7 @@ fn fs_cell(in: CellVertexOutput) -> @location(0) vec4<f32> {
     let has_glyph = in.uv.x != 0.0 || in.uv.y != 0.0;
     
     if has_glyph {
-        let glyph_sample = textureSample(atlas_texture, atlas_sampler, in.uv, in.glyph_layer);
+        let glyph_sample = textureSample(atlas_textures[in.glyph_layer], atlas_sampler, in.uv);
         
         if in.is_colored_glyph == 1u {
             // Colored glyph (emoji) - use atlas color directly
@@ -744,7 +744,7 @@ fn fs_cell(in: CellVertexOutput) -> @location(0) vec4<f32> {
     
     // Sample and blend underline decoration if present
     if in.has_underline > 0u {
-        let underline_sample = textureSample(atlas_texture, atlas_sampler, in.underline_uv, in.underline_layer);
+        let underline_sample = textureSample(atlas_textures[in.underline_layer], atlas_sampler, in.underline_uv);
         let underline_alpha = underline_sample.a;
         
         if underline_alpha > 0.0 {
@@ -758,7 +758,7 @@ fn fs_cell(in: CellVertexOutput) -> @location(0) vec4<f32> {
     
     // Sample and blend strikethrough decoration if present
     if in.has_strikethrough > 0u {
-        let strike_sample = textureSample(atlas_texture, atlas_sampler, in.strike_uv, in.strike_layer);
+        let strike_sample = textureSample(atlas_textures[in.strike_layer], atlas_sampler, in.strike_uv);
         let strike_alpha = strike_sample.a;
         
         if strike_alpha > 0.0 {

@@ -52,11 +52,15 @@ impl Keybind {
             let key_part = &lowercase[last_plus + 1..];
             let mod_part = &lowercase[..last_plus];
             // Normalize symbol names to actual characters
-            let key = Self::normalize_key_name(key_part);
+            let key = Self::normalize_key_name(key_part)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| key_part.to_string());
             (mod_part, key)
         } else {
             // No modifiers, just a key
-            let key = Self::normalize_key_name(&lowercase);
+            let key = Self::normalize_key_name(&lowercase)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| lowercase.clone());
             ("", key)
         };
         
@@ -86,77 +90,78 @@ impl Keybind {
     
     /// Normalizes key names to their canonical form.
     /// Supports both symbol names ("plus", "minus") and literal symbols ("+", "-").
-    fn normalize_key_name(name: &str) -> String {
-        match name {
+    /// Returns a static str for known keys, None for unknown (caller uses input).
+    fn normalize_key_name(name: &str) -> Option<&'static str> {
+        Some(match name {
             // Arrow keys
-            "left" | "arrowleft" | "arrow_left" => "left".to_string(),
-            "right" | "arrowright" | "arrow_right" => "right".to_string(),
-            "up" | "arrowup" | "arrow_up" => "up".to_string(),
-            "down" | "arrowdown" | "arrow_down" => "down".to_string(),
+            "left" | "arrowleft" | "arrow_left" => "left",
+            "right" | "arrowright" | "arrow_right" => "right",
+            "up" | "arrowup" | "arrow_up" => "up",
+            "down" | "arrowdown" | "arrow_down" => "down",
             
             // Other special keys
-            "enter" | "return" => "enter".to_string(),
-            "tab" => "tab".to_string(),
-            "escape" | "esc" => "escape".to_string(),
-            "backspace" | "back" => "backspace".to_string(),
-            "delete" | "del" => "delete".to_string(),
-            "insert" | "ins" => "insert".to_string(),
-            "home" => "home".to_string(),
-            "end" => "end".to_string(),
-            "pageup" | "page_up" | "pgup" => "pageup".to_string(),
-            "pagedown" | "page_down" | "pgdn" => "pagedown".to_string(),
+            "enter" | "return" => "enter",
+            "tab" => "tab",
+            "escape" | "esc" => "escape",
+            "backspace" | "back" => "backspace",
+            "delete" | "del" => "delete",
+            "insert" | "ins" => "insert",
+            "home" => "home",
+            "end" => "end",
+            "pageup" | "page_up" | "pgup" => "pageup",
+            "pagedown" | "page_down" | "pgdn" => "pagedown",
             
             // Function keys
-            "f1" => "f1".to_string(),
-            "f2" => "f2".to_string(),
-            "f3" => "f3".to_string(),
-            "f4" => "f4".to_string(),
-            "f5" => "f5".to_string(),
-            "f6" => "f6".to_string(),
-            "f7" => "f7".to_string(),
-            "f8" => "f8".to_string(),
-            "f9" => "f9".to_string(),
-            "f10" => "f10".to_string(),
-            "f11" => "f11".to_string(),
-            "f12" => "f12".to_string(),
+            "f1" => "f1",
+            "f2" => "f2",
+            "f3" => "f3",
+            "f4" => "f4",
+            "f5" => "f5",
+            "f6" => "f6",
+            "f7" => "f7",
+            "f8" => "f8",
+            "f9" => "f9",
+            "f10" => "f10",
+            "f11" => "f11",
+            "f12" => "f12",
             
             // Symbol name aliases
-            "plus" => "+".to_string(),
-            "minus" => "-".to_string(),
-            "equal" | "equals" => "=".to_string(),
-            "bracket_left" | "bracketleft" | "lbracket" => "[".to_string(),
-            "bracket_right" | "bracketright" | "rbracket" => "]".to_string(),
-            "brace_left" | "braceleft" | "lbrace" => "{".to_string(),
-            "brace_right" | "braceright" | "rbrace" => "}".to_string(),
-            "semicolon" => ";".to_string(),
-            "colon" => ":".to_string(),
-            "apostrophe" | "quote" => "'".to_string(),
-            "quotedbl" | "doublequote" => "\"".to_string(),
-            "comma" => ",".to_string(),
-            "period" | "dot" => ".".to_string(),
-            "slash" => "/".to_string(),
-            "backslash" => "\\".to_string(),
-            "grave" | "backtick" => "`".to_string(),
-            "tilde" => "~".to_string(),
-            "at" => "@".to_string(),
-            "hash" | "pound" => "#".to_string(),
-            "dollar" => "$".to_string(),
-            "percent" => "%".to_string(),
-            "caret" => "^".to_string(),
-            "ampersand" => "&".to_string(),
-            "asterisk" | "star" => "*".to_string(),
-            "paren_left" | "parenleft" | "lparen" => "(".to_string(),
-            "paren_right" | "parenright" | "rparen" => ")".to_string(),
-            "underscore" => "_".to_string(),
-            "pipe" | "bar" => "|".to_string(),
-            "question" => "?".to_string(),
-            "exclam" | "exclamation" | "bang" => "!".to_string(),
-            "less" | "lessthan" => "<".to_string(),
-            "greater" | "greaterthan" => ">".to_string(),
-            "space" => " ".to_string(),
-            // Pass through everything else as-is
-            _ => name.to_string(),
-        }
+            "plus" => "+",
+            "minus" => "-",
+            "equal" | "equals" => "=",
+            "bracket_left" | "bracketleft" | "lbracket" => "[",
+            "bracket_right" | "bracketright" | "rbracket" => "]",
+            "brace_left" | "braceleft" | "lbrace" => "{",
+            "brace_right" | "braceright" | "rbrace" => "}",
+            "semicolon" => ";",
+            "colon" => ":",
+            "apostrophe" | "quote" => "'",
+            "quotedbl" | "doublequote" => "\"",
+            "comma" => ",",
+            "period" | "dot" => ".",
+            "slash" => "/",
+            "backslash" => "\\",
+            "grave" | "backtick" => "`",
+            "tilde" => "~",
+            "at" => "@",
+            "hash" | "pound" => "#",
+            "dollar" => "$",
+            "percent" => "%",
+            "caret" => "^",
+            "ampersand" => "&",
+            "asterisk" | "star" => "*",
+            "paren_left" | "parenleft" | "lparen" => "(",
+            "paren_right" | "parenright" | "rparen" => ")",
+            "underscore" => "_",
+            "pipe" | "bar" => "|",
+            "question" => "?",
+            "exclam" | "exclamation" | "bang" => "!",
+            "less" | "lessthan" => "<",
+            "greater" | "greaterthan" => ">",
+            "space" => " ",
+            // Unknown - caller handles passthrough
+            _ => return None,
+        })
     }
 }
 
@@ -281,68 +286,34 @@ impl Keybindings {
     pub fn build_action_map(&self) -> HashMap<(bool, bool, bool, bool, String), Action> {
         let mut map = HashMap::new();
         
-        if let Some(parsed) = self.new_tab.parse() {
-            map.insert(parsed, Action::NewTab);
-        }
-        if let Some(parsed) = self.next_tab.parse() {
-            map.insert(parsed, Action::NextTab);
-        }
-        if let Some(parsed) = self.prev_tab.parse() {
-            map.insert(parsed, Action::PrevTab);
-        }
-        if let Some(parsed) = self.tab_1.parse() {
-            map.insert(parsed, Action::Tab1);
-        }
-        if let Some(parsed) = self.tab_2.parse() {
-            map.insert(parsed, Action::Tab2);
-        }
-        if let Some(parsed) = self.tab_3.parse() {
-            map.insert(parsed, Action::Tab3);
-        }
-        if let Some(parsed) = self.tab_4.parse() {
-            map.insert(parsed, Action::Tab4);
-        }
-        if let Some(parsed) = self.tab_5.parse() {
-            map.insert(parsed, Action::Tab5);
-        }
-        if let Some(parsed) = self.tab_6.parse() {
-            map.insert(parsed, Action::Tab6);
-        }
-        if let Some(parsed) = self.tab_7.parse() {
-            map.insert(parsed, Action::Tab7);
-        }
-        if let Some(parsed) = self.tab_8.parse() {
-            map.insert(parsed, Action::Tab8);
-        }
-        if let Some(parsed) = self.tab_9.parse() {
-            map.insert(parsed, Action::Tab9);
-        }
-        if let Some(parsed) = self.split_horizontal.parse() {
-            map.insert(parsed, Action::SplitHorizontal);
-        }
-        if let Some(parsed) = self.split_vertical.parse() {
-            map.insert(parsed, Action::SplitVertical);
-        }
-        if let Some(parsed) = self.close_pane.parse() {
-            map.insert(parsed, Action::ClosePane);
-        }
-        if let Some(parsed) = self.focus_pane_up.parse() {
-            map.insert(parsed, Action::FocusPaneUp);
-        }
-        if let Some(parsed) = self.focus_pane_down.parse() {
-            map.insert(parsed, Action::FocusPaneDown);
-        }
-        if let Some(parsed) = self.focus_pane_left.parse() {
-            map.insert(parsed, Action::FocusPaneLeft);
-        }
-        if let Some(parsed) = self.focus_pane_right.parse() {
-            map.insert(parsed, Action::FocusPaneRight);
-        }
-        if let Some(parsed) = self.copy.parse() {
-            map.insert(parsed, Action::Copy);
-        }
-        if let Some(parsed) = self.paste.parse() {
-            map.insert(parsed, Action::Paste);
+        let bindings: &[(&Keybind, Action)] = &[
+            (&self.new_tab, Action::NewTab),
+            (&self.next_tab, Action::NextTab),
+            (&self.prev_tab, Action::PrevTab),
+            (&self.tab_1, Action::Tab1),
+            (&self.tab_2, Action::Tab2),
+            (&self.tab_3, Action::Tab3),
+            (&self.tab_4, Action::Tab4),
+            (&self.tab_5, Action::Tab5),
+            (&self.tab_6, Action::Tab6),
+            (&self.tab_7, Action::Tab7),
+            (&self.tab_8, Action::Tab8),
+            (&self.tab_9, Action::Tab9),
+            (&self.split_horizontal, Action::SplitHorizontal),
+            (&self.split_vertical, Action::SplitVertical),
+            (&self.close_pane, Action::ClosePane),
+            (&self.focus_pane_up, Action::FocusPaneUp),
+            (&self.focus_pane_down, Action::FocusPaneDown),
+            (&self.focus_pane_left, Action::FocusPaneLeft),
+            (&self.focus_pane_right, Action::FocusPaneRight),
+            (&self.copy, Action::Copy),
+            (&self.paste, Action::Paste),
+        ];
+        
+        for (keybind, action) in bindings {
+            if let Some(parsed) = keybind.parse() {
+                map.insert(parsed, *action);
+            }
         }
         
         map

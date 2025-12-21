@@ -2,7 +2,7 @@
 
 use crate::graphics::{GraphicsCommand, ImageStorage};
 use crate::keyboard::{query_response, KeyboardState};
-use crate::vt_parser::{CsiParams, Handler, Parser};
+use crate::vt_parser::{CsiParams, Handler};
 use unicode_width::UnicodeWidthChar;
 
 /// Commands that the terminal can send to the application.
@@ -265,50 +265,80 @@ struct AlternateScreen {
 }
 
 /// Timing stats for performance debugging.
+/// Only populated when the `render_timing` feature is enabled.
 #[derive(Debug, Default)]
 pub struct ProcessingStats {
+    #[cfg(feature = "render_timing")]
     /// Total time spent in scroll_up operations (nanoseconds).
     pub scroll_up_ns: u64,
+    #[cfg(feature = "render_timing")]
     /// Number of scroll_up calls.
     pub scroll_up_count: u32,
+    #[cfg(feature = "render_timing")]
     /// Total time spent in scrollback operations (nanoseconds).
     pub scrollback_ns: u64,
+    #[cfg(feature = "render_timing")]
     /// Time in VecDeque pop_front.
     pub pop_front_ns: u64,
+    #[cfg(feature = "render_timing")]
     /// Time in VecDeque push_back.
     pub push_back_ns: u64,
+    #[cfg(feature = "render_timing")]
     /// Time in mem::swap.
     pub swap_ns: u64,
+    #[cfg(feature = "render_timing")]
     /// Total time spent in line clearing (nanoseconds).
     pub clear_line_ns: u64,
+    #[cfg(feature = "render_timing")]
     /// Total time spent in text handler (nanoseconds).
     pub text_handler_ns: u64,
+    #[cfg(feature = "render_timing")]
+    /// Total time spent in CSI handler (nanoseconds).
+    pub csi_handler_ns: u64,
+    #[cfg(feature = "render_timing")]
+    /// Number of CSI sequences processed.
+    pub csi_count: u32,
+    #[cfg(feature = "render_timing")]
     /// Number of characters processed.
     pub chars_processed: u32,
+    #[cfg(feature = "render_timing")]
+    /// Total time spent in VT parser (consume_input) - nanoseconds.
+    pub vt_parser_ns: u64,
+    #[cfg(feature = "render_timing")]
+    /// Number of consume_input calls.
+    pub consume_input_count: u32,
 }
 
 impl ProcessingStats {
+    #[cfg(feature = "render_timing")]
     pub fn reset(&mut self) {
         *self = Self::default();
     }
     
+    #[cfg(not(feature = "render_timing"))]
+    pub fn reset(&mut self) {}
+    
+    #[cfg(feature = "render_timing")]
     pub fn log_if_slow(&self, threshold_ms: u64) {
-        let total_ms = (self.scroll_up_ns + self.text_handler_ns) / 1_000_000;
+        let total_ms = (self.scroll_up_ns + self.text_handler_ns + self.csi_handler_ns) / 1_000_000;
         if total_ms >= threshold_ms {
+            let vt_only_ns = self.vt_parser_ns.saturating_sub(self.text_handler_ns + self.csi_handler_ns);
             log::info!(
-                "TIMING: scroll_up={:.2}ms ({}x), scrollback={:.2}ms [pop={:.2}ms swap={:.2}ms push={:.2}ms], clear={:.2}ms, text={:.2}ms, chars={}",
-                self.scroll_up_ns as f64 / 1_000_000.0,
-                self.scroll_up_count,
-                self.scrollback_ns as f64 / 1_000_000.0,
-                self.pop_front_ns as f64 / 1_000_000.0,
-                self.swap_ns as f64 / 1_000_000.0,
-                self.push_back_ns as f64 / 1_000_000.0,
-                self.clear_line_ns as f64 / 1_000_000.0,
+                "[PARSE_DETAIL] text={:.2}ms ({}chars) csi={:.2}ms ({}x) vt_only={:.2}ms ({}calls) scroll={:.2}ms ({}x)",
                 self.text_handler_ns as f64 / 1_000_000.0,
                 self.chars_processed,
+                self.csi_handler_ns as f64 / 1_000_000.0,
+                self.csi_count,
+                vt_only_ns as f64 / 1_000_000.0,
+                self.consume_input_count,
+                self.scroll_up_ns as f64 / 1_000_000.0,
+                self.scroll_up_count,
             );
         }
     }
+    
+    #[cfg(not(feature = "render_timing"))]
+    pub fn log_if_slow(&self, _threshold_ms: u64) {}
 }
 
 /// Kitty-style ring buffer for scrollback history.
@@ -496,11 +526,6 @@ pub struct Terminal {
     pub focus_reporting: bool,
     /// Synchronized output mode (for reducing flicker).
     synchronized_output: bool,
-    /// Pool of pre-allocated empty lines to avoid allocation during scrolling.
-    /// When we need a new line, we pop from this pool instead of allocating.
-    line_pool: Vec<Vec<Cell>>,
-    /// VT parser for escape sequence handling.
-    parser: Option<Parser>,
     /// Performance timing stats (for debugging).
     pub stats: ProcessingStats,
     /// Command queue for terminal-to-application communication.
@@ -517,21 +542,12 @@ pub struct Terminal {
 impl Terminal {
     /// Default scrollback limit (10,000 lines for better cache performance).
     pub const DEFAULT_SCROLLBACK_LIMIT: usize = 10_000;
-    
-    /// Size of the line pool for recycling allocations.
-    /// This avoids allocation during the first N scrolls before scrollback is full.
-    const LINE_POOL_SIZE: usize = 64;
 
     /// Creates a new terminal with the given dimensions and scrollback limit.
     pub fn new(cols: usize, rows: usize, scrollback_limit: usize) -> Self {
         log::info!("Terminal::new: cols={}, rows={}, scroll_bottom={}", cols, rows, rows.saturating_sub(1));
         let grid = vec![vec![Cell::default(); cols]; rows];
         let line_map: Vec<usize> = (0..rows).collect();
-        
-        // Pre-allocate a pool of empty lines to avoid allocation during scrolling
-        let line_pool: Vec<Vec<Cell>> = (0..Self::LINE_POOL_SIZE)
-            .map(|_| vec![Cell::default(); cols])
-            .collect();
 
         Self {
             grid,
@@ -567,24 +583,12 @@ impl Terminal {
             bracketed_paste: false,
             focus_reporting: false,
             synchronized_output: false,
-            line_pool,
-            parser: Some(Parser::new()),
             stats: ProcessingStats::default(),
             command_queue: Vec::new(),
             image_storage: ImageStorage::new(),
             cell_width: 10.0,  // Default, will be set by renderer
             cell_height: 20.0, // Default, will be set by renderer
         }
-    }
-    
-    /// Return a line to the pool for reuse (if pool isn't full).
-    #[allow(dead_code)]
-    #[inline]
-    fn return_line_to_pool(&mut self, line: Vec<Cell>) {
-        if self.line_pool.len() < Self::LINE_POOL_SIZE {
-            self.line_pool.push(line);
-        }
-        // Otherwise, let the line be dropped
     }
     
     /// Mark a specific line as dirty (needs redrawing).
@@ -642,6 +646,32 @@ impl Terminal {
         self.synchronized_output
     }
     
+    /// Advance cursor to next row, scrolling if necessary.
+    /// This is the common pattern: increment row, scroll if past scroll_bottom.
+    #[inline]
+    fn advance_row(&mut self) {
+        self.cursor_row += 1;
+        if self.cursor_row > self.scroll_bottom {
+            self.scroll_up(1);
+            self.cursor_row = self.scroll_bottom;
+        }
+    }
+    
+    /// Create a cell with current text attributes.
+    #[inline]
+    fn make_cell(&self, character: char, wide_continuation: bool) -> Cell {
+        Cell {
+            character,
+            fg_color: self.current_fg,
+            bg_color: self.current_bg,
+            bold: self.current_bold,
+            italic: self.current_italic,
+            underline_style: self.current_underline_style,
+            strikethrough: self.current_strikethrough,
+            wide_continuation,
+        }
+    }
+    
     /// Get the actual grid row index for a visual row.
     #[inline]
     pub fn grid_row(&self, visual_row: usize) -> usize {
@@ -667,7 +697,7 @@ impl Terminal {
         let blank = self.blank_cell();
         let row = &mut self.grid[grid_row];
         // Ensure row has correct width (may differ after swap with scrollback post-resize)
-        row.resize(self.cols, blank.clone());
+        row.resize(self.cols, blank);
         row.fill(blank);
     }
 
@@ -695,16 +725,8 @@ impl Terminal {
         }
     }
 
-    /// Processes raw bytes from the PTY using the internal VT parser.
-    /// Uses Kitty-style architecture: UTF-8 decode until ESC, then parse escape sequences.
-    pub fn process(&mut self, bytes: &[u8]) {
-        // We need to temporarily take ownership of the parser to satisfy the borrow checker,
-        // since parse() needs &mut self for both parser and handler (Terminal).
-        // Use Option::take to avoid creating a new default parser each time.
-        if let Some(mut parser) = self.parser.take() {
-            parser.parse(bytes, self);
-            self.parser = Some(parser);
-        }
+    /// Mark terminal as dirty (needs redraw). Called after parsing.
+    pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }
 
@@ -836,7 +858,8 @@ impl Terminal {
         let region_size = self.scroll_bottom - self.scroll_top + 1;
         let n = n.min(region_size);
         
-        self.stats.scroll_up_count += n as u32;
+        #[cfg(feature = "render_timing")]
+        { self.stats.scroll_up_count += n as u32; }
         
         for _ in 0..n {
             // Save the top line's grid index before rotation
@@ -869,14 +892,36 @@ impl Terminal {
         self.mark_region_dirty(self.scroll_top, self.scroll_bottom);
     }
     
-    /// Mark a range of lines as dirty efficiently.
+    /// Mark a range of lines as dirty efficiently using bitmask operations.
     #[inline]
     fn mark_region_dirty(&mut self, start: usize, end: usize) {
-        // For small regions (< 64 lines), this is faster than individual calls
-        for line in start..=end.min(255) {
-            let word = line / 64;
-            let bit = line % 64;
-            self.dirty_lines[word] |= 1u64 << bit;
+        let end = end.min(255);
+        if start > end {
+            return;
+        }
+        
+        // Process each 64-bit word that overlaps with [start, end]
+        let start_word = start / 64;
+        let end_word = end / 64;
+        
+        for word_idx in start_word..=end_word.min(3) {
+            let word_start = word_idx * 64;
+            let word_end = word_start + 63;
+            
+            // Calculate bit range within this word
+            let bit_start = if start > word_start { start - word_start } else { 0 };
+            let bit_end = if end < word_end { end - word_start } else { 63 };
+            
+            // Create mask for bits [bit_start, bit_end]
+            // mask = ((1 << (bit_end - bit_start + 1)) - 1) << bit_start
+            let num_bits = bit_end - bit_start + 1;
+            let mask = if num_bits >= 64 {
+                !0u64
+            } else {
+                ((1u64 << num_bits) - 1) << bit_start
+            };
+            
+            self.dirty_lines[word_idx] |= mask;
         }
     }
 
@@ -1097,6 +1142,39 @@ impl Terminal {
         
         rows
     }
+    
+    /// Get a single visible row by index without allocation.
+    /// Returns None if row_idx is out of bounds.
+    #[inline]
+    pub fn get_visible_row(&self, row_idx: usize) -> Option<&Vec<Cell>> {
+        if row_idx >= self.rows {
+            return None;
+        }
+        
+        if self.scroll_offset == 0 {
+            // No scrollback viewing, just return from grid via line_map
+            Some(&self.grid[self.line_map[row_idx]])
+        } else {
+            // We're viewing scrollback
+            let scrollback_len = self.scrollback.len();
+            let lines_from_scrollback = self.scroll_offset.min(self.rows);
+            
+            if row_idx < lines_from_scrollback {
+                // This row comes from scrollback
+                let scrollback_idx = scrollback_len - self.scroll_offset + row_idx;
+                self.scrollback.get(scrollback_idx)
+                    .or_else(|| Some(&self.grid[self.line_map[row_idx]]))
+            } else {
+                // This row comes from the grid
+                let grid_visual_idx = row_idx - lines_from_scrollback;
+                if grid_visual_idx < self.rows {
+                    Some(&self.grid[self.line_map[grid_visual_idx]])
+                } else {
+                    None
+                }
+            }
+        }
+    }
 
     /// Inserts n blank lines at the cursor position, scrolling lines below down.
     /// Uses line_map rotation for efficiency.
@@ -1119,11 +1197,11 @@ impl Terminal {
             
             // Clear the recycled line (now at cursor position)
             self.clear_grid_row(recycled_grid_row);
-            
-            // Mark affected lines dirty
-            for line in self.cursor_row..=self.scroll_bottom {
-                self.mark_line_dirty(line);
-            }
+        }
+        
+        // Mark affected lines dirty once after all rotations
+        for line in self.cursor_row..=self.scroll_bottom {
+            self.mark_line_dirty(line);
         }
     }
 
@@ -1148,11 +1226,11 @@ impl Terminal {
             
             // Clear the recycled line (now at bottom of scroll region)
             self.clear_grid_row(recycled_grid_row);
-            
-            // Mark affected lines dirty
-            for line in self.cursor_row..=self.scroll_bottom {
-                self.mark_line_dirty(line);
-            }
+        }
+        
+        // Mark affected lines dirty once after all rotations
+        for line in self.cursor_row..=self.scroll_bottom {
+            self.mark_line_dirty(line);
         }
     }
 
@@ -1162,14 +1240,10 @@ impl Terminal {
         let blank = self.blank_cell();
         let row = &mut self.grid[grid_row];
         let n = n.min(self.cols - self.cursor_col);
-        // Remove n characters from the end
-        for _ in 0..n {
-            row.pop();
-        }
-        // Insert n blank characters at cursor position
-        for _ in 0..n {
-            row.insert(self.cursor_col, blank);
-        }
+        // Truncate n characters from the end
+        row.truncate(self.cols - n);
+        // Insert n blank characters at cursor position (single O(cols) operation)
+        row.splice(self.cursor_col..self.cursor_col, std::iter::repeat(blank).take(n));
         self.mark_line_dirty(self.cursor_row);
     }
 
@@ -1179,16 +1253,11 @@ impl Terminal {
         let blank = self.blank_cell();
         let row = &mut self.grid[grid_row];
         let n = n.min(self.cols - self.cursor_col);
-        // Remove n characters at cursor position
-        for _ in 0..n {
-            if self.cursor_col < row.len() {
-                row.remove(self.cursor_col);
-            }
-        }
+        let end = (self.cursor_col + n).min(row.len());
+        // Remove n characters at cursor position (single O(cols) operation)
+        row.drain(self.cursor_col..end);
         // Pad with blank characters at the end
-        while row.len() < self.cols {
-            row.push(blank);
-        }
+        row.resize(self.cols, blank);
         self.mark_line_dirty(self.cursor_row);
     }
 
@@ -1197,21 +1266,18 @@ impl Terminal {
         let grid_row = self.line_map[self.cursor_row];
         let n = n.min(self.cols - self.cursor_col);
         let blank = self.blank_cell();
-        for i in 0..n {
-            if self.cursor_col + i < self.cols {
-                self.grid[grid_row][self.cursor_col + i] = blank;
-            }
-        }
+        // Fill range with blanks (bounds already guaranteed by min above)
+        self.grid[grid_row][self.cursor_col..self.cursor_col + n].fill(blank);
         self.mark_line_dirty(self.cursor_row);
     }
 
     /// Clears the current line from cursor to end.
+    #[inline]
     fn clear_line_from_cursor(&mut self) {
         let grid_row = self.line_map[self.cursor_row];
         let blank = self.blank_cell();
-        for col in self.cursor_col..self.cols {
-            self.grid[grid_row][col] = blank;
-        }
+        // Use slice fill for efficiency
+        self.grid[grid_row][self.cursor_col..].fill(blank);
         self.mark_line_dirty(self.cursor_row);
     }
 
@@ -1243,9 +1309,12 @@ impl Terminal {
 }
 
 impl Handler for Terminal {
-    /// Handle a chunk of decoded text (Unicode codepoints).
+    /// Handle a chunk of decoded text (Unicode codepoints as u32).
     /// This includes control characters (0x00-0x1F except ESC).
-    fn text(&mut self, chars: &[char]) {
+    fn text(&mut self, codepoints: &[u32]) {
+        #[cfg(feature = "render_timing")]
+        let start = std::time::Instant::now();
+        
         // Cache the current line to avoid repeated line_map lookups
         let mut cached_row = self.cursor_row;
         let mut grid_row = self.line_map[cached_row];
@@ -1253,25 +1322,27 @@ impl Handler for Terminal {
         // Mark the initial line as dirty (like Kitty's init_text_loop_line)
         self.mark_line_dirty(cached_row);
         
-        for &c in chars {
-            match c {
+        for &cp in codepoints {
+            // Fast path for ASCII control characters and printable ASCII
+            // These are the most common cases, so check them first using u32 directly
+            match cp {
                 // Bell
-                '\x07' => {
+                0x07 => {
                     // BEL - ignore for now (could trigger visual bell)
                 }
                 // Backspace
-                '\x08' => {
+                0x08 => {
                     if self.cursor_col > 0 {
                         self.cursor_col -= 1;
                     }
                 }
                 // Tab
-                '\x09' => {
+                0x09 => {
                     let next_tab = (self.cursor_col / 8 + 1) * 8;
                     self.cursor_col = next_tab.min(self.cols - 1);
                 }
                 // Line feed, Vertical tab, Form feed
-                '\x0A' | '\x0B' | '\x0C' => {
+                0x0A | 0x0B | 0x0C => {
                     let old_row = self.cursor_row;
                     self.cursor_row += 1;
                     if self.cursor_row > self.scroll_bottom {
@@ -1286,21 +1357,17 @@ impl Handler for Terminal {
                     self.mark_line_dirty(cached_row);
                 }
                 // Carriage return
-                '\x0D' => {
+                0x0D => {
                     self.cursor_col = 0;
                 }
                 // Fast path for printable ASCII (0x20-0x7E) - like Kitty
                 // ASCII is always width 1, never zero-width, never wide
-                c if c >= ' ' && c <= '~' => {
+                cp if cp >= 0x20 && cp <= 0x7E => {
                     // Handle wrap
                     if self.cursor_col >= self.cols {
                         if self.auto_wrap {
                             self.cursor_col = 0;
-                            self.cursor_row += 1;
-                            if self.cursor_row > self.scroll_bottom {
-                                self.scroll_up(1);
-                                self.cursor_row = self.scroll_bottom;
-                            }
+                            self.advance_row();
                             cached_row = self.cursor_row;
                             grid_row = self.line_map[cached_row];
                             self.mark_line_dirty(cached_row);
@@ -1310,111 +1377,21 @@ impl Handler for Terminal {
                     }
                     
                     // Write character directly - no wide char handling needed for ASCII
-                    self.grid[grid_row][self.cursor_col] = Cell {
-                        character: c,
-                        fg_color: self.current_fg,
-                        bg_color: self.current_bg,
-                        bold: self.current_bold,
-                        italic: self.current_italic,
-                        underline_style: self.current_underline_style,
-                        strikethrough: self.current_strikethrough,
-                        wide_continuation: false,
-                    };
+                    // SAFETY: cp is in 0x20..=0x7E which are valid ASCII chars
+                    let c = unsafe { char::from_u32_unchecked(cp) };
+                    self.grid[grid_row][self.cursor_col] = self.make_cell(c, false);
                     self.cursor_col += 1;
                 }
                 // Slow path for non-ASCII printable characters (including all Unicode)
-                c if c > '~' => {
-                    // Determine character width using Unicode Standard Annex #11
-                    let char_width = c.width().unwrap_or(1);
-                    
-                    // Skip zero-width characters (combining marks, etc.)
-                    if char_width == 0 {
-                        // TODO: Handle combining characters
-                        continue;
-                    }
-                    
-                    // Handle wrap
-                    if self.cursor_col >= self.cols {
-                        if self.auto_wrap {
-                            self.cursor_col = 0;
-                            self.cursor_row += 1;
-                            if self.cursor_row > self.scroll_bottom {
-                                self.scroll_up(1);
-                                self.cursor_row = self.scroll_bottom;
-                            }
-                            // Update cache after line change
-                            cached_row = self.cursor_row;
-                            grid_row = self.line_map[cached_row];
-                            // Mark the new line as dirty
-                            self.mark_line_dirty(cached_row);
-                        } else {
-                            self.cursor_col = self.cols - 1;
-                        }
-                    }
-                    
-                    // For double-width characters at end of line, wrap first
-                    if char_width == 2 && self.cursor_col == self.cols - 1 {
-                        if self.auto_wrap {
-                            self.grid[grid_row][self.cursor_col] = Cell::default();
-                            self.cursor_col = 0;
-                            self.cursor_row += 1;
-                            if self.cursor_row > self.scroll_bottom {
-                                self.scroll_up(1);
-                                self.cursor_row = self.scroll_bottom;
-                            }
-                            cached_row = self.cursor_row;
-                            grid_row = self.line_map[cached_row];
-                            // Mark the new line as dirty
-                            self.mark_line_dirty(cached_row);
-                        } else {
-                            continue; // Can't fit
-                        }
-                    }
-                    
-                    // Write character directly using cached grid_row
-                    // Safety: ensure grid row has correct width (may differ after scrollback swap)
-                    if self.grid[grid_row].len() != self.cols {
-                        self.grid[grid_row].resize(self.cols, Cell::default());
-                    }
-                    
-                    // Handle overwriting wide character cells
-                    if self.grid[grid_row][self.cursor_col].wide_continuation && self.cursor_col > 0 {
-                        self.grid[grid_row][self.cursor_col - 1] = Cell::default();
-                    }
-                    if char_width == 1 && self.cursor_col + 1 < self.cols 
-                       && self.grid[grid_row][self.cursor_col + 1].wide_continuation {
-                        self.grid[grid_row][self.cursor_col + 1] = Cell::default();
-                    }
-                    
-                    self.grid[grid_row][self.cursor_col] = Cell {
-                        character: c,
-                        fg_color: self.current_fg,
-                        bg_color: self.current_bg,
-                        bold: self.current_bold,
-                        italic: self.current_italic,
-                        underline_style: self.current_underline_style,
-                        strikethrough: self.current_strikethrough,
-                        wide_continuation: false,
-                    };
-                    self.cursor_col += 1;
-                    
-                    // For double-width, write continuation cell
-                    if char_width == 2 && self.cursor_col < self.cols {
-                        if self.cursor_col + 1 < self.cols 
-                           && self.grid[grid_row][self.cursor_col + 1].wide_continuation {
-                            self.grid[grid_row][self.cursor_col + 1] = Cell::default();
-                        }
-                    self.grid[grid_row][self.cursor_col] = Cell {
-                        character: c,
-                        fg_color: self.current_fg,
-                        bg_color: self.current_bg,
-                        bold: self.current_bold,
-                        italic: self.current_italic,
-                        underline_style: self.current_underline_style,
-                        strikethrough: self.current_strikethrough,
-                        wide_continuation: false,
-                    };
-                        self.cursor_col += 1;
+                // Delegates to print_char() which handles wide characters, wrapping, etc.
+                cp if cp > 0x7E => {
+                    // Convert to char, using replacement character for invalid codepoints
+                    let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                    self.print_char(c);
+                    // Update cached values since print_char may have scrolled or wrapped
+                    if cached_row != self.cursor_row {
+                        cached_row = self.cursor_row;
+                        grid_row = self.line_map[cached_row];
                     }
                 }
                 // Other control chars - ignore
@@ -1422,6 +1399,12 @@ impl Handler for Terminal {
             }
         }
         // Dirty lines are marked incrementally above - no need for mark_all_lines_dirty()
+        
+        #[cfg(feature = "render_timing")]
+        {
+            self.stats.text_handler_ns += start.elapsed().as_nanos() as u64;
+            self.stats.chars_processed += codepoints.len() as u32;
+        }
     }
 
     /// Handle control characters embedded in escape sequences.
@@ -1437,11 +1420,7 @@ impl Handler for Terminal {
                 self.cursor_col = next_tab.min(self.cols - 1);
             }
             0x0A | 0x0B | 0x0C => {
-                self.cursor_row += 1;
-                if self.cursor_row > self.scroll_bottom {
-                    self.scroll_up(1);
-                    self.cursor_row = self.scroll_bottom;
-                }
+                self.advance_row();
             }
             0x0D => {
                 self.cursor_col = 0;
@@ -1617,7 +1596,11 @@ impl Handler for Terminal {
     }
 
     /// Handle a complete CSI sequence.
+    #[inline]
     fn csi(&mut self, params: &CsiParams) {
+        #[cfg(feature = "render_timing")]
+        let start = std::time::Instant::now();
+        
         let action = params.final_char as char;
         let primary = params.primary;
         let secondary = params.secondary;
@@ -1766,13 +1749,40 @@ impl Handler for Terminal {
                 self.insert_characters(n);
             }
             // Repeat preceding character (REP)
+            // Optimized like Kitty: batch writes for ASCII, avoid per-char overhead
             'b' => {
-                let n = params.get(0, 1).max(1) as usize;
-                if self.cursor_col > 0 {
+                let n = (params.get(0, 1).max(1) as usize).min(65535); // Like Kitty's CSI_REP_MAX_REPETITIONS
+                if self.cursor_col > 0 && n > 0 {
                     let grid_row = self.line_map[self.cursor_row];
                     let last_char = self.grid[grid_row][self.cursor_col - 1].character;
-                    for _ in 0..n {
-                        self.print_char(last_char);
+                    let last_cp = last_char as u32;
+                    
+                    // Fast path for ASCII: direct grid write, no width lookup
+                    if last_cp >= 0x20 && last_cp <= 0x7E {
+                        let cell = self.make_cell(last_char, false);
+                        self.mark_line_dirty(self.cursor_row);
+                        
+                        for _ in 0..n {
+                            // Handle wrap
+                            if self.cursor_col >= self.cols {
+                                if self.auto_wrap {
+                                    self.cursor_col = 0;
+                                    self.advance_row();
+                                    self.mark_line_dirty(self.cursor_row);
+                                } else {
+                                    self.cursor_col = self.cols - 1;
+                                }
+                            }
+                            // Direct write - recompute grid_row in case of scroll
+                            let gr = self.line_map[self.cursor_row];
+                            self.grid[gr][self.cursor_col] = cell.clone();
+                            self.cursor_col += 1;
+                        }
+                    } else {
+                        // Slow path for non-ASCII: use print_char for proper width handling
+                        for _ in 0..n {
+                            self.print_char(last_char);
+                        }
                     }
                 }
             }
@@ -1893,6 +1903,12 @@ impl Handler for Terminal {
                 );
             }
         }
+        
+        #[cfg(feature = "render_timing")]
+        {
+            self.stats.csi_handler_ns += start.elapsed().as_nanos() as u64;
+            self.stats.csi_count += 1;
+        }
     }
 
     fn save_cursor(&mut self) {
@@ -2012,6 +2028,15 @@ impl Handler for Terminal {
             self.mark_line_dirty(visual_row);
         }
     }
+    
+    #[cfg(feature = "render_timing")]
+    fn add_vt_parser_ns(&mut self, ns: u64) {
+        self.stats.vt_parser_ns += ns;
+        self.stats.consume_input_count += 1;
+    }
+    
+    #[cfg(not(feature = "render_timing"))]
+    fn add_vt_parser_ns(&mut self, _ns: u64) {}
 }
 
 impl Terminal {
@@ -2035,11 +2060,7 @@ impl Terminal {
         if self.cursor_col >= self.cols {
             if self.auto_wrap {
                 self.cursor_col = 0;
-                self.cursor_row += 1;
-                if self.cursor_row > self.scroll_bottom {
-                    self.scroll_up(1);
-                    self.cursor_row = self.scroll_bottom;
-                }
+                self.advance_row();
             } else {
                 self.cursor_col = self.cols - 1;
             }
@@ -2053,11 +2074,7 @@ impl Terminal {
                 let grid_row = self.line_map[self.cursor_row];
                 self.grid[grid_row][self.cursor_col] = Cell::default();
                 self.cursor_col = 0;
-                self.cursor_row += 1;
-                if self.cursor_row > self.scroll_bottom {
-                    self.scroll_up(1);
-                    self.cursor_row = self.scroll_bottom;
-                }
+                self.advance_row();
             } else {
                 // Can't fit, don't print
                 return;
@@ -2080,16 +2097,7 @@ impl Terminal {
         }
         
         // Write the character to the first cell
-                    self.grid[grid_row][self.cursor_col] = Cell {
-                        character: c,
-                        fg_color: self.current_fg,
-                        bg_color: self.current_bg,
-                        bold: self.current_bold,
-                        italic: self.current_italic,
-                        underline_style: self.current_underline_style,
-                        strikethrough: self.current_strikethrough,
-                        wide_continuation: false,
-                    };
+        self.grid[grid_row][self.cursor_col] = self.make_cell(c, false);
         self.mark_line_dirty(self.cursor_row);
         self.cursor_col += 1;
         
@@ -2102,53 +2110,79 @@ impl Terminal {
                 self.grid[grid_row][self.cursor_col + 1] = Cell::default();
             }
             
-            self.grid[grid_row][self.cursor_col] = Cell {
-                character: ' ',  // Placeholder - renderer will skip this
-                fg_color: self.current_fg,
-                bg_color: self.current_bg,
-                bold: self.current_bold,
-                italic: self.current_italic,
-                underline_style: self.current_underline_style,
-                strikethrough: self.current_strikethrough,
-                wide_continuation: true,
-            };
+            self.grid[grid_row][self.cursor_col] = self.make_cell(' ', true);
             self.cursor_col += 1;
         }
     }
 
+    /// Parse extended color (SGR 38/48) and return the color and number of params consumed.
+    /// Returns (Color, params_consumed) or None if parsing failed.
+    /// 
+    /// SAFETY: Caller must ensure i < params.num_params
+    #[inline(always)]
+    fn parse_extended_color(params: &CsiParams, i: usize) -> Option<(Color, usize)> {
+        let num = params.num_params;
+        let p = &params.params;
+        let is_sub = &params.is_sub_param;
+        
+        // Check for sub-parameter format (38:2:r:g:b or 38:5:idx)
+        if i + 1 < num && is_sub[i + 1] {
+            let mode = p[i + 1];
+            if mode == 5 && i + 2 < num {
+                return Some((Color::Indexed(p[i + 2] as u8), 2));
+            } else if mode == 2 && i + 4 < num {
+                return Some((Color::Rgb(
+                    p[i + 2] as u8,
+                    p[i + 3] as u8,
+                    p[i + 4] as u8,
+                ), 4));
+            }
+        } else if i + 2 < num {
+            // Regular format (38;2;r;g;b or 38;5;idx)
+            let mode = p[i + 1];
+            if mode == 5 {
+                return Some((Color::Indexed(p[i + 2] as u8), 2));
+            } else if mode == 2 && i + 4 < num {
+                return Some((Color::Rgb(
+                    p[i + 2] as u8,
+                    p[i + 3] as u8,
+                    p[i + 4] as u8,
+                ), 4));
+            }
+        }
+        None
+    }
+
     /// Handle SGR (Select Graphic Rendition) parameters.
+    /// This is a hot path - called for every color/style change in terminal output.
+    #[inline(always)]
     fn handle_sgr(&mut self, params: &CsiParams) {
-        if params.num_params == 0 {
-            self.current_fg = Color::Default;
-            self.current_bg = Color::Default;
-            self.current_bold = false;
-            self.current_italic = false;
-            self.current_underline_style = 0;
-            self.current_strikethrough = false;
+        let num = params.num_params;
+        
+        // Fast path: SGR 0 (reset) with no params or explicit 0
+        if num == 0 {
+            self.reset_sgr_attributes();
             return;
         }
 
+        let p = &params.params;
+        let is_sub = &params.is_sub_param;
         let mut i = 0;
-        while i < params.num_params {
-            let code = params.params[i];
+        
+        while i < num {
+            // SAFETY: i < num <= MAX_CSI_PARAMS, so index is always valid
+            let code = p[i];
 
             match code {
-                0 => {
-                    self.current_fg = Color::Default;
-                    self.current_bg = Color::Default;
-                    self.current_bold = false;
-                    self.current_italic = false;
-                    self.current_underline_style = 0;
-                    self.current_strikethrough = false;
-                }
+                0 => self.reset_sgr_attributes(),
                 1 => self.current_bold = true,
+                // 2 => dim (not currently rendered)
                 3 => self.current_italic = true,
                 4 => {
                     // Check for sub-parameter (4:x format for underline style)
-                    if i + 1 < params.num_params && params.is_sub_param[i + 1] {
-                        let style = params.params[i + 1];
+                    if i + 1 < num && is_sub[i + 1] {
                         // 0=none, 1=single, 2=double, 3=curly, 4=dotted, 5=dashed
-                        self.current_underline_style = (style as u8).min(5);
+                        self.current_underline_style = (p[i + 1] as u8).min(5);
                         i += 1;
                     } else {
                         // Plain SGR 4 = single underline
@@ -2157,84 +2191,55 @@ impl Terminal {
                 }
                 7 => std::mem::swap(&mut self.current_fg, &mut self.current_bg),
                 9 => self.current_strikethrough = true,
+                21 => self.current_underline_style = 2, // Double underline
                 22 => self.current_bold = false,
                 23 => self.current_italic = false,
                 24 => self.current_underline_style = 0,
                 27 => std::mem::swap(&mut self.current_fg, &mut self.current_bg),
                 29 => self.current_strikethrough = false,
+                // Standard foreground colors (30-37)
                 30..=37 => self.current_fg = Color::Indexed((code - 30) as u8),
                 38 => {
                     // Extended foreground color
-                    if i + 1 < params.num_params && params.is_sub_param[i + 1] {
-                        let mode = params.params[i + 1];
-                        if mode == 5 && i + 2 < params.num_params {
-                            self.current_fg = Color::Indexed(params.params[i + 2] as u8);
-                            i += 2;
-                        } else if mode == 2 && i + 4 < params.num_params {
-                            self.current_fg = Color::Rgb(
-                                params.params[i + 2] as u8,
-                                params.params[i + 3] as u8,
-                                params.params[i + 4] as u8,
-                            );
-                            i += 4;
-                        }
-                    } else if i + 2 < params.num_params {
-                        let mode = params.params[i + 1];
-                        if mode == 5 {
-                            self.current_fg = Color::Indexed(params.params[i + 2] as u8);
-                            i += 2;
-                        } else if mode == 2 && i + 4 < params.num_params {
-                            self.current_fg = Color::Rgb(
-                                params.params[i + 2] as u8,
-                                params.params[i + 3] as u8,
-                                params.params[i + 4] as u8,
-                            );
-                            i += 4;
-                        }
+                    if let Some((color, consumed)) = Self::parse_extended_color(params, i) {
+                        self.current_fg = color;
+                        i += consumed;
                     }
                 }
                 39 => self.current_fg = Color::Default,
+                // Standard background colors (40-47)
                 40..=47 => self.current_bg = Color::Indexed((code - 40) as u8),
                 48 => {
                     // Extended background color
-                    if i + 1 < params.num_params && params.is_sub_param[i + 1] {
-                        let mode = params.params[i + 1];
-                        if mode == 5 && i + 2 < params.num_params {
-                            self.current_bg = Color::Indexed(params.params[i + 2] as u8);
-                            i += 2;
-                        } else if mode == 2 && i + 4 < params.num_params {
-                            self.current_bg = Color::Rgb(
-                                params.params[i + 2] as u8,
-                                params.params[i + 3] as u8,
-                                params.params[i + 4] as u8,
-                            );
-                            i += 4;
-                        }
-                    } else if i + 2 < params.num_params {
-                        let mode = params.params[i + 1];
-                        if mode == 5 {
-                            self.current_bg = Color::Indexed(params.params[i + 2] as u8);
-                            i += 2;
-                        } else if mode == 2 && i + 4 < params.num_params {
-                            self.current_bg = Color::Rgb(
-                                params.params[i + 2] as u8,
-                                params.params[i + 3] as u8,
-                                params.params[i + 4] as u8,
-                            );
-                            i += 4;
-                        }
+                    if let Some((color, consumed)) = Self::parse_extended_color(params, i) {
+                        self.current_bg = color;
+                        i += consumed;
                     }
                 }
                 49 => self.current_bg = Color::Default,
+                // Bright foreground colors (90-97)
                 90..=97 => self.current_fg = Color::Indexed((code - 90 + 8) as u8),
+                // Bright background colors (100-107)
                 100..=107 => self.current_bg = Color::Indexed((code - 100 + 8) as u8),
                 _ => {}
             }
             i += 1;
         }
     }
+    
+    /// Reset all SGR attributes to defaults.
+    #[inline(always)]
+    fn reset_sgr_attributes(&mut self) {
+        self.current_fg = Color::Default;
+        self.current_bg = Color::Default;
+        self.current_bold = false;
+        self.current_italic = false;
+        self.current_underline_style = 0;
+        self.current_strikethrough = false;
+    }
 
     /// Handle Kitty keyboard protocol CSI sequences.
+    #[inline]
     fn handle_keyboard_protocol_csi(&mut self, params: &CsiParams) {
         match params.primary {
             b'?' => {
@@ -2266,6 +2271,7 @@ impl Terminal {
     }
 
     /// Handle DEC private mode set (CSI ? Ps h).
+    #[inline]
     fn handle_dec_private_mode_set(&mut self, params: &CsiParams) {
         for i in 0..params.num_params {
             match params.params[i] {
@@ -2334,6 +2340,7 @@ impl Terminal {
     }
 
     /// Handle DEC private mode reset (CSI ? Ps l).
+    #[inline]
     fn handle_dec_private_mode_reset(&mut self, params: &CsiParams) {
         for i in 0..params.num_params {
             match params.params[i] {
