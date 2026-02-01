@@ -16,6 +16,13 @@ pub enum Corner {
     BottomRight,
 }
 
+#[derive(Clone, Copy)]
+enum ProgressSegment {
+    Left,
+    Middle,
+    Right,
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // SUPERSAMPLED CANVAS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -55,14 +62,41 @@ impl SupersampledCanvas {
         }
     }
 
+    pub fn hline(&mut self, x1: usize, x2: usize, y: usize, thickness: usize) {
+        let y_start = y.saturating_sub(thickness / 2);
+        let y_end = (y_start + thickness).min(self.ss_height);
+        for py in y_start..y_end {
+            for px in x1..x2.min(self.ss_width) {
+                self.bitmap[py * self.ss_width + px] = 255;
+            }
+        }
+    }
+
+    pub fn vline(&mut self, y1: usize, y2: usize, x: usize, thickness: usize) {
+        let x_start = x.saturating_sub(thickness / 2);
+        let x_end = (x_start + thickness).min(self.ss_width);
+        for py in y1..y2.min(self.ss_height) {
+            for px in x_start..x_end {
+                self.bitmap[py * self.ss_width + px] = 255;
+            }
+        }
+    }
+
     /// Draw a thick line along x-axis with y computed by a function
-    pub fn thick_line_h(&mut self, x1: usize, x2: usize, y_at_x: impl Fn(usize) -> f64, thickness: usize) {
+    pub fn thick_line_h(
+        &mut self,
+        x1: usize,
+        x2: usize,
+        y_at_x: impl Fn(usize) -> f64,
+        thickness: usize,
+    ) {
         let delta = thickness / 2;
         let extra = thickness % 2;
         for x in x1..x2.min(self.ss_width) {
             let y_center = y_at_x(x) as i32;
             let y_start = (y_center - delta as i32).max(0) as usize;
-            let y_end = ((y_center + delta as i32 + extra as i32) as usize).min(self.ss_height);
+            let y_end = ((y_center + delta as i32 + extra as i32) as usize)
+                .min(self.ss_height);
             for y in y_start..y_end {
                 self.bitmap[y * self.ss_width + x] = 255;
             }
@@ -103,8 +137,10 @@ impl SupersampledCanvas {
                     Corner::TopRight => (max_y - (max_y / max_x) * x, false),
                 };
 
-                let in_triangle = if fill_below { y >= edge_y } else { y <= edge_y };
-                let should_fill = if inverted { !in_triangle } else { in_triangle };
+                let in_triangle =
+                    if fill_below { y >= edge_y } else { y <= edge_y };
+                let should_fill =
+                    if inverted { !in_triangle } else { in_triangle };
 
                 if should_fill {
                     self.bitmap[py * w + px] = 255;
@@ -155,11 +191,26 @@ impl SupersampledCanvas {
         let mid_y = max_y / 2.0;
 
         if left {
-            self.thick_line_h(0, w, |x| (mid_y / max_x) * (max_x - x as f64), thickness);
-            self.thick_line_h(0, w, |x| max_y - (mid_y / max_x) * (max_x - x as f64), thickness);
+            self.thick_line_h(
+                0,
+                w,
+                |x| (mid_y / max_x) * (max_x - x as f64),
+                thickness,
+            );
+            self.thick_line_h(
+                0,
+                w,
+                |x| max_y - (mid_y / max_x) * (max_x - x as f64),
+                thickness,
+            );
         } else {
             self.thick_line_h(0, w, |x| (mid_y / max_x) * x as f64, thickness);
-            self.thick_line_h(0, w, |x| max_y - (mid_y / max_x) * x as f64, thickness);
+            self.thick_line_h(
+                0,
+                w,
+                |x| max_y - (mid_y / max_x) * x as f64,
+                thickness,
+            );
         }
     }
 
@@ -289,7 +340,13 @@ impl SupersampledCanvas {
     }
 
     /// Stroke an arc (partial circle) with anti-aliasing
-    pub fn stroke_arc(&mut self, radius: f64, line_width: f64, start_angle: f64, end_angle: f64) {
+    pub fn stroke_arc(
+        &mut self,
+        radius: f64,
+        line_width: f64,
+        start_angle: f64,
+        end_angle: f64,
+    ) {
         let cx = self.ss_width as f64 / 2.0;
         let cy = self.ss_height as f64 / 2.0;
         let half_thickness = line_width / 2.0;
@@ -340,7 +397,8 @@ impl SupersampledCanvas {
                         total += self.bitmap[sy * self.ss_width + sx] as u32;
                     }
                 }
-                output[y * self.width + x] = (total / (Self::FACTOR * Self::FACTOR) as u32) as u8;
+                output[y * self.width + x] =
+                    (total / (Self::FACTOR * Self::FACTOR) as u32) as u8;
             }
         }
     }
@@ -366,6 +424,91 @@ pub fn is_box_drawing(c: char) -> bool {
         || (0x25A0..=0x25FF).contains(&cp)
         || (0x2800..=0x28FF).contains(&cp)
         || (0xE0B0..=0xE0BF).contains(&cp)
+        || (0xEE00..=0xEE0B).contains(&cp) // Nerd Fonts progress bar/spinner
+}
+
+fn render_progress_bar(
+    bitmap: &mut [u8],
+    w: usize,
+    h: usize,
+    dpi: f64,
+    segment: ProgressSegment,
+    filled: bool,
+) {
+    let thickness_h = box_thickness(1, dpi).round() as usize;
+    let thickness_v = box_thickness(1, dpi).round() as usize;
+
+    let draw_top = true;
+    let draw_bottom = true;
+    let draw_left = matches!(segment, ProgressSegment::Left);
+    let draw_right = matches!(segment, ProgressSegment::Right);
+
+    let hline = |buf: &mut [u8], y_start: usize, y_end: usize| {
+        for y in y_start..y_end.min(h) {
+            for x in 0..w {
+                buf[y * w + x] = 255;
+            }
+        }
+    };
+
+    let vline = |buf: &mut [u8], x_start: usize, x_end: usize| {
+        for y in 0..h {
+            for x in x_start..x_end.min(w) {
+                buf[y * w + x] = 255;
+            }
+        }
+    };
+
+    if draw_top {
+        hline(bitmap, 0, thickness_h + 1);
+    }
+    if draw_bottom {
+        hline(bitmap, h.saturating_sub(thickness_h + 1), h);
+    }
+    if draw_left {
+        vline(bitmap, 0, thickness_v + 1);
+    }
+    if draw_right {
+        vline(bitmap, w.saturating_sub(thickness_v + 1), w);
+    }
+
+    if filled {
+        let gap = 3 * thickness_h;
+        let y1 = gap;
+        let y2 = h.saturating_sub(gap);
+        let (x1, x2) = match segment {
+            ProgressSegment::Left => (gap, w),
+            ProgressSegment::Middle => (0, w),
+            ProgressSegment::Right => (0, w.saturating_sub(gap)),
+        };
+        for y in y1..y2.min(h) {
+            for x in x1..x2.min(w) {
+                bitmap[y * w + x] = 255;
+            }
+        }
+    }
+}
+
+fn render_spinner(
+    bitmap: &mut [u8],
+    supersampled: &mut bool,
+    w: usize,
+    h: usize,
+    dpi: f64,
+    start_degrees: f64,
+    end_degrees: f64,
+) {
+    let mut canvas = SupersampledCanvas::new(w, h);
+    let line_width = box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
+    let half_line = 0.5_f64.max(line_width / 2.0);
+    let cx = canvas.ss_width as f64 / 2.0;
+    let cy = canvas.ss_height as f64 / 2.0;
+    let radius = 0.0_f64.max(cx.min(cy) - half_line);
+    let start_rad = start_degrees.to_radians();
+    let end_rad = end_degrees.to_radians();
+    canvas.stroke_arc(radius, line_width, start_rad, end_rad);
+    canvas.downsample(bitmap);
+    *supersampled = true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -388,15 +531,15 @@ pub fn render_box_char(
 
     let mid_x = w / 2;
     let mid_y = h / 2;
-    let light = 2.max((font_size / 8.0).round() as usize);
-    let heavy = light * 2;
 
-    // For double lines
+    let light = 2.max((dpi / 72.0).round() as usize);
+    let heavy = (light * 2).max(4);
+
     let double_gap = light + 2;
     let double_off = double_gap / 2;
 
-    // Helper: draw horizontal line
     let hline = |buf: &mut [u8], x1: usize, x2: usize, y: usize, t: usize| {
+        let t = t.max(1);
         let y_start = y.saturating_sub(t / 2);
         let y_end = (y_start + t).min(h);
         for py in y_start..y_end {
@@ -406,8 +549,8 @@ pub fn render_box_char(
         }
     };
 
-    // Helper: draw vertical line
     let vline = |buf: &mut [u8], y1: usize, y2: usize, x: usize, t: usize| {
+        let t = t.max(1);
         let x_start = x.saturating_sub(t / 2);
         let x_end = (x_start + t).min(w);
         for py in y1..y2.min(h) {
@@ -418,13 +561,14 @@ pub fn render_box_char(
     };
 
     // Helper: fill rectangle
-    let fill_rect = |buf: &mut [u8], x1: usize, y1: usize, x2: usize, y2: usize| {
-        for py in y1..y2.min(h) {
-            for px in x1..x2.min(w) {
-                buf[py * w + px] = 255;
+    let fill_rect =
+        |buf: &mut [u8], x1: usize, y1: usize, x2: usize, y2: usize| {
+            for py in y1..y2.min(h) {
+                for px in x1..x2.min(w) {
+                    buf[py * w + px] = 255;
+                }
             }
-        }
-    };
+        };
 
     // Box drawing arm thickness encoding: 0=none, 1=light, 2=heavy
     let box_arms: Option<(u8, u8, u8, u8)> = match c {
@@ -477,12 +621,10 @@ pub fn render_box_char(
         '\u{2525}' => Some((2, 0, 1, 1)), // ┥
         '\u{252F}' => Some((2, 2, 0, 1)), // ┯
         '\u{2537}' => Some((2, 2, 1, 0)), // ┷
-        // Mixed cross (heavy horizontal, light vertical)
         '\u{2542}' => Some((1, 1, 2, 2)), // ╂
         _ => None,
     };
 
-    // Handle simple box drawing via lookup table
     if let Some((left, right, up, down)) = box_arms {
         let thickness = |arm: u8| -> usize {
             match arm {
@@ -491,26 +633,54 @@ pub fn render_box_char(
                 _ => 0,
             }
         };
+
+        let h_thick = thickness(left.max(right));
+        let v_thick = thickness(up.max(down));
+        let h_extend = v_thick / 2;
+        let v_extend = h_thick / 2;
+
         if left > 0 {
-            hline(&mut bitmap, 0, mid_x + 1, mid_y, thickness(left));
+            hline(&mut bitmap, 0, mid_x + h_extend + 1, mid_y, thickness(left));
         }
         if right > 0 {
-            hline(&mut bitmap, mid_x, w, mid_y, thickness(right));
+            hline(
+                &mut bitmap,
+                mid_x.saturating_sub(h_extend),
+                w,
+                mid_y,
+                thickness(right),
+            );
         }
         if up > 0 {
-            vline(&mut bitmap, 0, mid_y + 1, mid_x, thickness(up));
+            vline(&mut bitmap, 0, mid_y + v_extend + 1, mid_x, thickness(up));
         }
         if down > 0 {
-            vline(&mut bitmap, mid_y, h, mid_x, thickness(down));
+            vline(
+                &mut bitmap,
+                mid_y.saturating_sub(v_extend),
+                h,
+                mid_x,
+                thickness(down),
+            );
         }
-        return Some((bitmap, supersampled));
+        return Some((bitmap, false));
     }
 
-    // Continue with match for remaining characters
     render_box_char_extended(
-        c, &mut bitmap, &mut supersampled,
-        w, h, mid_x, mid_y, light, heavy, double_off,
-        dpi, hline, vline, fill_rect,
+        c,
+        &mut bitmap,
+        &mut supersampled,
+        w,
+        h,
+        mid_x,
+        mid_y,
+        light,
+        heavy,
+        double_off,
+        dpi,
+        hline,
+        vline,
+        fill_rect,
     )?;
 
     Some((bitmap, supersampled))
@@ -678,9 +848,20 @@ where
         // Delegate to part 3 for double lines, blocks, etc.
         _ => {
             return render_box_char_part3(
-                c, bitmap, supersampled,
-                w, h, mid_x, mid_y, light, heavy, double_off,
-                dpi, hline, vline, fill_rect,
+                c,
+                bitmap,
+                supersampled,
+                w,
+                h,
+                mid_x,
+                mid_y,
+                light,
+                heavy,
+                double_off,
+                dpi,
+                hline,
+                vline,
+                fill_rect,
             );
         }
     }
@@ -724,72 +905,238 @@ where
             hline(bitmap, mid_x, w, mid_y.saturating_sub(double_off), light);
             hline(bitmap, mid_x + double_off, w, mid_y + double_off, light);
             vline(bitmap, mid_y, h, mid_x.saturating_sub(double_off), light);
-            vline(bitmap, mid_y.saturating_sub(double_off), h, mid_x + double_off, light);
+            vline(
+                bitmap,
+                mid_y.saturating_sub(double_off),
+                h,
+                mid_x + double_off,
+                light,
+            );
         }
         '\u{2557}' => {
-            hline(bitmap, 0, mid_x + 1, mid_y.saturating_sub(double_off), light);
-            hline(bitmap, 0, mid_x.saturating_sub(double_off) + 1, mid_y + double_off, light);
+            hline(
+                bitmap,
+                0,
+                mid_x + 1,
+                mid_y.saturating_sub(double_off),
+                light,
+            );
+            hline(
+                bitmap,
+                0,
+                mid_x.saturating_sub(double_off) + 1,
+                mid_y + double_off,
+                light,
+            );
             vline(bitmap, mid_y, h, mid_x + double_off, light);
-            vline(bitmap, mid_y.saturating_sub(double_off), h, mid_x.saturating_sub(double_off), light);
+            vline(
+                bitmap,
+                mid_y.saturating_sub(double_off),
+                h,
+                mid_x.saturating_sub(double_off),
+                light,
+            );
         }
         '\u{255A}' => {
             hline(bitmap, mid_x, w, mid_y + double_off, light);
-            hline(bitmap, mid_x + double_off, w, mid_y.saturating_sub(double_off), light);
-            vline(bitmap, 0, mid_y + 1, mid_x.saturating_sub(double_off), light);
+            hline(
+                bitmap,
+                mid_x + double_off,
+                w,
+                mid_y.saturating_sub(double_off),
+                light,
+            );
+            vline(
+                bitmap,
+                0,
+                mid_y + 1,
+                mid_x.saturating_sub(double_off),
+                light,
+            );
             vline(bitmap, 0, mid_y + double_off + 1, mid_x + double_off, light);
         }
         '\u{255D}' => {
             hline(bitmap, 0, mid_x + 1, mid_y + double_off, light);
-            hline(bitmap, 0, mid_x.saturating_sub(double_off) + 1, mid_y.saturating_sub(double_off), light);
+            hline(
+                bitmap,
+                0,
+                mid_x.saturating_sub(double_off) + 1,
+                mid_y.saturating_sub(double_off),
+                light,
+            );
             vline(bitmap, 0, mid_y + 1, mid_x + double_off, light);
-            vline(bitmap, 0, mid_y + double_off + 1, mid_x.saturating_sub(double_off), light);
+            vline(
+                bitmap,
+                0,
+                mid_y + double_off + 1,
+                mid_x.saturating_sub(double_off),
+                light,
+            );
         }
         // Double T-junctions
         '\u{2560}' => {
             vline(bitmap, 0, h, mid_x.saturating_sub(double_off), light);
-            vline(bitmap, 0, mid_y.saturating_sub(double_off) + 1, mid_x + double_off, light);
+            vline(
+                bitmap,
+                0,
+                mid_y.saturating_sub(double_off) + 1,
+                mid_x + double_off,
+                light,
+            );
             vline(bitmap, mid_y + double_off, h, mid_x + double_off, light);
-            hline(bitmap, mid_x + double_off, w, mid_y.saturating_sub(double_off), light);
+            hline(
+                bitmap,
+                mid_x + double_off,
+                w,
+                mid_y.saturating_sub(double_off),
+                light,
+            );
             hline(bitmap, mid_x + double_off, w, mid_y + double_off, light);
         }
         '\u{2563}' => {
             vline(bitmap, 0, h, mid_x + double_off, light);
-            vline(bitmap, 0, mid_y.saturating_sub(double_off) + 1, mid_x.saturating_sub(double_off), light);
-            vline(bitmap, mid_y + double_off, h, mid_x.saturating_sub(double_off), light);
-            hline(bitmap, 0, mid_x.saturating_sub(double_off) + 1, mid_y.saturating_sub(double_off), light);
-            hline(bitmap, 0, mid_x.saturating_sub(double_off) + 1, mid_y + double_off, light);
+            vline(
+                bitmap,
+                0,
+                mid_y.saturating_sub(double_off) + 1,
+                mid_x.saturating_sub(double_off),
+                light,
+            );
+            vline(
+                bitmap,
+                mid_y + double_off,
+                h,
+                mid_x.saturating_sub(double_off),
+                light,
+            );
+            hline(
+                bitmap,
+                0,
+                mid_x.saturating_sub(double_off) + 1,
+                mid_y.saturating_sub(double_off),
+                light,
+            );
+            hline(
+                bitmap,
+                0,
+                mid_x.saturating_sub(double_off) + 1,
+                mid_y + double_off,
+                light,
+            );
         }
         '\u{2566}' => {
             hline(bitmap, 0, w, mid_y.saturating_sub(double_off), light);
-            hline(bitmap, 0, mid_x.saturating_sub(double_off) + 1, mid_y + double_off, light);
+            hline(
+                bitmap,
+                0,
+                mid_x.saturating_sub(double_off) + 1,
+                mid_y + double_off,
+                light,
+            );
             hline(bitmap, mid_x + double_off, w, mid_y + double_off, light);
-            vline(bitmap, mid_y + double_off, h, mid_x.saturating_sub(double_off), light);
+            vline(
+                bitmap,
+                mid_y + double_off,
+                h,
+                mid_x.saturating_sub(double_off),
+                light,
+            );
             vline(bitmap, mid_y + double_off, h, mid_x + double_off, light);
         }
         '\u{2569}' => {
             hline(bitmap, 0, w, mid_y + double_off, light);
-            hline(bitmap, 0, mid_x.saturating_sub(double_off) + 1, mid_y.saturating_sub(double_off), light);
-            hline(bitmap, mid_x + double_off, w, mid_y.saturating_sub(double_off), light);
-            vline(bitmap, 0, mid_y.saturating_sub(double_off) + 1, mid_x.saturating_sub(double_off), light);
-            vline(bitmap, 0, mid_y.saturating_sub(double_off) + 1, mid_x + double_off, light);
+            hline(
+                bitmap,
+                0,
+                mid_x.saturating_sub(double_off) + 1,
+                mid_y.saturating_sub(double_off),
+                light,
+            );
+            hline(
+                bitmap,
+                mid_x + double_off,
+                w,
+                mid_y.saturating_sub(double_off),
+                light,
+            );
+            vline(
+                bitmap,
+                0,
+                mid_y.saturating_sub(double_off) + 1,
+                mid_x.saturating_sub(double_off),
+                light,
+            );
+            vline(
+                bitmap,
+                0,
+                mid_y.saturating_sub(double_off) + 1,
+                mid_x + double_off,
+                light,
+            );
         }
         // Double cross
         '\u{256C}' => {
-            vline(bitmap, 0, mid_y.saturating_sub(double_off) + 1, mid_x.saturating_sub(double_off), light);
-            vline(bitmap, 0, mid_y.saturating_sub(double_off) + 1, mid_x + double_off, light);
-            vline(bitmap, mid_y + double_off, h, mid_x.saturating_sub(double_off), light);
+            vline(
+                bitmap,
+                0,
+                mid_y.saturating_sub(double_off) + 1,
+                mid_x.saturating_sub(double_off),
+                light,
+            );
+            vline(
+                bitmap,
+                0,
+                mid_y.saturating_sub(double_off) + 1,
+                mid_x + double_off,
+                light,
+            );
+            vline(
+                bitmap,
+                mid_y + double_off,
+                h,
+                mid_x.saturating_sub(double_off),
+                light,
+            );
             vline(bitmap, mid_y + double_off, h, mid_x + double_off, light);
-            hline(bitmap, 0, mid_x.saturating_sub(double_off) + 1, mid_y.saturating_sub(double_off), light);
-            hline(bitmap, 0, mid_x.saturating_sub(double_off) + 1, mid_y + double_off, light);
-            hline(bitmap, mid_x + double_off, w, mid_y.saturating_sub(double_off), light);
+            hline(
+                bitmap,
+                0,
+                mid_x.saturating_sub(double_off) + 1,
+                mid_y.saturating_sub(double_off),
+                light,
+            );
+            hline(
+                bitmap,
+                0,
+                mid_x.saturating_sub(double_off) + 1,
+                mid_y + double_off,
+                light,
+            );
+            hline(
+                bitmap,
+                mid_x + double_off,
+                w,
+                mid_y.saturating_sub(double_off),
+                light,
+            );
             hline(bitmap, mid_x + double_off, w, mid_y + double_off, light);
         }
         // Delegate remaining to part 4
         _ => {
             return render_box_char_part4(
-                c, bitmap, supersampled,
-                w, h, mid_x, mid_y, light, double_off,
-                dpi, hline, vline, fill_rect,
+                c,
+                bitmap,
+                supersampled,
+                w,
+                h,
+                mid_x,
+                mid_y,
+                light,
+                double_off,
+                dpi,
+                hline,
+                vline,
+                fill_rect,
             );
         }
     }
@@ -829,7 +1176,13 @@ where
             vline(bitmap, mid_y, h, mid_x, light);
         }
         '\u{2555}' => {
-            hline(bitmap, 0, mid_x.saturating_sub(double_off) + 1, mid_y, light);
+            hline(
+                bitmap,
+                0,
+                mid_x.saturating_sub(double_off) + 1,
+                mid_y,
+                light,
+            );
             vline(bitmap, mid_y, h, mid_x.saturating_sub(double_off), light);
             vline(bitmap, mid_y, h, mid_x + double_off, light);
         }
@@ -839,7 +1192,13 @@ where
         }
         '\u{2558}' => {
             hline(bitmap, mid_x + double_off, w, mid_y, light);
-            vline(bitmap, 0, mid_y + 1, mid_x.saturating_sub(double_off), light);
+            vline(
+                bitmap,
+                0,
+                mid_y + 1,
+                mid_x.saturating_sub(double_off),
+                light,
+            );
             vline(bitmap, 0, mid_y + 1, mid_x + double_off, light);
         }
         '\u{2559}' => {
@@ -847,8 +1206,20 @@ where
             vline(bitmap, 0, mid_y + 1, mid_x, light);
         }
         '\u{255B}' => {
-            hline(bitmap, 0, mid_x.saturating_sub(double_off) + 1, mid_y, light);
-            vline(bitmap, 0, mid_y + 1, mid_x.saturating_sub(double_off), light);
+            hline(
+                bitmap,
+                0,
+                mid_x.saturating_sub(double_off) + 1,
+                mid_y,
+                light,
+            );
+            vline(
+                bitmap,
+                0,
+                mid_y + 1,
+                mid_x.saturating_sub(double_off),
+                light,
+            );
             vline(bitmap, 0, mid_y + 1, mid_x + double_off, light);
         }
         '\u{255C}' => {
@@ -869,11 +1240,23 @@ where
         '\u{2561}' => {
             vline(bitmap, 0, h, mid_x.saturating_sub(double_off), light);
             vline(bitmap, 0, h, mid_x + double_off, light);
-            hline(bitmap, 0, mid_x.saturating_sub(double_off) + 1, mid_y, light);
+            hline(
+                bitmap,
+                0,
+                mid_x.saturating_sub(double_off) + 1,
+                mid_y,
+                light,
+            );
         }
         '\u{2562}' => {
             vline(bitmap, 0, h, mid_x, light);
-            hline(bitmap, 0, mid_x + 1, mid_y.saturating_sub(double_off), light);
+            hline(
+                bitmap,
+                0,
+                mid_x + 1,
+                mid_y.saturating_sub(double_off),
+                light,
+            );
             hline(bitmap, 0, mid_x + 1, mid_y + double_off, light);
         }
         '\u{2564}' => {
@@ -889,22 +1272,46 @@ where
         '\u{2567}' => {
             hline(bitmap, 0, w, mid_y.saturating_sub(double_off), light);
             hline(bitmap, 0, w, mid_y + double_off, light);
-            vline(bitmap, 0, mid_y.saturating_sub(double_off) + 1, mid_x, light);
+            vline(
+                bitmap,
+                0,
+                mid_y.saturating_sub(double_off) + 1,
+                mid_x,
+                light,
+            );
         }
         '\u{2568}' => {
             hline(bitmap, 0, w, mid_y, light);
-            vline(bitmap, 0, mid_y + 1, mid_x.saturating_sub(double_off), light);
+            vline(
+                bitmap,
+                0,
+                mid_y + 1,
+                mid_x.saturating_sub(double_off),
+                light,
+            );
             vline(bitmap, 0, mid_y + 1, mid_x + double_off, light);
         }
         // Mixed crosses
         '\u{256A}' => {
             hline(bitmap, 0, w, mid_y.saturating_sub(double_off), light);
             hline(bitmap, 0, w, mid_y + double_off, light);
-            vline(bitmap, 0, mid_y.saturating_sub(double_off) + 1, mid_x, light);
+            vline(
+                bitmap,
+                0,
+                mid_y.saturating_sub(double_off) + 1,
+                mid_x,
+                light,
+            );
             vline(bitmap, mid_y + double_off, h, mid_x, light);
         }
         '\u{256B}' => {
-            hline(bitmap, 0, mid_x.saturating_sub(double_off) + 1, mid_y, light);
+            hline(
+                bitmap,
+                0,
+                mid_x.saturating_sub(double_off) + 1,
+                mid_y,
+                light,
+            );
             hline(bitmap, mid_x + double_off, w, mid_y, light);
             vline(bitmap, 0, h, mid_x.saturating_sub(double_off), light);
             vline(bitmap, 0, h, mid_x + double_off, light);
@@ -912,9 +1319,18 @@ where
         // Delegate to part 5
         _ => {
             return render_box_char_part5(
-                c, bitmap, supersampled,
-                w, h, mid_x, mid_y, light,
-                dpi, hline, vline, fill_rect,
+                c,
+                bitmap,
+                supersampled,
+                w,
+                h,
+                mid_x,
+                mid_y,
+                light,
+                dpi,
+                hline,
+                vline,
+                fill_rect,
             );
         }
     }
@@ -942,7 +1358,7 @@ where
     F: Fn(&mut [u8], usize, usize, usize, usize),
 {
     let heavy = light * 2;
-    
+
     match c {
         // Rounded corners
         '\u{256D}' | '\u{256E}' | '\u{256F}' | '\u{2570}' => {
@@ -954,8 +1370,10 @@ where
             let vert_line_end = (vert_line_start + light).min(w);
             let vert_line_width = vert_line_end - vert_line_start;
 
-            let adjusted_hx = vert_line_start as f64 + vert_line_width as f64 / 2.0;
-            let adjusted_hy = hori_line_start as f64 + hori_line_height as f64 / 2.0;
+            let adjusted_hx =
+                vert_line_start as f64 + vert_line_width as f64 / 2.0;
+            let adjusted_hy =
+                hori_line_start as f64 + hori_line_height as f64 / 2.0;
 
             let stroke = (hori_line_height.max(vert_line_width)) as f64;
             let corner_radius = adjusted_hx.min(adjusted_hy);
@@ -996,12 +1414,18 @@ where
                     let qy = pos_y.abs() - by;
                     let dx = if qx > 0.0 { qx } else { 0.0 };
                     let dy = if qy > 0.0 { qy } else { 0.0 };
-                    let dist = (dx * dx + dy * dy).sqrt() + qx.max(qy).min(0.0) - corner_radius;
+                    let dist = (dx * dx + dy * dy).sqrt() + qx.max(qy).min(0.0)
+                        - corner_radius;
 
-                    let aa = if qx > 1e-7 && qy > 1e-7 { aa_corner } else { 0.0 };
+                    let aa = if qx > 1e-7 && qy > 1e-7 {
+                        aa_corner
+                    } else {
+                        0.0
+                    };
                     let outer = half_stroke - dist;
                     let inner = -half_stroke - dist;
-                    let alpha = smoothstep(-aa, aa, outer) - smoothstep(-aa, aa, inner);
+                    let alpha =
+                        smoothstep(-aa, aa, outer) - smoothstep(-aa, aa, inner);
 
                     if alpha <= 0.0 {
                         continue;
@@ -1103,9 +1527,19 @@ where
         // Delegate to part 6
         _ => {
             return render_box_char_part6(
-                c, bitmap, supersampled,
-                w, h, mid_x, mid_y, light, heavy,
-                dpi, hline, vline, fill_rect,
+                c,
+                bitmap,
+                supersampled,
+                w,
+                h,
+                mid_x,
+                mid_y,
+                light,
+                heavy,
+                dpi,
+                hline,
+                vline,
+                fill_rect,
             );
         }
     }
@@ -1167,7 +1601,9 @@ where
                 let y = i * h / w.max(1);
                 if x < w && y < h {
                     for t in 0..light {
-                        if x + t < w { bitmap[y * w + x + t] = 255; }
+                        if x + t < w {
+                            bitmap[y * w + x + t] = 255;
+                        }
                     }
                 }
             }
@@ -1178,7 +1614,9 @@ where
                 let y = i * h / w.max(1);
                 if x < w && y < h {
                     for t in 0..light {
-                        if x + t < w { bitmap[y * w + x + t] = 255; }
+                        if x + t < w {
+                            bitmap[y * w + x + t] = 255;
+                        }
                     }
                 }
             }
@@ -1190,8 +1628,12 @@ where
                 let y = i * h / w.max(1);
                 if y < h {
                     for t in 0..light {
-                        if x1 + t < w { bitmap[y * w + x1 + t] = 255; }
-                        if x2 + t < w { bitmap[y * w + x2 + t] = 255; }
+                        if x1 + t < w {
+                            bitmap[y * w + x1 + t] = 255;
+                        }
+                        if x2 + t < w {
+                            bitmap[y * w + x2 + t] = 255;
+                        }
                     }
                 }
             }
@@ -1218,21 +1660,27 @@ where
         '\u{2591}' => {
             for y in 0..h {
                 for x in 0..w {
-                    if (x + y) % 4 == 0 { bitmap[y * w + x] = 255; }
+                    if (x + y) % 4 == 0 {
+                        bitmap[y * w + x] = 255;
+                    }
                 }
             }
         }
         '\u{2592}' => {
             for y in 0..h {
                 for x in 0..w {
-                    if (x + y) % 2 == 0 { bitmap[y * w + x] = 255; }
+                    if (x + y) % 2 == 0 {
+                        bitmap[y * w + x] = 255;
+                    }
                 }
             }
         }
         '\u{2593}' => {
             for y in 0..h {
                 for x in 0..w {
-                    if (x + y) % 4 != 0 { bitmap[y * w + x] = 255; }
+                    if (x + y) % 4 != 0 {
+                        bitmap[y * w + x] = 255;
+                    }
                 }
             }
         }
@@ -1270,10 +1718,7 @@ where
         }
         // Delegate to part 7
         _ => {
-            return render_box_char_part7(
-                c, bitmap, supersampled,
-                w, h, dpi,
-            );
+            return render_box_char_part7(c, bitmap, supersampled, w, h, dpi);
         }
     }
     Some(())
@@ -1385,7 +1830,9 @@ fn render_box_char_part8(
         // E0B1: Right-pointing chevron (outline)
         '\u{E0B1}' => {
             let mut canvas = SupersampledCanvas::new(w, h);
-            let thickness = (box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64).round() as usize;
+            let thickness = (box_thickness(1, dpi)
+                * SupersampledCanvas::FACTOR as f64)
+                .round() as usize;
             canvas.stroke_powerline_arrow(false, thickness);
             canvas.downsample(bitmap);
             *supersampled = true;
@@ -1400,7 +1847,9 @@ fn render_box_char_part8(
         // E0B3: Left-pointing chevron (outline)
         '\u{E0B3}' => {
             let mut canvas = SupersampledCanvas::new(w, h);
-            let thickness = (box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64).round() as usize;
+            let thickness = (box_thickness(1, dpi)
+                * SupersampledCanvas::FACTOR as f64)
+                .round() as usize;
             canvas.stroke_powerline_arrow(true, thickness);
             canvas.downsample(bitmap);
             *supersampled = true;
@@ -1415,7 +1864,8 @@ fn render_box_char_part8(
         // E0B5: Right semicircle (outline)
         '\u{E0B5}' => {
             let mut canvas = SupersampledCanvas::new(w, h);
-            let thickness = box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
+            let thickness =
+                box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
             canvas.stroke_bezier_d(false, thickness);
             canvas.downsample(bitmap);
             *supersampled = true;
@@ -1430,7 +1880,8 @@ fn render_box_char_part8(
         // E0B7: Left semicircle (outline)
         '\u{E0B7}' => {
             let mut canvas = SupersampledCanvas::new(w, h);
-            let thickness = box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
+            let thickness =
+                box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
             canvas.stroke_bezier_d(true, thickness);
             canvas.downsample(bitmap);
             *supersampled = true;
@@ -1512,7 +1963,8 @@ fn render_box_char_part9(
         // White circle (outline)
         '\u{25CB}' => {
             let mut canvas = SupersampledCanvas::new(w, h);
-            let line_width = box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
+            let line_width =
+                box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
             let half_line = line_width / 2.0;
             let cx = canvas.ss_width as f64 / 2.0;
             let cy = canvas.ss_height as f64 / 2.0;
@@ -1529,7 +1981,8 @@ fn render_box_char_part9(
             let radius = cx.min(cy);
             let central_radius = (2.0 / 3.0) * radius;
             canvas.fill_circle_radius(central_radius);
-            let line_width = (SupersampledCanvas::FACTOR as f64).max((radius - central_radius) / 2.5);
+            let line_width = (SupersampledCanvas::FACTOR as f64)
+                .max((radius - central_radius) / 2.5);
             let outer_radius = 0.0_f64.max(cx.min(cy) - line_width / 2.0);
             canvas.stroke_circle(outer_radius, line_width);
             canvas.downsample(bitmap);
@@ -1538,63 +1991,94 @@ fn render_box_char_part9(
         // Quadrant arcs
         '\u{25DC}' => {
             let mut canvas = SupersampledCanvas::new(w, h);
-            let line_width = box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
+            let line_width =
+                box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
             let half_line = 0.5_f64.max(line_width / 2.0);
             let cx = canvas.ss_width as f64 / 2.0;
             let cy = canvas.ss_height as f64 / 2.0;
             let radius = 0.0_f64.max(cx.min(cy) - half_line);
-            canvas.stroke_arc(radius, line_width, std::f64::consts::PI, 3.0 * std::f64::consts::PI / 2.0);
+            canvas.stroke_arc(
+                radius,
+                line_width,
+                std::f64::consts::PI,
+                3.0 * std::f64::consts::PI / 2.0,
+            );
             canvas.downsample(bitmap);
             *supersampled = true;
         }
         '\u{25DD}' => {
             let mut canvas = SupersampledCanvas::new(w, h);
-            let line_width = box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
+            let line_width =
+                box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
             let half_line = 0.5_f64.max(line_width / 2.0);
             let cx = canvas.ss_width as f64 / 2.0;
             let cy = canvas.ss_height as f64 / 2.0;
             let radius = 0.0_f64.max(cx.min(cy) - half_line);
-            canvas.stroke_arc(radius, line_width, 3.0 * std::f64::consts::PI / 2.0, 2.0 * std::f64::consts::PI);
+            canvas.stroke_arc(
+                radius,
+                line_width,
+                3.0 * std::f64::consts::PI / 2.0,
+                2.0 * std::f64::consts::PI,
+            );
             canvas.downsample(bitmap);
             *supersampled = true;
         }
         '\u{25DE}' => {
             let mut canvas = SupersampledCanvas::new(w, h);
-            let line_width = box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
+            let line_width =
+                box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
             let half_line = 0.5_f64.max(line_width / 2.0);
             let cx = canvas.ss_width as f64 / 2.0;
             let cy = canvas.ss_height as f64 / 2.0;
             let radius = 0.0_f64.max(cx.min(cy) - half_line);
-            canvas.stroke_arc(radius, line_width, 0.0, std::f64::consts::PI / 2.0);
+            canvas.stroke_arc(
+                radius,
+                line_width,
+                0.0,
+                std::f64::consts::PI / 2.0,
+            );
             canvas.downsample(bitmap);
             *supersampled = true;
         }
         '\u{25DF}' => {
             let mut canvas = SupersampledCanvas::new(w, h);
-            let line_width = box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
+            let line_width =
+                box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
             let half_line = 0.5_f64.max(line_width / 2.0);
             let cx = canvas.ss_width as f64 / 2.0;
             let cy = canvas.ss_height as f64 / 2.0;
             let radius = 0.0_f64.max(cx.min(cy) - half_line);
-            canvas.stroke_arc(radius, line_width, std::f64::consts::PI / 2.0, std::f64::consts::PI);
+            canvas.stroke_arc(
+                radius,
+                line_width,
+                std::f64::consts::PI / 2.0,
+                std::f64::consts::PI,
+            );
             canvas.downsample(bitmap);
             *supersampled = true;
         }
         // Half arcs
         '\u{25E0}' => {
             let mut canvas = SupersampledCanvas::new(w, h);
-            let line_width = box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
+            let line_width =
+                box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
             let half_line = 0.5_f64.max(line_width / 2.0);
             let cx = canvas.ss_width as f64 / 2.0;
             let cy = canvas.ss_height as f64 / 2.0;
             let radius = 0.0_f64.max(cx.min(cy) - half_line);
-            canvas.stroke_arc(radius, line_width, std::f64::consts::PI, 2.0 * std::f64::consts::PI);
+            canvas.stroke_arc(
+                radius,
+                line_width,
+                std::f64::consts::PI,
+                2.0 * std::f64::consts::PI,
+            );
             canvas.downsample(bitmap);
             *supersampled = true;
         }
         '\u{25E1}' => {
             let mut canvas = SupersampledCanvas::new(w, h);
-            let line_width = box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
+            let line_width =
+                box_thickness(1, dpi) * SupersampledCanvas::FACTOR as f64;
             let half_line = 0.5_f64.max(line_width / 2.0);
             let cx = canvas.ss_width as f64 / 2.0;
             let cy = canvas.ss_height as f64 / 2.0;
@@ -1603,7 +2087,58 @@ fn render_box_char_part9(
             canvas.downsample(bitmap);
             *supersampled = true;
         }
-        // Unimplemented character
+        // Nerd Fonts progress bar (U+EE00-U+EE05)
+        '\u{EE00}' => {
+            render_progress_bar(bitmap, w, h, dpi, ProgressSegment::Left, false)
+        }
+        '\u{EE01}' => render_progress_bar(
+            bitmap,
+            w,
+            h,
+            dpi,
+            ProgressSegment::Middle,
+            false,
+        ),
+        '\u{EE02}' => render_progress_bar(
+            bitmap,
+            w,
+            h,
+            dpi,
+            ProgressSegment::Right,
+            false,
+        ),
+        '\u{EE03}' => {
+            render_progress_bar(bitmap, w, h, dpi, ProgressSegment::Left, true)
+        }
+        '\u{EE04}' => render_progress_bar(
+            bitmap,
+            w,
+            h,
+            dpi,
+            ProgressSegment::Middle,
+            true,
+        ),
+        '\u{EE05}' => {
+            render_progress_bar(bitmap, w, h, dpi, ProgressSegment::Right, true)
+        }
+        '\u{EE06}' => {
+            render_spinner(bitmap, supersampled, w, h, dpi, 235.0, 305.0);
+        }
+        '\u{EE07}' => {
+            render_spinner(bitmap, supersampled, w, h, dpi, 270.0, 390.0);
+        }
+        '\u{EE08}' => {
+            render_spinner(bitmap, supersampled, w, h, dpi, 315.0, 470.0);
+        }
+        '\u{EE09}' => {
+            render_spinner(bitmap, supersampled, w, h, dpi, 360.0, 540.0);
+        }
+        '\u{EE0A}' => {
+            render_spinner(bitmap, supersampled, w, h, dpi, 80.0, 220.0);
+        }
+        '\u{EE0B}' => {
+            render_spinner(bitmap, supersampled, w, h, dpi, 170.0, 270.0);
+        }
         _ => return None,
     }
     Some(())

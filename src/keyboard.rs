@@ -294,11 +294,29 @@ impl KeyboardState {
 /// Encodes a key event according to the Kitty keyboard protocol.
 pub struct KeyEncoder<'a> {
     state: &'a KeyboardState,
+    /// Whether application cursor keys mode (DECCKM) is enabled.
+    /// When true, arrow keys send SS3 format (ESC O letter).
+    /// When false, arrow keys send CSI format (ESC [ letter).
+    application_cursor_keys: bool,
 }
 
 impl<'a> KeyEncoder<'a> {
     pub fn new(state: &'a KeyboardState) -> Self {
-        Self { state }
+        Self {
+            state,
+            application_cursor_keys: false,
+        }
+    }
+
+    /// Creates a new KeyEncoder with application cursor keys mode setting.
+    pub fn with_cursor_mode(
+        state: &'a KeyboardState,
+        application_cursor_keys: bool,
+    ) -> Self {
+        Self {
+            state,
+            application_cursor_keys,
+        }
     }
 
     /// Encodes a functional key press to bytes.
@@ -369,7 +387,9 @@ impl<'a> KeyEncoder<'a> {
 
             if has_event_type {
                 result.push(b':');
-                result.extend_from_slice((event_type as u8).to_string().as_bytes());
+                result.extend_from_slice(
+                    (event_type as u8).to_string().as_bytes(),
+                );
             }
         }
 
@@ -383,7 +403,11 @@ impl<'a> KeyEncoder<'a> {
     }
 
     /// Encodes functional keys in legacy mode.
-    fn encode_legacy_functional(&self, key: FunctionalKey, modifiers: Modifiers) -> Vec<u8> {
+    fn encode_legacy_functional(
+        &self,
+        key: FunctionalKey,
+        modifiers: Modifiers,
+    ) -> Vec<u8> {
         let mod_param = modifiers.encode();
 
         match key {
@@ -453,12 +477,20 @@ impl<'a> KeyEncoder<'a> {
             // Other functional keys - encode as CSI u
             _ => {
                 let key_code = key as u32;
-                self.encode_csi_u(key_code, modifiers, KeyEventType::Press, None)
+                self.encode_csi_u(
+                    key_code,
+                    modifiers,
+                    KeyEventType::Press,
+                    None,
+                )
             }
         }
     }
 
-    /// Encodes arrow/home/end keys: CSI 1;mod X (with modifiers) or SS3 X (no modifiers).
+    /// Encodes arrow/home/end keys based on DECCKM mode:
+    /// - Normal mode (application_cursor_keys=false): CSI letter (ESC [ letter)
+    /// - Application mode (application_cursor_keys=true): SS3 letter (ESC O letter)
+    /// With modifiers, always use CSI 1;mod letter format.
     fn encode_arrow(&self, letter: u8, mod_param: Option<u8>) -> Vec<u8> {
         if let Some(m) = mod_param {
             // With modifiers: CSI 1;mod letter
@@ -466,9 +498,12 @@ impl<'a> KeyEncoder<'a> {
             result.extend_from_slice(m.to_string().as_bytes());
             result.push(letter);
             result
-        } else {
-            // No modifiers: SS3 letter (application cursor mode)
+        } else if self.application_cursor_keys {
+            // Application cursor mode: SS3 letter (ESC O letter)
             vec![0x1b, b'O', letter]
+        } else {
+            // Normal cursor mode: CSI letter (ESC [ letter)
+            vec![0x1b, b'[', letter]
         }
     }
 
