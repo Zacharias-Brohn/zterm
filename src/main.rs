@@ -2038,7 +2038,14 @@ impl App {
                     self.config.edge_glow_intensity,
                     &statusline_content,
                 ) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        // Clear dirty lines after successful render (like Kitty's linebuf_mark_line_clean)
+                        for (pane_id, _) in &geometries {
+                            if let Some(pane) = tab.panes.get_mut(pane_id) {
+                                pane.terminal.clear_dirty_lines();
+                            }
+                        }
+                    }
                     Err(wgpu::SurfaceError::Lost) => {
                         renderer.resize(renderer.width, renderer.height);
                     }

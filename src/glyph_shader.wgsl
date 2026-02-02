@@ -381,10 +381,29 @@ fn vs_cell_bg(
     let col = instance_index % grid_params.cols;
     let row = instance_index / grid_params.cols;
     
-    // Skip if out of bounds
+    // Skip if out of bounds - place vertex outside clip volume (z=2 is beyond far plane)
     if row >= grid_params.rows {
         var out: CellVertexOutput;
-        out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.clip_position = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+        out.uv = vec2<f32>(0.0, 0.0);
+        out.fg_color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.bg_color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.is_background = 1u;
+        out.is_colored_glyph = 0u;
+        out.is_cursor = 0u;
+        out.cursor_shape = 0u;
+        out.cursor_color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.cursor_uv = vec2<f32>(0.0, 0.0);
+        out.cell_size = vec2<f32>(0.0, 0.0);
+        out.underline_uv = vec2<f32>(0.0, 0.0);
+        out.strike_uv = vec2<f32>(0.0, 0.0);
+        out.decoration_fg = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.has_underline = 0u;
+        out.has_strikethrough = 0u;
+        out.glyph_layer = 0;
+        out.cursor_layer = 0;
+        out.underline_layer = 0;
+        out.strike_layer = 0;
         return out;
     }
     
@@ -517,10 +536,29 @@ fn vs_cell_glyph(
     let col = instance_index % grid_params.cols;
     let row = instance_index / grid_params.cols;
     
-    // Skip if out of bounds
+    // Skip if out of bounds - use off-screen position with valid W to avoid undefined behavior
     if row >= grid_params.rows {
         var out: CellVertexOutput;
-        out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.clip_position = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+        out.uv = vec2<f32>(0.0, 0.0);
+        out.fg_color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.bg_color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.is_background = 0u;
+        out.is_colored_glyph = 0u;
+        out.is_cursor = 0u;
+        out.cursor_shape = 0u;
+        out.cursor_color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.cursor_uv = vec2<f32>(0.0, 0.0);
+        out.cell_size = vec2<f32>(0.0, 0.0);
+        out.underline_uv = vec2<f32>(0.0, 0.0);
+        out.strike_uv = vec2<f32>(0.0, 0.0);
+        out.decoration_fg = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.has_underline = 0u;
+        out.has_strikethrough = 0u;
+        out.glyph_layer = 0;
+        out.cursor_layer = 0;
+        out.underline_layer = 0;
+        out.strike_layer = 0;
         return out;
     }
     
@@ -536,10 +574,29 @@ fn vs_cell_glyph(
     let underline_sprite_idx = decoration_type_to_sprite(decoration_type);
     let has_decorations = underline_sprite_idx > 0u || has_strike;
     
-    // Skip if no glyph AND no decorations
+    // Skip if no glyph AND no decorations - use off-screen position with valid W
     if sprite_idx == 0u && !has_decorations {
         var out: CellVertexOutput;
-        out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.clip_position = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+        out.uv = vec2<f32>(0.0, 0.0);
+        out.fg_color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.bg_color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.is_background = 0u;
+        out.is_colored_glyph = 0u;
+        out.is_cursor = 0u;
+        out.cursor_shape = 0u;
+        out.cursor_color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.cursor_uv = vec2<f32>(0.0, 0.0);
+        out.cell_size = vec2<f32>(0.0, 0.0);
+        out.underline_uv = vec2<f32>(0.0, 0.0);
+        out.strike_uv = vec2<f32>(0.0, 0.0);
+        out.decoration_fg = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.has_underline = 0u;
+        out.has_strikethrough = 0u;
+        out.glyph_layer = 0;
+        out.cursor_layer = 0;
+        out.underline_layer = 0;
+        out.strike_layer = 0;
         return out;
     }
     

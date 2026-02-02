@@ -252,6 +252,11 @@ impl ColorPalette {
 }
 
 /// Saved cursor state for DECSC/DECRC.
+/// Per ECMA-48 and DEC VT standards, DECSC saves:
+/// - Cursor position (col, row)
+/// - Character attributes (fg, bg, bold, italic, underline, strikethrough)
+/// - Origin mode (DECOM) - affects cursor positioning relative to scroll region
+/// - Auto-wrap mode (DECAWM) - affects line wrapping behavior
 #[derive(Clone, Debug, Default)]
 struct SavedCursor {
     col: usize,
@@ -262,6 +267,8 @@ struct SavedCursor {
     italic: bool,
     underline_style: u8,
     strikethrough: bool,
+    origin_mode: bool,
+    auto_wrap: bool,
 }
 
 /// Alternate screen buffer state.
@@ -1374,6 +1381,26 @@ impl Handler for Terminal {
     /// Handle a chunk of decoded text (Unicode codepoints as u32).
     /// This includes control characters (0x00-0x1F except ESC).
     fn text(&mut self, codepoints: &[u32]) {
+        // DEBUG: Detect CSI sequence content appearing as text (indicates parser bug)
+        // Look for patterns like "38;2;128" or "4;64;64m" - these are SGR parameters
+        if codepoints.len() >= 3 {
+            let has_semicolon = codepoints.iter().any(|&c| c == 0x3B); // ';'
+            let has_m = codepoints.iter().any(|&c| c == 0x6D); // 'm'
+            let mostly_digits = codepoints
+                .iter()
+                .filter(|&&c| c >= 0x30 && c <= 0x39)
+                .count()
+                > codepoints.len() / 2;
+            if has_semicolon && mostly_digits {
+                let text: String = codepoints
+                    .iter()
+                    .filter_map(|&c| char::from_u32(c))
+                    .collect();
+                log::error!("DEBUG CSI LEAK: text handler received CSI-like content: {:?} at ({}, {})", 
+                    text, self.cursor_col, self.cursor_row);
+            }
+        }
+
         #[cfg(feature = "render_timing")]
         let start = std::time::Instant::now();
 
@@ -1866,6 +1893,11 @@ impl Handler for Terminal {
                 match mode {
                     0 => self.clear_line_from_cursor(),
                     1 => {
+                        log::warn!(
+                            "DEBUG EL1 (erase to cursor): row={} cursor_col={}",
+                            self.cursor_row,
+                            self.cursor_col
+                        );
                         let grid_row = self.line_map[self.cursor_row];
                         for col in 0..=self.cursor_col {
                             self.grid[grid_row][col] = blank;
@@ -1873,6 +1905,10 @@ impl Handler for Terminal {
                         self.mark_line_dirty(self.cursor_row);
                     }
                     2 => {
+                        log::warn!(
+                            "DEBUG EL2 (erase whole line): row={}",
+                            self.cursor_row
+                        );
                         let grid_row = self.line_map[self.cursor_row];
                         self.grid[grid_row].fill(blank);
                         self.mark_line_dirty(self.cursor_row);
@@ -2028,8 +2064,9 @@ impl Handler for Terminal {
                         &mut self.scroll_bottom,
                     );
                 }
-                // Move cursor to home position
-                self.cursor_row = 0;
+                // Move cursor to home position (respects origin mode)
+                self.cursor_row =
+                    if self.origin_mode { self.scroll_top } else { 0 };
                 self.cursor_col = 0;
             }
             // Window manipulation (CSI Ps t) - XTWINOPS
@@ -2130,11 +2167,15 @@ impl Handler for Terminal {
             italic: self.current_italic,
             underline_style: self.current_underline_style,
             strikethrough: self.current_strikethrough,
+            origin_mode: self.origin_mode,
+            auto_wrap: self.auto_wrap,
         };
         log::debug!(
-            "ESC 7: Cursor saved at ({}, {})",
+            "ESC 7: Cursor saved at ({}, {}), origin_mode={}, auto_wrap={}",
             self.cursor_col,
-            self.cursor_row
+            self.cursor_row,
+            self.origin_mode,
+            self.auto_wrap
         );
     }
 
@@ -2149,10 +2190,14 @@ impl Handler for Terminal {
         self.current_italic = self.saved_cursor.italic;
         self.current_underline_style = self.saved_cursor.underline_style;
         self.current_strikethrough = self.saved_cursor.strikethrough;
+        self.origin_mode = self.saved_cursor.origin_mode;
+        self.auto_wrap = self.saved_cursor.auto_wrap;
         log::debug!(
-            "ESC 8: Cursor restored to ({}, {})",
+            "ESC 8: Cursor restored to ({}, {}), origin_mode={}, auto_wrap={}",
             self.cursor_col,
-            self.cursor_row
+            self.cursor_row,
+            self.origin_mode,
+            self.auto_wrap
         );
     }
 

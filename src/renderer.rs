@@ -2148,6 +2148,10 @@ impl Renderer {
         let rows = terminal.rows;
         let total_cells = cols * rows;
         
+        // TEMPORARY DEBUG: Force full rebuild every frame to test if dirty-line tracking is the issue
+        // TODO: Remove this once the rendering bug is fixed
+        self.cells_dirty = true;
+        
         // Check if grid size changed - need full rebuild
         let size_changed = self.last_grid_size != (cols, rows);
         if size_changed {
@@ -2156,10 +2160,6 @@ impl Renderer {
             self.cells_dirty = true;
         }
         
-        // Get dirty lines bitmap BEFORE first pass - we only need to create sprites for dirty lines
-        // This is a key optimization: sprites are cached, so we only need to check lines that changed
-        let dirty_bitmap = terminal.get_dirty_lines();
-        
         // First pass: ensure all characters have sprites
         // This needs mutable access to self for sprite creation
         // Like Kitty's render_line(), detect PUA+space patterns for multi-cell rendering
@@ -2167,18 +2167,8 @@ impl Renderer {
         // OPTIMIZATION: Use get_visible_row() to avoid Vec allocation
         for row_idx in 0..rows {
             // Skip clean lines (unless size changed, which sets cells_dirty)
-            if !self.cells_dirty {
-                if row_idx < 64 {
-                    let bit = 1u64 << row_idx;
-                    if (dirty_bitmap & bit) == 0 {
-                        continue;
-                    }
-                }
-                // For rows >= 64, we conservatively process them if any dirty bit is set
-                // (same as the second pass behavior)
-                else if dirty_bitmap == 0 {
-                    continue;
-                }
+            if !self.cells_dirty && !terminal.is_line_dirty(row_idx) {
+                continue;
             }
             
             let Some(row) = terminal.get_visible_row(row_idx) else {
@@ -2339,37 +2329,53 @@ impl Renderer {
         
         // Second pass: convert cells to GPU format
         // OPTIMIZATION: Use get_visible_row() to avoid Vec allocation
-        // dirty_bitmap already fetched above before first pass
         let mut any_updated = false;
+        
+        // DEBUG: Log grid dimensions and buffer state
+        static DEBUG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let frame_num = DEBUG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if frame_num % 60 == 0 {  // Log every 60 frames (~1 second at 60fps)
+            log::info!("DEBUG update_gpu_cells: cols={} rows={} total={} gpu_cells.len={} cells_dirty={}", 
+                cols, rows, total_cells, self.gpu_cells.len(), self.cells_dirty);
+        }
         
         // If we did a full reset or size changed, update all lines
         if self.cells_dirty {
+            static ROW_DEBUG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let row_frame = ROW_DEBUG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            
+            if row_frame % 60 == 0 {
+                let first_col: String = (0..rows).filter_map(|r| {
+                    terminal.get_visible_row(r).and_then(|row| {
+                        row.first().map(|cell| {
+                            let c = cell.character;
+                            if c == '\0' { ' ' } else { c }
+                        })
+                    })
+                }).collect();
+                log::info!("DEBUG col0: \"{}\"", first_col);
+            }
+            
             for row_idx in 0..rows {
                 if let Some(row) = terminal.get_visible_row(row_idx) {
                     let start = row_idx * cols;
                     let end = start + cols;
+                    
+                    if end > self.gpu_cells.len() {
+                        log::error!("DEBUG BUG: row_idx={} start={} end={} but gpu_cells.len={}", 
+                            row_idx, start, end, self.gpu_cells.len());
+                        continue;
+                    }
+                    
                     Self::cells_to_gpu_row_static(row, &mut self.gpu_cells[start..end], cols, &self.sprite_map);
                 }
             }
             self.cells_dirty = false;
             any_updated = true;
         } else {
-            // Only update dirty lines
-            for row_idx in 0..rows.min(64) {
-                let bit = 1u64 << row_idx;
-                if (dirty_bitmap & bit) != 0 {
-                    if let Some(row) = terminal.get_visible_row(row_idx) {
-                        let start = row_idx * cols;
-                        let end = start + cols;
-                        Self::cells_to_gpu_row_static(row, &mut self.gpu_cells[start..end], cols, &self.sprite_map);
-                        any_updated = true;
-                    }
-                }
-            }
-            
-            // For terminals with more than 64 rows, check additional dirty_lines words
-            if rows > 64 && dirty_bitmap != 0 {
-                for row_idx in 64..rows {
+            // Only update dirty lines - use is_line_dirty() which handles all 256 lines
+            for row_idx in 0..rows {
+                if terminal.is_line_dirty(row_idx) {
                     if let Some(row) = terminal.get_visible_row(row_idx) {
                         let start = row_idx * cols;
                         let end = start + cols;
@@ -4601,9 +4607,8 @@ impl Renderer {
                 }
             }
             
-            // Calculate pane dimensions in cells
-            let cols = (pane_width / self.cell_metrics.cell_width as f32).floor() as u32;
-            let rows = (pane_height / self.cell_metrics.cell_height as f32).floor() as u32;
+            let cols = terminal.cols as u32;
+            let rows = terminal.rows as u32;
             
             // Use the actual gpu_cells size for buffer allocation (terminal.cols * terminal.rows)
             // This may differ from pane pixel dimensions due to rounding
@@ -4637,6 +4642,35 @@ impl Renderer {
                 selection_end_col: sel_end_col,
                 selection_end_row: sel_end_row,
             };
+            
+            // DEBUG: Log grid params every 60 frames
+            static PANE_DEBUG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let pane_frame = PANE_DEBUG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if pane_frame % 60 == 0 {
+                log::info!("DEBUG pane {}: grid_params cols={} rows={} gpu_cells.len={} expected={}", 
+                    info.pane_id, grid_params.cols, grid_params.rows, 
+                    self.gpu_cells.len(), (grid_params.cols * grid_params.rows) as usize);
+                
+                // Sample a few cells to see if sprite indices look reasonable
+                if !self.gpu_cells.is_empty() {
+                    let sample_indices = [0, 1, 2, cols as usize, cols as usize + 1];
+                    for &idx in &sample_indices {
+                        if idx < self.gpu_cells.len() {
+                            let cell = &self.gpu_cells[idx];
+                            let sprite_idx = cell.sprite_idx & !0x80000000;
+                            log::info!("DEBUG   cell[{}]: sprite_idx={} fg={:#x} bg={:#x}", 
+                                idx, sprite_idx, cell.fg, cell.bg);
+                            
+                            if sprite_idx > 0 && (sprite_idx as usize) < self.sprite_info.len() {
+                                let sprite = &self.sprite_info[sprite_idx as usize];
+                                log::info!("DEBUG     sprite[{}]: uv=({:.3},{:.3},{:.3},{:.3}) layer={} size=({:.1},{:.1})",
+                                    sprite_idx, sprite.uv[0], sprite.uv[1], sprite.uv[2], sprite.uv[3],
+                                    sprite.layer, sprite.size[0], sprite.size[1]);
+                            }
+                        }
+                    }
+                }
+            }
             
             // Upload this pane's cell data to its own buffer (like Kitty's send_cell_data_to_gpu)
             // This happens BEFORE the render pass, so each pane has its own data
@@ -5027,6 +5061,17 @@ impl Renderer {
                     let (vp_x, vp_y, vp_w, vp_h) = pane_data.viewport;
                     render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
                     
+                    // Set scissor rect to clip rendering to pane bounds
+                    let scissor_x = (vp_x.round().max(0.0) as u32).min(self.width);
+                    let scissor_y = (vp_y.round().max(0.0) as u32).min(self.height);
+                    let scissor_w = (vp_w.round() as u32).min(self.width.saturating_sub(scissor_x));
+                    let scissor_h = (vp_h.round() as u32).min(self.height.saturating_sub(scissor_y));
+                    
+                    if scissor_w == 0 || scissor_h == 0 {
+                        continue;
+                    }
+                    render_pass.set_scissor_rect(scissor_x, scissor_y, scissor_w, scissor_h);
+                    
                     // Draw cell backgrounds
                     render_pass.set_pipeline(&self.cell_bg_pipeline);
                     render_pass.set_bind_group(0, &self.glyph_bind_group, &[]); // Atlas (shared)
@@ -5041,8 +5086,9 @@ impl Renderer {
                 }
             }
             
-            // Restore full-screen viewport for remaining rendering (statusline, overlays)
+            // Restore full-screen viewport and scissor for remaining rendering (statusline, overlays)
             render_pass.set_viewport(0.0, 0.0, self.width as f32, self.height as f32, 0.0, 1.0);
+            render_pass.set_scissor_rect(0, 0, self.width, self.height);
             
             // ═══════════════════════════════════════════════════════════════════
             // STATUSLINE RENDERING (dedicated shader)

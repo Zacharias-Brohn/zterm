@@ -1,5 +1,5 @@
 //! VT Parser - A high-performance terminal escape sequence parser.
-//! 
+//!
 //! Based on Kitty's vt-parser.c design, this parser uses explicit state tracking
 //! to enable fast-path processing of normal text while correctly handling
 //! escape sequences.
@@ -12,8 +12,8 @@
 //! 5. Buffer is integrated into parser - I/O writes directly here
 //! 6. Lock is released during parsing - I/O can continue while main parses
 
-use std::sync::Mutex;
 use crate::simd_utf8::SimdUtf8Decoder;
+use std::sync::Mutex;
 
 /// Buffer size - 1MB like Kitty
 pub const BUF_SIZE: usize = 1024 * 1024;
@@ -166,7 +166,8 @@ impl CsiParams {
     fn add_digit(&mut self, digit: u8) {
         // Like Kitty: accumulate with multipliers, divide at commit
         if self.num_digits < DIGIT_MULTIPLIERS.len() {
-            self.accumulator += (digit - b'0') as i64 * DIGIT_MULTIPLIERS[self.num_digits];
+            self.accumulator +=
+                (digit - b'0') as i64 * DIGIT_MULTIPLIERS[self.num_digits];
             self.num_digits += 1;
         }
     }
@@ -183,7 +184,8 @@ impl CsiParams {
             0
         } else {
             // Division converts from reverse-order accumulation
-            (self.accumulator / DIGIT_MULTIPLIERS[self.num_digits - 1]) as i32 * self.multiplier
+            (self.accumulator / DIGIT_MULTIPLIERS[self.num_digits - 1]) as i32
+                * self.multiplier
         };
         self.params[self.num_params] = value;
         self.num_params += 1;
@@ -243,10 +245,10 @@ struct BufferState {
 }
 
 /// Kitty-style shared parser with integrated 1MB buffer.
-/// 
+///
 /// Like Kitty's PS struct, this owns the buffer AND all parser state.
 /// I/O thread writes directly to this buffer, main thread parses in-place.
-/// 
+///
 /// Critical: Lock is RELEASED during parsing so I/O can continue writing.
 pub struct SharedParser {
     /// The 1MB buffer - I/O writes to end, main reads from front
@@ -255,7 +257,7 @@ pub struct SharedParser {
     state: Mutex<BufferState>,
     /// Eventfd for waking I/O thread when space available
     wakeup_fd: i32,
-    
+
     // ========== Parser state (main thread only, not behind mutex) ==========
     // These are copies of read_pos/read_sz/read_consumed for use while lock is released
     /// Current parse position (main thread working copy)
@@ -288,11 +290,15 @@ unsafe impl Send for SharedParser {}
 impl SharedParser {
     /// Create a new shared parser with integrated buffer.
     pub fn new() -> Self {
-        let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        let wakeup_fd =
+            unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if wakeup_fd < 0 {
-            panic!("Failed to create eventfd: {}", std::io::Error::last_os_error());
+            panic!(
+                "Failed to create eventfd: {}",
+                std::io::Error::last_os_error()
+            );
         }
-        
+
         Self {
             buf: std::cell::UnsafeCell::new(Box::new([0u8; BUF_SIZE])),
             state: Mutex::new(BufferState {
@@ -309,174 +315,213 @@ impl SharedParser {
             vte_state: std::cell::UnsafeCell::new(State::Normal),
             csi: std::cell::UnsafeCell::new(CsiParams::default()),
             utf8: std::cell::UnsafeCell::new(SimdUtf8Decoder::new()),
-            codepoint_buf: std::cell::UnsafeCell::new(Vec::with_capacity(BUF_SIZE)),
+            codepoint_buf: std::cell::UnsafeCell::new(Vec::with_capacity(
+                BUF_SIZE,
+            )),
             osc_buffer: std::cell::UnsafeCell::new(Vec::new()),
             string_buffer: std::cell::UnsafeCell::new(Vec::new()),
             escape_len: std::cell::UnsafeCell::new(0),
         }
     }
-    
+
     /// Get the wakeup fd for I/O thread to poll on.
     pub fn wakeup_fd(&self) -> i32 {
         self.wakeup_fd
     }
-    
+
     // ========== I/O Thread API ==========
-    
+
     /// Check if there's space for writing. Called by I/O thread.
     pub fn has_space(&self) -> bool {
         let state = self.state.lock().unwrap();
         state.read_sz + state.write_pending < BUF_SIZE
     }
-    
+
     /// Get write buffer for I/O thread. Returns (ptr, available_bytes).
     /// Caller MUST call commit_write() after writing.
     pub fn create_write_buffer(&self) -> (*mut u8, usize) {
         let state = self.state.lock().unwrap();
         let write_offset = state.read_sz + state.write_pending;
         let available = BUF_SIZE.saturating_sub(write_offset);
-        
+
         if available == 0 {
             return (std::ptr::null_mut(), 0);
         }
-        
+
         // SAFETY: I/O writes past read_sz+write_pending
         let ptr = unsafe { (*self.buf.get()).as_mut_ptr().add(write_offset) };
         (ptr, available)
     }
-    
+
     /// Commit bytes written by I/O thread.
     pub fn commit_write(&self, len: usize) {
         let mut state = self.state.lock().unwrap();
         state.write_pending += len;
     }
-    
+
     /// Read from PTY fd into buffer. Returns bytes read, -1 for error.
     pub fn read_from_fd(&self, fd: i32) -> isize {
         let (ptr, available) = self.create_write_buffer();
         if available == 0 {
             return 0;
         }
-        
-        let result = unsafe { libc::read(fd, ptr as *mut libc::c_void, available) };
-        
+
+        let result =
+            unsafe { libc::read(fd, ptr as *mut libc::c_void, available) };
+
         if result > 0 {
             self.commit_write(result as usize);
         }
         result
     }
-    
+
     /// Drain the wakeup eventfd.
     pub fn drain_wakeup(&self) {
         let mut buf = 0u64;
         unsafe {
-            libc::read(self.wakeup_fd, &mut buf as *mut u64 as *mut libc::c_void, 8);
+            libc::read(
+                self.wakeup_fd,
+                &mut buf as *mut u64 as *mut libc::c_void,
+                8,
+            );
         }
     }
-    
+
     // ========== Main Thread API ==========
-    
+
     /// Run a parse pass. This is the Kitty-style run_worker():
     /// 1. Lock, make pending visible
     /// 2. UNLOCK during actual parsing (consume_input)
     /// 3. Re-lock, add new pending, check for more data, repeat
     /// 4. Final compaction and wake I/O if space created
-    /// 
+    ///
     /// Returns true if any data was parsed.
     pub fn run_parse_pass<H: Handler>(&self, handler: &mut H) -> bool {
         let mut parsed_any = false;
-        
+
         // Lock for initial bookkeeping
         let mut state = self.state.lock().unwrap();
-        
+
         // Make pending writes visible (like Kitty: self->read.sz += self->write.pending)
         state.read_sz += state.write_pending;
         state.write_pending = 0;
-        
+
         // Check if there's data to parse (like Kitty: read.pos < read.sz)
         let has_pending_input = state.read_pos < state.read_sz;
         if !has_pending_input {
             return false;
         }
-        
+
         let initial_pos = state.read_pos;
         let initial_sz = state.read_sz;
-        
+
         // Track if buffer was ever full during this parse pass (for wakeup decision)
         // Like Kitty: pd->write_space_created = self->read.sz >= BUF_SZ (checked BEFORE compaction)
         let mut buffer_was_ever_full = state.read_sz >= BUF_SIZE;
-        
+
         // Reset consumed counter for this parse pass (like Kitty: self->read.consumed = 0)
         state.read_consumed = 0;
-        
+
+        // Check vte_state at start of parse pass
+        let vte_state_at_start = unsafe { *self.vte_state.get() };
+        if vte_state_at_start != State::Normal {
+            log::error!(
+                "DEBUG run_parse_pass START: vte_state={:?} read_pos={} read_sz={}",
+                vte_state_at_start, state.read_pos, state.read_sz
+            );
+        }
+
         // Copy positions to UnsafeCell fields for use while lock is released
         unsafe {
             *self.parse_pos.get() = state.read_pos;
             *self.parse_sz.get() = state.read_sz;
             *self.parse_consumed.get() = state.read_pos; // consumed starts at current pos
         }
-        
+
         // Parse loop - release lock during parsing!
         // Like Kitty's do { ... } while (self->read.pos < self->read.sz)
         let mut loop_count = 0;
         loop {
             let parse_pos = unsafe { *self.parse_pos.get() };
             let parse_sz = unsafe { *self.parse_sz.get() };
-            
+
             if parse_pos >= parse_sz {
                 break;
             }
-            
+
             // RELEASE LOCK during parsing - I/O can continue writing!
             drop(state);
-            
+
             // Parse the data - consume_input updates parse_pos and parse_consumed
             self.consume_input(handler);
             parsed_any = true;
             loop_count += 1;
-            
+
             // Re-acquire lock
             state = self.state.lock().unwrap();
-            
+
             // CRITICAL: Like Kitty line 1518, add new pending data INSIDE the loop
             // This allows us to process data that arrived while we were parsing
             state.read_sz += state.write_pending;
             state.write_pending = 0;
-            
+
             // Update buffer_was_ever_full if buffer is now full
             if state.read_sz >= BUF_SIZE {
                 buffer_was_ever_full = true;
             }
-            
+
             // Update state with new positions from parsing
             state.read_pos = unsafe { *self.parse_pos.get() };
             state.read_consumed = unsafe { *self.parse_consumed.get() };
-            
+
             // Update parse_sz to include new data for next iteration
             unsafe {
                 *self.parse_sz.get() = state.read_sz;
             }
-            
+
             // If no more unparsed data, we're done (like Kitty: while read.pos < read.sz)
             if state.read_pos >= state.read_sz {
                 break;
             }
         }
-        
+
         let bytes_parsed = state.read_pos.saturating_sub(initial_pos);
         if bytes_parsed > 0 || loop_count > 1 {
             log::debug!("[PARSE] initial_pos={} initial_sz={} final_pos={} final_sz={} loops={} bytes={}",
                 initial_pos, initial_sz, state.read_pos, state.read_sz, loop_count, bytes_parsed);
         }
-        
+
         // Compaction - remove consumed bytes (like Kitty)
         if state.read_consumed > 0 {
             let old_sz = state.read_sz;
-            
+
+            // Debug: Check what we're about to discard and what state we're in
+            let vte_state = unsafe { *self.vte_state.get() };
+            if vte_state != State::Normal {
+                let buf = unsafe { &*self.buf.get() };
+                let remaining_start = state.read_consumed.min(old_sz);
+                let preview_len = (old_sz - remaining_start).min(20);
+                let preview: String = buf
+                    [remaining_start..remaining_start + preview_len]
+                    .iter()
+                    .map(|&b| {
+                        if b >= 0x20 && b < 0x7f {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                log::error!(
+                    "DEBUG COMPACT: state={:?} consumed={} old_sz={} remaining preview: {:?}",
+                    vte_state, state.read_consumed, old_sz, preview
+                );
+            }
+
             // Like Kitty: pos -= consumed, sz -= consumed, memmove
             state.read_pos = state.read_pos.saturating_sub(state.read_consumed);
             state.read_sz = state.read_sz.saturating_sub(state.read_consumed);
-            
+
             // memmove remaining data to front
             if state.read_sz > 0 {
                 unsafe {
@@ -488,10 +533,10 @@ impl SharedParser {
                     );
                 }
             }
-            
+
             let consumed = state.read_consumed;
             state.read_consumed = 0;
-            
+
             // Wake I/O thread if buffer was ever full during this pass and we freed space
             // Like Kitty: if (pd.write_space_created) wakeup_io_loop()
             if buffer_was_ever_full && state.read_sz < BUF_SIZE {
@@ -500,7 +545,11 @@ impl SharedParser {
                 drop(state);
                 let val = 1u64;
                 unsafe {
-                    libc::write(self.wakeup_fd, &val as *const u64 as *const libc::c_void, 8);
+                    libc::write(
+                        self.wakeup_fd,
+                        &val as *const u64 as *const libc::c_void,
+                        8,
+                    );
                 }
                 return parsed_any;
             }
@@ -509,29 +558,29 @@ impl SharedParser {
             log::warn!("[PARSE] Buffer was full but read_consumed=0! read_pos={} read_sz={}", 
                 state.read_pos, state.read_sz);
         }
-        
+
         drop(state);
         parsed_any
     }
-    
+
     /// Check if there's pending data (for tick scheduling).
     pub fn has_pending_data(&self) -> bool {
         let state = self.state.lock().unwrap();
         state.read_pos < state.read_sz || state.write_pending > 0
     }
-    
+
     // ========== Internal parsing methods (main thread only) ==========
-    
+
     /// Main parsing dispatch - like Kitty's consume_input().
     /// Reads from buf[parse_pos..parse_sz] and updates positions.
-    /// 
+    ///
     /// IMPORTANT: Unlike the previous implementation, this now loops internally
     /// until the buffer is exhausted or we're waiting for more data in an incomplete
     /// escape sequence. This reduces per-CSI overhead from 3 function calls to 1.
     fn consume_input<H: Handler>(&self, handler: &mut H) {
         #[cfg(feature = "render_timing")]
         let start = std::time::Instant::now();
-        
+
         // Get mutable access to parser state (SAFETY: only main thread calls this)
         let parse_pos = unsafe { &mut *self.parse_pos.get() };
         let parse_sz = unsafe { *self.parse_sz.get() };
@@ -544,28 +593,69 @@ impl SharedParser {
         let string_buffer = unsafe { &mut *self.string_buffer.get() };
         let escape_len = unsafe { &mut *self.escape_len.get() };
         let buf = unsafe { &*self.buf.get() };
-        
+
+        // Debug: Log state at start of consume_input
+        if *vte_state != State::Normal {
+            log::error!(
+                "DEBUG consume_input START: state={:?} pos={} consumed={} sz={}",
+                *vte_state, *parse_pos, *parse_consumed, parse_sz
+            );
+        }
+
+        // Debug: Check if we're starting in Normal with CSI-like content
+        if *vte_state == State::Normal
+            && *parse_pos < parse_sz
+            && buf[*parse_pos] == b'['
+        {
+            log::error!(
+                "DEBUG: Starting consume_input in Normal but buf[{}]='[' (0x5b). consumed={} sz={}",
+                *parse_pos, *parse_consumed, parse_sz
+            );
+        }
+
         // Loop until buffer exhausted or waiting for more data
         while *parse_pos < parse_sz {
             match *vte_state {
                 State::Normal => {
-                    // Like Kitty: consume_normal(self); self->read.consumed = self->read.pos;
-                    Self::consume_normal_impl(handler, buf, parse_pos, parse_sz, utf8, codepoint_buf, vte_state, escape_len);
+                    Self::consume_normal_impl(
+                        handler,
+                        buf,
+                        parse_pos,
+                        parse_sz,
+                        utf8,
+                        codepoint_buf,
+                        vte_state,
+                        escape_len,
+                    );
                     *parse_consumed = *parse_pos;
-                    // consume_normal_impl sets vte_state to Escape if ESC found, so loop continues
                 }
                 State::Escape => {
-                    // Like Kitty: if (consume_esc(self)) { self->read.consumed = self->read.pos; }
-                    if Self::consume_escape_impl(handler, buf, parse_pos, parse_sz, *parse_consumed, vte_state, csi, osc_buffer, string_buffer, escape_len) {
+                    let state_before = *vte_state;
+                    if Self::consume_escape_impl(
+                        handler,
+                        buf,
+                        parse_pos,
+                        parse_sz,
+                        *parse_consumed,
+                        vte_state,
+                        csi,
+                        osc_buffer,
+                        string_buffer,
+                        escape_len,
+                    ) {
                         *parse_consumed = *parse_pos;
-                        // State changed, continue loop
+                    } else if *vte_state != state_before {
+                        // State changed to multi-byte sequence (CSI, OSC, etc.)
+                        // Continue loop WITHOUT updating parse_consumed
                     } else {
                         // Need more data for escape sequence
                         break;
                     }
                 }
                 State::EscapeIntermediate(_) => {
-                    if Self::consume_escape_intermediate_impl(handler, buf, parse_pos, parse_sz, vte_state) {
+                    if Self::consume_escape_intermediate_impl(
+                        handler, buf, parse_pos, parse_sz, vte_state,
+                    ) {
                         *parse_consumed = *parse_pos;
                     } else {
                         break;
@@ -573,7 +663,15 @@ impl SharedParser {
                 }
                 State::Csi => {
                     // Like Kitty: if (consume_csi(self)) { self->read.consumed = self->read.pos; dispatch; SET_STATE(NORMAL); }
-                    if Self::consume_csi_impl(handler, buf, parse_pos, parse_sz, *parse_consumed, csi, escape_len) {
+                    if Self::consume_csi_impl(
+                        handler,
+                        buf,
+                        parse_pos,
+                        parse_sz,
+                        *parse_consumed,
+                        csi,
+                        escape_len,
+                    ) {
                         *parse_consumed = *parse_pos;
                         if csi.is_valid {
                             handler.csi(csi);
@@ -586,7 +684,10 @@ impl SharedParser {
                     }
                 }
                 State::Osc => {
-                    if Self::consume_osc_impl(handler, buf, parse_pos, parse_sz, vte_state, osc_buffer, escape_len) {
+                    if Self::consume_osc_impl(
+                        handler, buf, parse_pos, parse_sz, vte_state,
+                        osc_buffer, escape_len,
+                    ) {
                         *parse_consumed = *parse_pos;
                         *vte_state = State::Normal;
                     } else {
@@ -594,7 +695,15 @@ impl SharedParser {
                     }
                 }
                 State::Dcs | State::Apc | State::Pm | State::Sos => {
-                    if Self::consume_string_impl(handler, buf, parse_pos, parse_sz, vte_state, string_buffer, escape_len) {
+                    if Self::consume_string_impl(
+                        handler,
+                        buf,
+                        parse_pos,
+                        parse_sz,
+                        vte_state,
+                        string_buffer,
+                        escape_len,
+                    ) {
                         *parse_consumed = *parse_pos;
                         *vte_state = State::Normal;
                     } else {
@@ -603,11 +712,11 @@ impl SharedParser {
                 }
             }
         }
-        
+
         #[cfg(feature = "render_timing")]
         handler.add_vt_parser_ns(start.elapsed().as_nanos() as u64);
     }
-    
+
     /// Consume normal text - like Kitty's consume_normal().
     /// UTF-8 decodes until ESC is found using SIMD-optimized decoder.
     #[inline]
@@ -625,15 +734,16 @@ impl SharedParser {
             if *parse_pos >= parse_sz {
                 break;
             }
-            
+
             let remaining = &buf[*parse_pos..parse_sz];
-            let (consumed, found_esc) = utf8.decode_to_esc(remaining, codepoint_buf);
+            let (consumed, found_esc) =
+                utf8.decode_to_esc(remaining, codepoint_buf);
             *parse_pos += consumed;
-            
+
             if !codepoint_buf.is_empty() {
                 handler.text(codepoint_buf);
             }
-            
+
             if found_esc {
                 *vte_state = State::Escape;
                 *escape_len = 0;
@@ -641,7 +751,7 @@ impl SharedParser {
             }
         }
     }
-    
+
     /// Consume escape sequence start - like Kitty's consume_esc().
     /// Returns true if sequence is complete (consumed = pos).
     #[inline]
@@ -660,38 +770,93 @@ impl SharedParser {
         if *parse_pos >= parse_sz {
             return false;
         }
-        
+
         let ch = buf[*parse_pos];
         *parse_pos += 1;
         *escape_len += 1;
-        
+
         // Like Kitty: is_first_char = read.pos - read.consumed == 1
         let is_first_char = *parse_pos - parse_consumed == 1;
-        
+
         if is_first_char {
             match ch {
-                b'[' => { *vte_state = State::Csi; csi.reset(); }
-                b']' => { *vte_state = State::Osc; osc_buffer.clear(); }
-                b'P' => { *vte_state = State::Dcs; string_buffer.clear(); }
-                b'_' => { *vte_state = State::Apc; string_buffer.clear(); }
-                b'^' => { *vte_state = State::Pm; string_buffer.clear(); }
-                b'X' => { *vte_state = State::Sos; string_buffer.clear(); }
-                // Two-char sequences - need another char
-                b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'%' | b'#' | b' ' => {
-                    *vte_state = State::EscapeIntermediate(ch);
-                    return false; // Need more chars
+                // Multi-byte sequences: return false so parse_consumed is NOT updated.
+                // This prevents ESC[ from being discarded on buffer compaction before
+                // the full sequence completes.
+                b'[' => {
+                    *vte_state = State::Csi;
+                    csi.reset();
+                    return false;
                 }
-                // Single-char escape sequences
-                b'7' => { handler.save_cursor(); *vte_state = State::Normal; }
-                b'8' => { handler.restore_cursor(); *vte_state = State::Normal; }
-                b'c' => { handler.reset(); *vte_state = State::Normal; }
-                b'D' => { handler.index(); *vte_state = State::Normal; }
-                b'E' => { handler.newline(); *vte_state = State::Normal; }
-                b'H' => { handler.set_tab_stop(); *vte_state = State::Normal; }
-                b'M' => { handler.reverse_index(); *vte_state = State::Normal; }
-                b'=' => { handler.set_keypad_mode(true); *vte_state = State::Normal; }
-                b'>' => { handler.set_keypad_mode(false); *vte_state = State::Normal; }
-                b'\\' => { *vte_state = State::Normal; } // ST
+                b']' => {
+                    *vte_state = State::Osc;
+                    osc_buffer.clear();
+                    return false;
+                }
+                b'P' => {
+                    *vte_state = State::Dcs;
+                    string_buffer.clear();
+                    return false;
+                }
+                b'_' => {
+                    *vte_state = State::Apc;
+                    string_buffer.clear();
+                    return false;
+                }
+                b'^' => {
+                    *vte_state = State::Pm;
+                    string_buffer.clear();
+                    return false;
+                }
+                b'X' => {
+                    *vte_state = State::Sos;
+                    string_buffer.clear();
+                    return false;
+                }
+                b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'%'
+                | b'#' | b' ' => {
+                    *vte_state = State::EscapeIntermediate(ch);
+                    return false;
+                }
+                b'7' => {
+                    handler.save_cursor();
+                    *vte_state = State::Normal;
+                }
+                b'8' => {
+                    handler.restore_cursor();
+                    *vte_state = State::Normal;
+                }
+                b'c' => {
+                    handler.reset();
+                    *vte_state = State::Normal;
+                }
+                b'D' => {
+                    handler.index();
+                    *vte_state = State::Normal;
+                }
+                b'E' => {
+                    handler.newline();
+                    *vte_state = State::Normal;
+                }
+                b'H' => {
+                    handler.set_tab_stop();
+                    *vte_state = State::Normal;
+                }
+                b'M' => {
+                    handler.reverse_index();
+                    *vte_state = State::Normal;
+                }
+                b'=' => {
+                    handler.set_keypad_mode(true);
+                    *vte_state = State::Normal;
+                }
+                b'>' => {
+                    handler.set_keypad_mode(false);
+                    *vte_state = State::Normal;
+                }
+                b'\\' => {
+                    *vte_state = State::Normal;
+                }
                 _ => {
                     log::debug!("Unknown escape sequence: ESC {:02x}", ch);
                     *vte_state = State::Normal;
@@ -702,7 +867,7 @@ impl SharedParser {
             // Second char of two-char sequence - like Kitty's else branch
             let prev_ch = buf[*parse_pos - 2];
             *vte_state = State::Normal;
-            
+
             match prev_ch {
                 b'(' | b')' => {
                     let set = if prev_ch == b'(' { 0 } else { 1 };
@@ -718,7 +883,7 @@ impl SharedParser {
             return true;
         }
     }
-    
+
     /// Consume second byte of two-char escape sequence.
     fn consume_escape_intermediate_impl<H: Handler>(
         handler: &mut H,
@@ -730,17 +895,20 @@ impl SharedParser {
         if *parse_pos >= parse_sz {
             return false;
         }
-        
+
         let ch = buf[*parse_pos];
         *parse_pos += 1;
-        
+
         let intermediate = match *vte_state {
             State::EscapeIntermediate(i) => i,
-            _ => { *vte_state = State::Normal; return true; }
+            _ => {
+                *vte_state = State::Normal;
+                return true;
+            }
         };
-        
+
         *vte_state = State::Normal;
-        
+
         match intermediate {
             b'(' | b')' => {
                 let set = if intermediate == b'(' { 0 } else { 1 };
@@ -753,10 +921,10 @@ impl SharedParser {
             }
             _ => {}
         }
-        
+
         true
     }
-    
+
     /// Consume CSI sequence - like Kitty's csi_parse_loop().
     /// Returns true when sequence is complete.
     #[inline]
@@ -773,119 +941,116 @@ impl SharedParser {
             let ch = buf[*parse_pos];
             *parse_pos += 1;
             *escape_len += 1;
-            
+
             // Handle embedded control characters
             if ch <= 0x1F && ch != 0x1B {
                 handler.control(ch);
                 continue;
             }
-            
+
             match csi.state {
-                CsiState::Start => {
-                    match ch {
-                        b';' => {
-                            csi.params[csi.num_params] = 0;
-                            csi.num_params += 1;
-                            csi.state = CsiState::Body;
-                        }
-                        b'0'..=b'9' => {
-                            csi.add_digit(ch);
-                            csi.state = CsiState::Body;
-                        }
-                        b'?' | b'>' | b'<' | b'=' => {
-                            csi.primary = ch;
-                            csi.state = CsiState::Body;
-                        }
-                        b'-' => {
-                            csi.multiplier = -1;
-                            csi.num_digits = 1;
-                            csi.state = CsiState::Body;
-                        }
-                        b' ' | b'\'' | b'"' | b'!' | b'$' | b'#' | b'*' => {
-                            csi.secondary = ch;
-                            csi.state = CsiState::PostSecondary;
-                        }
-                        b'@'..=b'~' => {
-                            csi.final_char = ch;
-                            csi.is_valid = true;
-                            return true;
-                        }
-                        _ => {
-                            log::debug!("Invalid CSI character: {:02x}", ch);
-                            return true;
-                        }
+                CsiState::Start => match ch {
+                    b';' => {
+                        csi.params[csi.num_params] = 0;
+                        csi.num_params += 1;
+                        csi.state = CsiState::Body;
                     }
-                }
-                CsiState::Body => {
-                    match ch {
-                        b'0'..=b'9' => {
-                            csi.add_digit(ch);
-                        }
-                        b';' => {
-                            if csi.num_digits == 0 {
-                                csi.num_digits = 1;
-                            }
-                            if !csi.commit_param() {
-                                return true;
-                            }
-                            csi.is_sub_param[csi.num_params] = false;
-                        }
-                        b':' => {
-                            if !csi.commit_param() {
-                                return true;
-                            }
-                            csi.is_sub_param[csi.num_params] = true;
-                        }
-                        b'-' if csi.num_digits == 0 => {
-                            csi.multiplier = -1;
+                    b'0'..=b'9' => {
+                        csi.add_digit(ch);
+                        csi.state = CsiState::Body;
+                    }
+                    b'?' | b'>' | b'<' | b'=' => {
+                        csi.primary = ch;
+                        csi.state = CsiState::Body;
+                    }
+                    b'-' => {
+                        csi.multiplier = -1;
+                        csi.num_digits = 1;
+                        csi.state = CsiState::Body;
+                    }
+                    b' ' | b'\'' | b'"' | b'!' | b'$' | b'#' | b'*' => {
+                        csi.secondary = ch;
+                        csi.state = CsiState::PostSecondary;
+                    }
+                    b'@'..=b'~' => {
+                        csi.final_char = ch;
+                        csi.is_valid = true;
+                        return true;
+                    }
+                    _ => {
+                        log::debug!("Invalid CSI character: {:02x}", ch);
+                        return true;
+                    }
+                },
+                CsiState::Body => match ch {
+                    b'0'..=b'9' => {
+                        csi.add_digit(ch);
+                    }
+                    b';' => {
+                        if csi.num_digits == 0 {
                             csi.num_digits = 1;
                         }
-                        b' ' | b'\'' | b'"' | b'!' | b'$' | b'#' | b'*' => {
-                            if !csi.commit_param() {
-                                return true;
-                            }
-                            csi.secondary = ch;
-                            csi.state = CsiState::PostSecondary;
-                        }
-                        b'@'..=b'~' => {
-                            if csi.num_digits > 0 || csi.num_params > 0 {
-                                csi.commit_param();
-                            }
-                            csi.final_char = ch;
-                            csi.is_valid = true;
+                        if !csi.commit_param() {
                             return true;
                         }
-                        _ => {
-                            log::debug!("Invalid CSI body character: {:02x}", ch);
-                            return true;
-                        }
+                        csi.is_sub_param[csi.num_params] = false;
                     }
-                }
-                CsiState::PostSecondary => {
-                    match ch {
-                        b'@'..=b'~' => {
-                            csi.final_char = ch;
-                            csi.is_valid = true;
+                    b':' => {
+                        if !csi.commit_param() {
                             return true;
                         }
-                        _ => {
-                            log::debug!("Invalid CSI post-secondary character: {:02x}", ch);
-                            return true;
-                        }
+                        csi.is_sub_param[csi.num_params] = true;
                     }
-                }
+                    b'-' if csi.num_digits == 0 => {
+                        csi.multiplier = -1;
+                        csi.num_digits = 1;
+                    }
+                    b' ' | b'\'' | b'"' | b'!' | b'$' | b'#' | b'*' => {
+                        if !csi.commit_param() {
+                            return true;
+                        }
+                        csi.secondary = ch;
+                        csi.state = CsiState::PostSecondary;
+                    }
+                    b'@'..=b'~' => {
+                        if csi.num_digits > 0 || csi.num_params > 0 {
+                            csi.commit_param();
+                        }
+                        csi.final_char = ch;
+                        csi.is_valid = true;
+                        return true;
+                    }
+                    _ => {
+                        log::debug!("Invalid CSI body character: {:02x}", ch);
+                        return true;
+                    }
+                },
+                CsiState::PostSecondary => match ch {
+                    b'@'..=b'~' => {
+                        csi.final_char = ch;
+                        csi.is_valid = true;
+                        return true;
+                    }
+                    _ => {
+                        log::debug!(
+                            "Invalid CSI post-secondary character: {:02x}",
+                            ch
+                        );
+                        return true;
+                    }
+                },
             }
         }
-        
+
         // Check max length
         if *parse_pos - parse_consumed > MAX_ESCAPE_LEN {
             log::debug!("CSI escape too long, ignoring");
             return true;
         }
-        
+
         false
     }
-    
+
     /// Consume OSC sequence.
     fn consume_osc_impl<H: Handler>(
         handler: &mut H,
@@ -898,7 +1063,7 @@ impl SharedParser {
     ) -> bool {
         while *parse_pos < parse_sz {
             let ch = buf[*parse_pos];
-            
+
             match ch {
                 0x07 => {
                     // BEL terminator
@@ -914,7 +1079,8 @@ impl SharedParser {
                 }
                 0x1B => {
                     // Check for ESC \
-                    if *parse_pos + 1 < parse_sz && buf[*parse_pos + 1] == b'\\' {
+                    if *parse_pos + 1 < parse_sz && buf[*parse_pos + 1] == b'\\'
+                    {
                         *parse_pos += 2;
                         handler.osc(osc_buffer);
                         return true;
@@ -936,16 +1102,16 @@ impl SharedParser {
                     *escape_len += 1;
                 }
             }
-            
+
             if *escape_len > MAX_ESCAPE_LEN {
                 log::debug!("OSC sequence too long, aborting");
                 return true;
             }
         }
-        
+
         false
     }
-    
+
     /// Consume DCS/APC/PM/SOS string sequence.
     fn consume_string_impl<H: Handler>(
         handler: &mut H,
@@ -958,19 +1124,28 @@ impl SharedParser {
     ) -> bool {
         while *parse_pos < parse_sz {
             let ch = buf[*parse_pos];
-            
+
             match ch {
                 0x9C => {
                     // C1 ST terminator
                     *parse_pos += 1;
-                    Self::dispatch_string_command(handler, vte_state, string_buffer);
+                    Self::dispatch_string_command(
+                        handler,
+                        vte_state,
+                        string_buffer,
+                    );
                     return true;
                 }
                 0x1B => {
                     // Check for ESC \
-                    if *parse_pos + 1 < parse_sz && buf[*parse_pos + 1] == b'\\' {
+                    if *parse_pos + 1 < parse_sz && buf[*parse_pos + 1] == b'\\'
+                    {
                         *parse_pos += 2;
-                        Self::dispatch_string_command(handler, vte_state, string_buffer);
+                        Self::dispatch_string_command(
+                            handler,
+                            vte_state,
+                            string_buffer,
+                        );
                         return true;
                     } else if *parse_pos + 1 < parse_sz {
                         // ESC not followed by \ - include in buffer
@@ -988,16 +1163,16 @@ impl SharedParser {
                     *escape_len += 1;
                 }
             }
-            
+
             if *escape_len > MAX_ESCAPE_LEN {
                 log::debug!("String command too long, aborting");
                 return true;
             }
         }
-        
+
         false
     }
-    
+
     /// Dispatch string command to handler.
     fn dispatch_string_command<H: Handler>(
         handler: &mut H,
@@ -1047,22 +1222,28 @@ impl Parser {
 
     /// Process a buffer of bytes, calling the handler for each action.
     /// Returns the number of bytes consumed.
-    pub fn parse<H: Handler>(&mut self, bytes: &[u8], handler: &mut H) -> usize {
+    pub fn parse<H: Handler>(
+        &mut self,
+        bytes: &[u8],
+        handler: &mut H,
+    ) -> usize {
         let mut pos = 0;
-        
+
         while pos < bytes.len() {
             match self.state {
                 State::Normal => {
                     // Fast path: UTF-8 decode until ESC using SIMD
-                    let (consumed, found_esc) = self.utf8.decode_to_esc(&bytes[pos..], &mut self.codepoint_buf);
-                    
+                    let (consumed, found_esc) = self
+                        .utf8
+                        .decode_to_esc(&bytes[pos..], &mut self.codepoint_buf);
+
                     // Process decoded codepoints (text + control chars)
                     if !self.codepoint_buf.is_empty() {
                         handler.text(&self.codepoint_buf);
                     }
-                    
+
                     pos += consumed;
-                    
+
                     if found_esc {
                         self.state = State::Escape;
                         self.escape_len = 0;
@@ -1072,7 +1253,8 @@ impl Parser {
                     pos += self.consume_escape(bytes, pos, handler);
                 }
                 State::EscapeIntermediate(_) => {
-                    pos += self.consume_escape_intermediate(bytes, pos, handler);
+                    pos +=
+                        self.consume_escape_intermediate(bytes, pos, handler);
                 }
                 State::Csi => {
                     pos += self.consume_csi(bytes, pos, handler);
@@ -1085,19 +1267,24 @@ impl Parser {
                 }
             }
         }
-        
+
         pos
     }
 
     /// Process bytes after ESC.
-    fn consume_escape<H: Handler>(&mut self, bytes: &[u8], pos: usize, handler: &mut H) -> usize {
+    fn consume_escape<H: Handler>(
+        &mut self,
+        bytes: &[u8],
+        pos: usize,
+        handler: &mut H,
+    ) -> usize {
         if pos >= bytes.len() {
             return 0;
         }
-        
+
         let ch = bytes[pos];
         self.escape_len += 1;
-        
+
         match ch {
             // CSI: ESC [
             b'[' => {
@@ -1136,7 +1323,8 @@ impl Parser {
                 1
             }
             // Two-char sequences: ESC ( ESC ) ESC # ESC % ESC SP etc.
-            b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'%' | b'#' | b' ' => {
+            b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'%' | b'#'
+            | b' ' => {
                 self.state = State::EscapeIntermediate(ch);
                 1
             }
@@ -1210,11 +1398,16 @@ impl Parser {
     }
 
     /// Process second byte of two-char escape sequence.
-    fn consume_escape_intermediate<H: Handler>(&mut self, bytes: &[u8], pos: usize, handler: &mut H) -> usize {
+    fn consume_escape_intermediate<H: Handler>(
+        &mut self,
+        bytes: &[u8],
+        pos: usize,
+        handler: &mut H,
+    ) -> usize {
         if pos >= bytes.len() {
             return 0;
         }
-        
+
         let ch = bytes[pos];
         // Extract intermediate from state enum (eliminates redundant self.intermediate field)
         let intermediate = match self.state {
@@ -1223,7 +1416,7 @@ impl Parser {
         };
         self.escape_len += 1;
         self.state = State::Normal;
-        
+
         match intermediate {
             b'(' | b')' => {
                 // Designate character set G0/G1
@@ -1244,32 +1437,37 @@ impl Parser {
             }
             _ => {}
         }
-        
+
         1
     }
 
     /// Process CSI sequence bytes.
-    fn consume_csi<H: Handler>(&mut self, bytes: &[u8], pos: usize, handler: &mut H) -> usize {
+    fn consume_csi<H: Handler>(
+        &mut self,
+        bytes: &[u8],
+        pos: usize,
+        handler: &mut H,
+    ) -> usize {
         let mut consumed = 0;
-        
+
         while pos + consumed < bytes.len() {
             let ch = bytes[pos + consumed];
             consumed += 1;
             self.escape_len += 1;
-            
+
             // Check for max length
             if self.escape_len > MAX_ESCAPE_LEN {
                 log::debug!("CSI sequence too long, aborting");
                 self.state = State::Normal;
                 return consumed;
             }
-            
+
             // Handle control characters embedded in CSI (common to all states)
             if ch <= 0x1F && ch != 0x1B {
                 handler.control(ch);
                 continue;
             }
-            
+
             match self.csi.state {
                 CsiState::Start => {
                     match ch {
@@ -1347,7 +1545,9 @@ impl Parser {
                         }
                         // Final byte
                         b'@'..=b'~' => {
-                            if self.csi.num_digits > 0 || self.csi.num_params > 0 {
+                            if self.csi.num_digits > 0
+                                || self.csi.num_params > 0
+                            {
                                 self.csi.commit_param();
                             }
                             self.csi.final_char = ch;
@@ -1357,7 +1557,10 @@ impl Parser {
                             return consumed;
                         }
                         _ => {
-                            log::debug!("Invalid CSI body character: {:02x}", ch);
+                            log::debug!(
+                                "Invalid CSI body character: {:02x}",
+                                ch
+                            );
                             self.state = State::Normal;
                             return consumed;
                         }
@@ -1374,7 +1577,10 @@ impl Parser {
                             return consumed;
                         }
                         _ => {
-                            log::debug!("Invalid CSI post-secondary character: {:02x}", ch);
+                            log::debug!(
+                                "Invalid CSI post-secondary character: {:02x}",
+                                ch
+                            );
                             self.state = State::Normal;
                             return consumed;
                         }
@@ -1382,7 +1588,7 @@ impl Parser {
                 }
             }
         }
-        
+
         consumed
     }
 
@@ -1393,22 +1599,29 @@ impl Parser {
 
     /// Process OSC sequence bytes using SIMD-accelerated terminator search.
     /// Like Kitty's find_st_terminator + accumulate_st_terminated_esc_code.
-    fn consume_osc<H: Handler>(&mut self, bytes: &[u8], pos: usize, handler: &mut H) -> usize {
+    fn consume_osc<H: Handler>(
+        &mut self,
+        bytes: &[u8],
+        pos: usize,
+        handler: &mut H,
+    ) -> usize {
         let remaining = &bytes[pos..];
-        
+
         // Use SIMD-accelerated search to find BEL (0x07), ESC (0x1B), or C1 ST (0x9C)
         // memchr2 finds either of two bytes; we check ESC specially for ESC \ sequence
         // First, try to find BEL or C1 ST (the simple terminators)
         if let Some(term_pos) = memchr::memchr3(0x07, 0x1B, 0x9C, remaining) {
             let terminator = remaining[term_pos];
-            
+
             // Check max length before accepting
-            if self.escape_len + term_pos > MAX_ESCAPE_LEN || self.osc_buffer.len() + term_pos > MAX_OSC_LEN {
+            if self.escape_len + term_pos > MAX_ESCAPE_LEN
+                || self.osc_buffer.len() + term_pos > MAX_OSC_LEN
+            {
                 log::debug!("OSC sequence too long, aborting");
                 self.state = State::Normal;
                 return remaining.len();
             }
-            
+
             match terminator {
                 0x07 => {
                     // BEL terminator - copy data in bulk and dispatch
@@ -1428,9 +1641,12 @@ impl Parser {
                 }
                 0x1B => {
                     // ESC found - check if followed by \ for ST
-                    if term_pos + 1 < remaining.len() && remaining[term_pos + 1] == b'\\' {
+                    if term_pos + 1 < remaining.len()
+                        && remaining[term_pos + 1] == b'\\'
+                    {
                         // ESC \ (ST) terminator
-                        self.osc_buffer.extend_from_slice(&remaining[..term_pos]);
+                        self.osc_buffer
+                            .extend_from_slice(&remaining[..term_pos]);
                         handler.osc(&self.osc_buffer);
                         self.state = State::Normal;
                         self.escape_len += term_pos + 2;
@@ -1438,7 +1654,8 @@ impl Parser {
                     } else if term_pos + 1 < remaining.len() {
                         // ESC not followed by \ - this is a new escape sequence
                         // Copy everything before ESC and transition to Escape state
-                        self.osc_buffer.extend_from_slice(&remaining[..term_pos]);
+                        self.osc_buffer
+                            .extend_from_slice(&remaining[..term_pos]);
                         handler.osc(&self.osc_buffer);
                         self.state = State::Escape;
                         self.escape_len += term_pos + 1;
@@ -1446,7 +1663,8 @@ impl Parser {
                     } else {
                         // ESC at end of buffer, need more data
                         // Copy everything before ESC, keep ESC for next parse
-                        self.osc_buffer.extend_from_slice(&remaining[..term_pos]);
+                        self.osc_buffer
+                            .extend_from_slice(&remaining[..term_pos]);
                         self.escape_len += term_pos;
                         return term_pos;
                     }
@@ -1455,12 +1673,14 @@ impl Parser {
             }
         } else {
             // No terminator found - check max length
-            if self.escape_len + remaining.len() > MAX_ESCAPE_LEN || self.osc_buffer.len() + remaining.len() > MAX_OSC_LEN {
+            if self.escape_len + remaining.len() > MAX_ESCAPE_LEN
+                || self.osc_buffer.len() + remaining.len() > MAX_OSC_LEN
+            {
                 log::debug!("OSC sequence too long, aborting");
                 self.state = State::Normal;
                 return remaining.len();
             }
-            
+
             // Buffer all remaining bytes for next parse call
             self.osc_buffer.extend_from_slice(remaining);
             self.escape_len += remaining.len();
@@ -1476,35 +1696,43 @@ impl Parser {
             State::Apc => handler.apc(&self.string_buffer),
             State::Pm => handler.pm(&self.string_buffer),
             State::Sos => handler.sos(&self.string_buffer),
-            _ => unreachable!("dispatch_string_command called in invalid state"),
+            _ => {
+                unreachable!("dispatch_string_command called in invalid state")
+            }
         }
     }
 
     /// Process DCS/APC/PM/SOS sequence bytes using SIMD-accelerated terminator search.
     /// Like Kitty's find_st_terminator + accumulate_st_terminated_esc_code.
     /// Uses iterative approach to avoid stack overflow on malformed input.
-    fn consume_string_command<H: Handler>(&mut self, bytes: &[u8], pos: usize, handler: &mut H) -> usize {
+    fn consume_string_command<H: Handler>(
+        &mut self,
+        bytes: &[u8],
+        pos: usize,
+        handler: &mut H,
+    ) -> usize {
         let mut current_pos = pos;
         let mut total_consumed = 0;
-        
+
         loop {
             let remaining = &bytes[current_pos..];
-            
+
             // Use SIMD-accelerated search to find ESC (0x1B) or C1 ST (0x9C)
             if let Some(term_pos) = memchr::memchr2(0x1B, 0x9C, remaining) {
                 let terminator = remaining[term_pos];
-                
+
                 // Check max length before accepting
                 if self.escape_len + term_pos > MAX_ESCAPE_LEN {
                     log::debug!("String command too long, aborting");
                     self.state = State::Normal;
                     return total_consumed + remaining.len();
                 }
-                
+
                 match terminator {
                     0x9C => {
                         // C1 ST terminator - copy data in bulk and dispatch
-                        self.string_buffer.extend_from_slice(&remaining[..term_pos]);
+                        self.string_buffer
+                            .extend_from_slice(&remaining[..term_pos]);
                         self.dispatch_string_command(handler);
                         self.state = State::Normal;
                         self.escape_len += term_pos + 1;
@@ -1512,9 +1740,12 @@ impl Parser {
                     }
                     0x1B => {
                         // ESC found - check if followed by \ for ST
-                        if term_pos + 1 < remaining.len() && remaining[term_pos + 1] == b'\\' {
+                        if term_pos + 1 < remaining.len()
+                            && remaining[term_pos + 1] == b'\\'
+                        {
                             // ESC \ (ST) terminator
-                            self.string_buffer.extend_from_slice(&remaining[..term_pos]);
+                            self.string_buffer
+                                .extend_from_slice(&remaining[..term_pos]);
                             self.dispatch_string_command(handler);
                             self.state = State::Normal;
                             self.escape_len += term_pos + 2;
@@ -1522,7 +1753,8 @@ impl Parser {
                         } else if term_pos + 1 < remaining.len() {
                             // ESC not followed by \ - include ESC in data and continue
                             // (Unlike OSC, string commands include raw ESC that isn't ST)
-                            self.string_buffer.extend_from_slice(&remaining[..=term_pos]);
+                            self.string_buffer
+                                .extend_from_slice(&remaining[..=term_pos]);
                             self.escape_len += term_pos + 1;
                             // Continue searching from after this ESC (iterative, not recursive)
                             let consumed = term_pos + 1;
@@ -1532,7 +1764,8 @@ impl Parser {
                         } else {
                             // ESC at end of buffer, need more data
                             // Copy everything before ESC, keep ESC for next parse
-                            self.string_buffer.extend_from_slice(&remaining[..term_pos]);
+                            self.string_buffer
+                                .extend_from_slice(&remaining[..term_pos]);
                             self.escape_len += term_pos;
                             return total_consumed + term_pos;
                         }
@@ -1546,7 +1779,7 @@ impl Parser {
                     self.state = State::Normal;
                     return total_consumed + remaining.len();
                 }
-                
+
                 // Buffer all remaining bytes for next parse call
                 self.string_buffer.extend_from_slice(remaining);
                 self.escape_len += remaining.len();
@@ -1557,13 +1790,13 @@ impl Parser {
 }
 
 /// Handler trait for responding to parsed escape sequences.
-/// 
+///
 /// Unlike the vte crate's Perform trait, this trait receives decoded characters
 /// (not bytes) for text, and control characters are expected to be handled
 /// inline in the text() method (like Kitty does).
 pub trait Handler {
     /// Handle a chunk of decoded text (Unicode codepoints as u32).
-    /// 
+    ///
     /// This includes control characters (0x00-0x1F except ESC).
     /// The handler should process control chars like:
     /// - LF (0x0A), VT (0x0B), FF (0x0C): line feed
@@ -1571,66 +1804,66 @@ pub trait Handler {
     /// - HT (0x09): tab
     /// - BS (0x08): backspace
     /// - BEL (0x07): bell
-    /// 
+    ///
     /// ESC is never passed to this method - it triggers state transitions.
-    /// 
+    ///
     /// Codepoints are passed as u32 for efficiency (avoiding char validation).
     /// All codepoints are guaranteed to be valid Unicode (validated during UTF-8 decode).
     fn text(&mut self, codepoints: &[u32]);
-    
+
     /// Handle a single control character embedded in a CSI/OSC sequence.
     /// This is called for control chars (0x00-0x1F) that appear inside
     /// escape sequences, which should still be processed.
     fn control(&mut self, byte: u8);
-    
+
     /// Handle a complete CSI sequence.
     fn csi(&mut self, params: &CsiParams);
-    
+
     /// Handle a complete OSC sequence.
     fn osc(&mut self, data: &[u8]);
-    
+
     /// Handle a DCS sequence.
     fn dcs(&mut self, _data: &[u8]) {}
-    
+
     /// Handle an APC sequence.
     fn apc(&mut self, _data: &[u8]) {}
-    
+
     /// Handle a PM sequence.
     fn pm(&mut self, _data: &[u8]) {}
-    
+
     /// Handle a SOS sequence.
     fn sos(&mut self, _data: &[u8]) {}
-    
+
     /// Save cursor position (DECSC).
     fn save_cursor(&mut self) {}
-    
+
     /// Restore cursor position (DECRC).
     fn restore_cursor(&mut self) {}
-    
+
     /// Full terminal reset (RIS).
     fn reset(&mut self) {}
-    
+
     /// Index - move cursor down, scroll if at bottom (IND).
     fn index(&mut self) {}
-    
+
     /// Newline - carriage return + line feed (NEL).
     fn newline(&mut self) {}
-    
+
     /// Reverse index - move cursor up, scroll if at top (RI).
     fn reverse_index(&mut self) {}
-    
+
     /// Set tab stop at current position (HTS).
     fn set_tab_stop(&mut self) {}
-    
+
     /// Set keypad application/normal mode.
     fn set_keypad_mode(&mut self, _application: bool) {}
-    
+
     /// Designate character set.
     fn designate_charset(&mut self, _set: u8, _charset: u8) {}
-    
+
     /// Screen alignment test (DECALN).
     fn screen_alignment(&mut self) {}
-    
+
     /// Add VT parser time (for performance tracking).
     /// Called by the parser to report time spent in consume_input.
     fn add_vt_parser_ns(&mut self, _ns: u64) {}
@@ -1639,14 +1872,14 @@ pub trait Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     struct TestHandler {
         text_chunks: Vec<Vec<u32>>,
         csi_count: usize,
         osc_count: usize,
         control_chars: Vec<u8>,
     }
-    
+
     impl TestHandler {
         fn new() -> Self {
             Self {
@@ -1657,107 +1890,122 @@ mod tests {
             }
         }
     }
-    
+
     impl Handler for TestHandler {
         fn text(&mut self, codepoints: &[u32]) {
             self.text_chunks.push(codepoints.to_vec());
         }
-        
+
         fn control(&mut self, byte: u8) {
             self.control_chars.push(byte);
         }
-        
+
         fn csi(&mut self, _params: &CsiParams) {
             self.csi_count += 1;
         }
-        
+
         fn osc(&mut self, _data: &[u8]) {
             self.osc_count += 1;
         }
     }
-    
+
     #[test]
     fn test_plain_text() {
         let mut parser = Parser::new();
         let mut handler = TestHandler::new();
-        
+
         parser.parse(b"Hello, World!", &mut handler);
-        
+
         assert_eq!(handler.text_chunks.len(), 1);
-        let text: String = handler.text_chunks[0].iter().filter_map(|&cp| char::from_u32(cp)).collect();
+        let text: String = handler.text_chunks[0]
+            .iter()
+            .filter_map(|&cp| char::from_u32(cp))
+            .collect();
         assert_eq!(text, "Hello, World!");
     }
-    
+
     #[test]
     fn test_utf8_text() {
         let mut parser = Parser::new();
         let mut handler = TestHandler::new();
-        
+
         parser.parse("Hello, 世界!".as_bytes(), &mut handler);
-        
+
         assert_eq!(handler.text_chunks.len(), 1);
-        let text: String = handler.text_chunks[0].iter().filter_map(|&cp| char::from_u32(cp)).collect();
+        let text: String = handler.text_chunks[0]
+            .iter()
+            .filter_map(|&cp| char::from_u32(cp))
+            .collect();
         assert_eq!(text, "Hello, 世界!");
     }
-    
+
     #[test]
     fn test_control_chars_in_text() {
         let mut parser = Parser::new();
         let mut handler = TestHandler::new();
-        
+
         // Text with LF and CR
         parser.parse(b"Hello\nWorld\r!", &mut handler);
-        
+
         assert_eq!(handler.text_chunks.len(), 1);
-        let text: String = handler.text_chunks[0].iter().filter_map(|&cp| char::from_u32(cp)).collect();
+        let text: String = handler.text_chunks[0]
+            .iter()
+            .filter_map(|&cp| char::from_u32(cp))
+            .collect();
         assert_eq!(text, "Hello\nWorld\r!");
     }
-    
+
     #[test]
     fn test_csi_sequence() {
         let mut parser = Parser::new();
         let mut handler = TestHandler::new();
-        
+
         // ESC [ 1 ; 2 m (SGR bold + dim)
         parser.parse(b"\x1b[1;2m", &mut handler);
-        
+
         assert_eq!(handler.csi_count, 1);
     }
-    
+
     #[test]
     fn test_mixed_text_and_csi() {
         let mut parser = Parser::new();
         let mut handler = TestHandler::new();
-        
+
         parser.parse(b"Hello\x1b[1mWorld", &mut handler);
-        
+
         assert_eq!(handler.text_chunks.len(), 2);
-        let text1: String = handler.text_chunks[0].iter().filter_map(|&cp| char::from_u32(cp)).collect();
-        let text2: String = handler.text_chunks[1].iter().filter_map(|&cp| char::from_u32(cp)).collect();
+        let text1: String = handler.text_chunks[0]
+            .iter()
+            .filter_map(|&cp| char::from_u32(cp))
+            .collect();
+        let text2: String = handler.text_chunks[1]
+            .iter()
+            .filter_map(|&cp| char::from_u32(cp))
+            .collect();
         assert_eq!(text1, "Hello");
         assert_eq!(text2, "World");
         assert_eq!(handler.csi_count, 1);
     }
-    
+
     #[test]
     fn test_osc_sequence() {
         let mut parser = Parser::new();
         let mut handler = TestHandler::new();
-        
+
         // OSC 0 ; title BEL
         parser.parse(b"\x1b]0;My Title\x07", &mut handler);
-        
+
         assert_eq!(handler.osc_count, 1);
     }
-    
+
     #[test]
     fn test_csi_with_subparams() {
         let mut parser = Parser::new();
         let mut handler = TestHandler::new();
-        
+
         // CSI 38:2:255:128:64 m (RGB foreground with colon separators)
         parser.parse(b"\x1b[38:2:255:128:64m", &mut handler);
-        
+
         assert_eq!(handler.csi_count, 1);
     }
 }
