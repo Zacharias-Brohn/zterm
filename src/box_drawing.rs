@@ -634,13 +634,13 @@ pub fn render_box_char(
             }
         };
 
-        let h_thick = thickness(left.max(right));
         let v_thick = thickness(up.max(down));
+        let h_thick = thickness(left.max(right));
         let h_extend = v_thick / 2;
         let v_extend = h_thick / 2;
 
         if left > 0 {
-            hline(&mut bitmap, 0, mid_x + h_extend + 1, mid_y, thickness(left));
+            hline(&mut bitmap, 0, mid_x + h_extend, mid_y, thickness(left));
         }
         if right > 0 {
             hline(
@@ -652,7 +652,7 @@ pub fn render_box_char(
             );
         }
         if up > 0 {
-            vline(&mut bitmap, 0, mid_y + v_extend + 1, mid_x, thickness(up));
+            vline(&mut bitmap, 0, mid_y + v_extend, mid_x, thickness(up));
         }
         if down > 0 {
             vline(

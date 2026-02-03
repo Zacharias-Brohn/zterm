@@ -175,9 +175,10 @@ struct SpriteKey {
 
 impl SpriteKey {
     /// Create a key for a single-cell sprite (the common case)
+    /// Uses cell_index=255 as sentinel to distinguish from multi-cell cell 0
     #[inline]
     fn single(ch: char, style: FontStyle, colored: bool) -> Self {
-        Self { ch, cell_index: 0, style, colored }
+        Self { ch, cell_index: 255, style, colored }
     }
     
     /// Create a key for a multi-cell sprite
@@ -2267,6 +2268,12 @@ impl Renderer {
                 // Regular character - create sprite as normal
                 let (sprite_idx, is_colored) = self.get_or_create_sprite(c, style);
                 
+                // DEBUG: Log colored glyph detection
+                if is_colored {
+                    log::debug!("EMOJI MULTICELL CHECK: col={} char=U+{:04X} '{}' sprite_idx={} is_colored={}",
+                               col, c as u32, c, sprite_idx, is_colored);
+                }
+                
                 // If this is a colored glyph (emoji) followed by empty cells, create multi-cell sprites
                 if is_colored && sprite_idx != 0 {
                     // Count trailing empty cells for potential multi-cell emoji
@@ -2276,6 +2283,8 @@ impl Renderer {
                     while col + num_empty + 1 < row.len() && num_empty < MAX_EXTRA_CELLS {
                         let next_cell = &row[col + num_empty + 1];
                         let next_char = next_cell.character;
+                        log::debug!("  checking next cell at col={}: char=U+{:04X} '{}' wide_cont={}",
+                                   col + num_empty + 1, next_char as u32, next_char, next_cell.wide_continuation);
                         if next_char == ' ' || next_char == '\u{2002}' || next_char == '\0' {
                             num_empty += 1;
                         } else {
@@ -2283,17 +2292,22 @@ impl Renderer {
                         }
                     }
                     
+                    log::debug!("  found {} trailing empty cells", num_empty);
+                    
                     if num_empty > 0 {
                         let total_cells = 1 + num_empty;
+                        log::debug!("  creating multi-cell sprites for {} cells", total_cells);
                         
                         // Check if we already have multi-cell sprites for this emoji
                         let first_key = SpriteKey::multi(c, 0, style, true);
                         
                         if self.sprite_map.get(&first_key).is_none() {
-                            // Need to create multi-cell emoji sprites
+                            log::debug!("  rasterizing multi-cell emoji U+{:04X}", c as u32);
                             let cell_sprites = self.rasterize_emoji_multicell(c, total_cells);
+                            log::debug!("  got {} cell sprites", cell_sprites.len());
                             
                             for (cell_idx, glyph) in cell_sprites.into_iter().enumerate() {
+                                log::debug!("    cell {} sprite size: {:?}", cell_idx, glyph.size);
                                 if glyph.size[0] > 0.0 && glyph.size[1] > 0.0 {
                                     let key = SpriteKey::multi(c, cell_idx as u8, style, true);
                                     

@@ -240,8 +240,13 @@ struct BufferState {
     read_pos: usize,
     read_consumed: usize,
     read_sz: usize,
-    /// Write tracking: pending = bytes written by I/O but not yet visible to reader
+    /// Write tracking (like Kitty's write struct):
+    /// - pending: bytes written by I/O but not yet visible to reader
+    /// - offset: where I/O thread is writing (for compaction fixup)
+    /// - sz: size of current write buffer (0 if none outstanding)
     write_pending: usize,
+    write_offset: usize,
+    write_sz: usize,
 }
 
 /// Kitty-style shared parser with integrated 1MB buffer.
@@ -306,6 +311,8 @@ impl SharedParser {
                 read_consumed: 0,
                 read_sz: 0,
                 write_pending: 0,
+                write_offset: 0,
+                write_sz: 0,
             }),
             wakeup_fd,
             // Parser state - working copies for use while lock is released
@@ -339,8 +346,17 @@ impl SharedParser {
 
     /// Get write buffer for I/O thread. Returns (ptr, available_bytes).
     /// Caller MUST call commit_write() after writing.
+    /// Like Kitty's vt_parser_create_write_buffer().
     pub fn create_write_buffer(&self) -> (*mut u8, usize) {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+
+        if state.write_sz > 0 {
+            log::error!(
+                "create_write_buffer called with existing write buffer"
+            );
+            return (std::ptr::null_mut(), 0);
+        }
+
         let write_offset = state.read_sz + state.write_pending;
         let available = BUF_SIZE.saturating_sub(write_offset);
 
@@ -348,15 +364,33 @@ impl SharedParser {
             return (std::ptr::null_mut(), 0);
         }
 
-        // SAFETY: I/O writes past read_sz+write_pending
+        state.write_offset = write_offset;
+        state.write_sz = available;
+
         let ptr = unsafe { (*self.buf.get()).as_mut_ptr().add(write_offset) };
         (ptr, available)
     }
 
     /// Commit bytes written by I/O thread.
+    /// Like Kitty's vt_parser_commit_write() - handles compaction that happened
+    /// between create_write_buffer and commit_write by moving data if needed.
     pub fn commit_write(&self, len: usize) {
         let mut state = self.state.lock().unwrap();
+        let current_offset = state.read_sz + state.write_pending;
+
+        if state.write_offset > current_offset {
+            unsafe {
+                let buf = &mut *self.buf.get();
+                std::ptr::copy(
+                    buf.as_ptr().add(state.write_offset),
+                    buf.as_mut_ptr().add(current_offset),
+                    len,
+                );
+            }
+        }
+
         state.write_pending += len;
+        state.write_sz = 0;
     }
 
     /// Read from PTY fd into buffer. Returns bytes read, -1 for error.
@@ -371,8 +405,16 @@ impl SharedParser {
 
         if result > 0 {
             self.commit_write(result as usize);
+        } else {
+            self.cancel_write();
         }
         result
+    }
+
+    /// Cancel a pending write buffer (on error/EOF).
+    fn cancel_write(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.write_sz = 0;
     }
 
     /// Drain the wakeup eventfd.
@@ -412,9 +454,6 @@ impl SharedParser {
             return false;
         }
 
-        let initial_pos = state.read_pos;
-        let initial_sz = state.read_sz;
-
         // Track if buffer was ever full during this parse pass (for wakeup decision)
         // Like Kitty: pd->write_space_created = self->read.sz >= BUF_SZ (checked BEFORE compaction)
         let mut buffer_was_ever_full = state.read_sz >= BUF_SIZE;
@@ -422,25 +461,14 @@ impl SharedParser {
         // Reset consumed counter for this parse pass (like Kitty: self->read.consumed = 0)
         state.read_consumed = 0;
 
-        // Check vte_state at start of parse pass
-        let vte_state_at_start = unsafe { *self.vte_state.get() };
-        if vte_state_at_start != State::Normal {
-            log::error!(
-                "DEBUG run_parse_pass START: vte_state={:?} read_pos={} read_sz={}",
-                vte_state_at_start, state.read_pos, state.read_sz
-            );
-        }
-
         // Copy positions to UnsafeCell fields for use while lock is released
         unsafe {
             *self.parse_pos.get() = state.read_pos;
             *self.parse_sz.get() = state.read_sz;
-            *self.parse_consumed.get() = state.read_pos; // consumed starts at current pos
+            *self.parse_consumed.get() = state.read_pos;
         }
 
-        // Parse loop - release lock during parsing!
         // Like Kitty's do { ... } while (self->read.pos < self->read.sz)
-        let mut loop_count = 0;
         loop {
             let parse_pos = unsafe { *self.parse_pos.get() };
             let parse_sz = unsafe { *self.parse_sz.get() };
@@ -452,10 +480,9 @@ impl SharedParser {
             // RELEASE LOCK during parsing - I/O can continue writing!
             drop(state);
 
-            // Parse the data - consume_input updates parse_pos and parse_consumed
-            self.consume_input(handler);
+            // Like Kitty line 1516: consume_input(self, ...)
+            let made_progress = self.consume_input(handler);
             parsed_any = true;
-            loop_count += 1;
 
             // Re-acquire lock
             state = self.state.lock().unwrap();
@@ -479,45 +506,14 @@ impl SharedParser {
                 *self.parse_sz.get() = state.read_sz;
             }
 
-            // If no more unparsed data, we're done (like Kitty: while read.pos < read.sz)
-            if state.read_pos >= state.read_sz {
+            // Like Kitty: while read.pos < read.sz
+            if state.read_pos >= state.read_sz || !made_progress {
                 break;
             }
         }
 
-        let bytes_parsed = state.read_pos.saturating_sub(initial_pos);
-        if bytes_parsed > 0 || loop_count > 1 {
-            log::debug!("[PARSE] initial_pos={} initial_sz={} final_pos={} final_sz={} loops={} bytes={}",
-                initial_pos, initial_sz, state.read_pos, state.read_sz, loop_count, bytes_parsed);
-        }
-
         // Compaction - remove consumed bytes (like Kitty)
         if state.read_consumed > 0 {
-            let old_sz = state.read_sz;
-
-            // Debug: Check what we're about to discard and what state we're in
-            let vte_state = unsafe { *self.vte_state.get() };
-            if vte_state != State::Normal {
-                let buf = unsafe { &*self.buf.get() };
-                let remaining_start = state.read_consumed.min(old_sz);
-                let preview_len = (old_sz - remaining_start).min(20);
-                let preview: String = buf
-                    [remaining_start..remaining_start + preview_len]
-                    .iter()
-                    .map(|&b| {
-                        if b >= 0x20 && b < 0x7f {
-                            b as char
-                        } else {
-                            '.'
-                        }
-                    })
-                    .collect();
-                log::error!(
-                    "DEBUG COMPACT: state={:?} consumed={} old_sz={} remaining preview: {:?}",
-                    vte_state, state.read_consumed, old_sz, preview
-                );
-            }
-
             // Like Kitty: pos -= consumed, sz -= consumed, memmove
             state.read_pos = state.read_pos.saturating_sub(state.read_consumed);
             state.read_sz = state.read_sz.saturating_sub(state.read_consumed);
@@ -534,14 +530,11 @@ impl SharedParser {
                 }
             }
 
-            let consumed = state.read_consumed;
             state.read_consumed = 0;
 
             // Wake I/O thread if buffer was ever full during this pass and we freed space
             // Like Kitty: if (pd.write_space_created) wakeup_io_loop()
             if buffer_was_ever_full && state.read_sz < BUF_SIZE {
-                log::debug!("[PARSE] Waking I/O: was_full={} old_sz={} new_sz={} consumed={}", 
-                    buffer_was_ever_full, old_sz, state.read_sz, consumed);
                 drop(state);
                 let val = 1u64;
                 unsafe {
@@ -572,16 +565,14 @@ impl SharedParser {
     // ========== Internal parsing methods (main thread only) ==========
 
     /// Main parsing dispatch - like Kitty's consume_input().
-    /// Reads from buf[parse_pos..parse_sz] and updates positions.
+    /// Processes ONE state case per call and returns, like Kitty lines 1458-1490.
+    /// The outer loop in run_parse_pass() calls this repeatedly until buffer exhausted.
     ///
-    /// IMPORTANT: Unlike the previous implementation, this now loops internally
-    /// until the buffer is exhausted or we're waiting for more data in an incomplete
-    /// escape sequence. This reduces per-CSI overhead from 3 function calls to 1.
-    fn consume_input<H: Handler>(&self, handler: &mut H) {
+    /// Returns true if we made progress (consumed some bytes or changed state).
+    fn consume_input<H: Handler>(&self, handler: &mut H) -> bool {
         #[cfg(feature = "render_timing")]
         let start = std::time::Instant::now();
 
-        // Get mutable access to parser state (SAFETY: only main thread calls this)
         let parse_pos = unsafe { &mut *self.parse_pos.get() };
         let parse_sz = unsafe { *self.parse_sz.get() };
         let parse_consumed = unsafe { &mut *self.parse_consumed.get() };
@@ -594,131 +585,119 @@ impl SharedParser {
         let escape_len = unsafe { &mut *self.escape_len.get() };
         let buf = unsafe { &*self.buf.get() };
 
-        // Debug: Log state at start of consume_input
-        if *vte_state != State::Normal {
-            log::error!(
-                "DEBUG consume_input START: state={:?} pos={} consumed={} sz={}",
-                *vte_state, *parse_pos, *parse_consumed, parse_sz
-            );
+        if *parse_pos >= parse_sz {
+            #[cfg(feature = "render_timing")]
+            handler.add_vt_parser_ns(start.elapsed().as_nanos() as u64);
+            return false;
         }
 
-        // Debug: Check if we're starting in Normal with CSI-like content
-        if *vte_state == State::Normal
-            && *parse_pos < parse_sz
-            && buf[*parse_pos] == b'['
-        {
-            log::error!(
-                "DEBUG: Starting consume_input in Normal but buf[{}]='[' (0x5b). consumed={} sz={}",
-                *parse_pos, *parse_consumed, parse_sz
-            );
-        }
-
-        // Loop until buffer exhausted or waiting for more data
-        while *parse_pos < parse_sz {
-            match *vte_state {
-                State::Normal => {
-                    Self::consume_normal_impl(
-                        handler,
-                        buf,
-                        parse_pos,
-                        parse_sz,
-                        utf8,
-                        codepoint_buf,
-                        vte_state,
-                        escape_len,
-                    );
+        let made_progress = match *vte_state {
+            State::Normal => {
+                // Like Kitty line 1460: consume_normal(self); self->read.consumed = self->read.pos; break;
+                Self::consume_normal_impl(
+                    handler,
+                    buf,
+                    parse_pos,
+                    parse_sz,
+                    utf8,
+                    codepoint_buf,
+                    vte_state,
+                    escape_len,
+                );
+                *parse_consumed = *parse_pos;
+                true
+            }
+            State::Escape => {
+                // Like Kitty lines 1461-1463:
+                // case VTE_ESC: if (consume_esc(self)) { self->read.consumed = self->read.pos; } break;
+                if Self::consume_escape_impl(
+                    handler,
+                    buf,
+                    parse_pos,
+                    parse_sz,
+                    *parse_consumed,
+                    vte_state,
+                    csi,
+                    osc_buffer,
+                    string_buffer,
+                    escape_len,
+                ) {
                     *parse_consumed = *parse_pos;
                 }
-                State::Escape => {
-                    let state_before = *vte_state;
-                    if Self::consume_escape_impl(
-                        handler,
-                        buf,
-                        parse_pos,
-                        parse_sz,
-                        *parse_consumed,
-                        vte_state,
-                        csi,
-                        osc_buffer,
-                        string_buffer,
-                        escape_len,
-                    ) {
-                        *parse_consumed = *parse_pos;
-                    } else if *vte_state != state_before {
-                        // State changed to multi-byte sequence (CSI, OSC, etc.)
-                        // Continue loop WITHOUT updating parse_consumed
-                    } else {
-                        // Need more data for escape sequence
-                        break;
-                    }
+                true
+            }
+            State::EscapeIntermediate(_) => {
+                if Self::consume_escape_intermediate_impl(
+                    handler, buf, parse_pos, parse_sz, vte_state,
+                ) {
+                    *parse_consumed = *parse_pos;
                 }
-                State::EscapeIntermediate(_) => {
-                    if Self::consume_escape_intermediate_impl(
-                        handler, buf, parse_pos, parse_sz, vte_state,
-                    ) {
-                        *parse_consumed = *parse_pos;
-                    } else {
-                        break;
+                true
+            }
+            State::Csi => {
+                // Like Kitty lines 1465-1466:
+                // if (consume_csi(self)) { self->read.consumed = self->read.pos; if (self->csi.is_valid) dispatch_csi(self); SET_STATE(NORMAL); }
+                if Self::consume_csi_impl(
+                    handler,
+                    buf,
+                    parse_pos,
+                    parse_sz,
+                    *parse_consumed,
+                    csi,
+                    escape_len,
+                ) {
+                    *parse_consumed = *parse_pos;
+                    if csi.is_valid {
+                        handler.csi(csi);
                     }
-                }
-                State::Csi => {
-                    // Like Kitty: if (consume_csi(self)) { self->read.consumed = self->read.pos; dispatch; SET_STATE(NORMAL); }
-                    if Self::consume_csi_impl(
-                        handler,
-                        buf,
-                        parse_pos,
-                        parse_sz,
-                        *parse_consumed,
-                        csi,
-                        escape_len,
-                    ) {
-                        *parse_consumed = *parse_pos;
-                        if csi.is_valid {
-                            handler.csi(csi);
-                        }
-                        *vte_state = State::Normal;
-                        // Continue loop to process more data
-                    } else {
-                        // Need more data for CSI sequence
-                        break;
-                    }
-                }
-                State::Osc => {
-                    if Self::consume_osc_impl(
-                        handler, buf, parse_pos, parse_sz, vte_state,
-                        osc_buffer, escape_len,
-                    ) {
-                        *parse_consumed = *parse_pos;
-                        *vte_state = State::Normal;
-                    } else {
-                        break;
-                    }
-                }
-                State::Dcs | State::Apc | State::Pm | State::Sos => {
-                    if Self::consume_string_impl(
-                        handler,
-                        buf,
-                        parse_pos,
-                        parse_sz,
-                        vte_state,
-                        string_buffer,
-                        escape_len,
-                    ) {
-                        *parse_consumed = *parse_pos;
-                        *vte_state = State::Normal;
-                    } else {
-                        break;
-                    }
+                    *vte_state = State::Normal;
+                    true
+                } else {
+                    false
                 }
             }
-        }
+            State::Osc => {
+                if Self::consume_osc_impl(
+                    handler, buf, parse_pos, parse_sz, vte_state, osc_buffer,
+                    escape_len,
+                ) {
+                    *parse_consumed = *parse_pos;
+                    *vte_state = State::Normal;
+                    true
+                } else {
+                    false
+                }
+            }
+            State::Dcs | State::Apc | State::Pm | State::Sos => {
+                if Self::consume_string_impl(
+                    handler,
+                    buf,
+                    parse_pos,
+                    parse_sz,
+                    vte_state,
+                    string_buffer,
+                    escape_len,
+                ) {
+                    *parse_consumed = *parse_pos;
+                    *vte_state = State::Normal;
+                    true
+                } else {
+                    false
+                }
+            }
+        };
 
         #[cfg(feature = "render_timing")]
         handler.add_vt_parser_ns(start.elapsed().as_nanos() as u64);
+
+        made_progress
     }
 
     /// Consume normal text - like Kitty's consume_normal().
     /// UTF-8 decodes until ESC is found using SIMD-optimized decoder.
+    ///
+    /// Like Kitty: processes text until ESC found, then sets state to Escape and returns.
+    /// The outer loop will call consume_input again to handle the Escape state.
     #[inline]
     fn consume_normal_impl<H: Handler>(
         handler: &mut H,
@@ -730,6 +709,7 @@ impl SharedParser {
         vte_state: &mut State,
         escape_len: &mut usize,
     ) {
+        // Like Kitty's consume_normal() inner loop
         loop {
             if *parse_pos >= parse_sz {
                 break;
@@ -738,18 +718,23 @@ impl SharedParser {
             let remaining = &buf[*parse_pos..parse_sz];
             let (consumed, found_esc) =
                 utf8.decode_to_esc(remaining, codepoint_buf);
-            *parse_pos += consumed;
 
             if !codepoint_buf.is_empty() {
                 handler.text(codepoint_buf);
             }
 
+            // Like Kitty: self->read.pos += self->utf8_decoder.num_consumed
+            *parse_pos += consumed;
+
             if found_esc {
+                // Like Kitty: if (sentinel_found) { SET_STATE(ESC); break; }
                 *vte_state = State::Escape;
                 *escape_len = 0;
                 break;
             }
         }
+        // Like Kitty line 1460: consume_normal(self); self->read.consumed = self->read.pos; break;
+        // The caller (consume_input) will set parse_consumed = parse_pos
     }
 
     /// Consume escape sequence start - like Kitty's consume_esc().
@@ -786,33 +771,28 @@ impl SharedParser {
                 b'[' => {
                     *vte_state = State::Csi;
                     csi.reset();
-                    return false;
                 }
                 b']' => {
                     *vte_state = State::Osc;
                     osc_buffer.clear();
-                    return false;
                 }
                 b'P' => {
                     *vte_state = State::Dcs;
                     string_buffer.clear();
-                    return false;
                 }
                 b'_' => {
                     *vte_state = State::Apc;
                     string_buffer.clear();
-                    return false;
                 }
                 b'^' => {
                     *vte_state = State::Pm;
                     string_buffer.clear();
-                    return false;
                 }
                 b'X' => {
                     *vte_state = State::Sos;
                     string_buffer.clear();
-                    return false;
                 }
+                // Two-byte escape sequences - return false like Kitty's IS_ESCAPED_CHAR
                 b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'%'
                 | b'#' | b' ' => {
                     *vte_state = State::EscapeIntermediate(ch);
